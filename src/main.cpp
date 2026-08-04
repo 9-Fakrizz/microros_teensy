@@ -33,59 +33,75 @@ const int R_A_PLUS  = 17;
 // =====================================================
 // ---------------- Robot Parameters -------------------
 // =====================================================
-const float WHEEL_DIAMETER_MM = 125.0;
-const float CIRCUMFERENCE_M =
-  (3.14159265 * WHEEL_DIAMETER_MM) / 1000.0;
-
-const float PULSES_PER_REV = 1000.0;
-const float MAX_SPEED = 1.0;     // m/s max speed
+// Wheel geometry / pulses-per-rev / meter conversion is now done on the
+// Python side during calibration, not here. Keep WHEEL_DIAMETER_MM and
+// PULSES_PER_REV in your Python calibration script for reference.
+const float MAX_SPEED = 1.0;     // m/s max speed, used below for debounce timing math
 
 // ---------------- Timing -----------------------------
 const uint32_t IMU_REPORT_INTERVAL_MS = 50;   // must match TIMER_PERIOD_MS
 const uint32_t TIMER_PERIOD_MS        = 50;   // 20 Hz publish rate
 const unsigned long CMD_TIMEOUT_MS    = 500;  // stop motors if no cmd_vel
 
-// ---------------- Encoder debounce --------------------
-// Minimum time between accepted pulses, in microseconds. Reject anything
-// faster than this as noise/glitch rather than a real quadrature edge.
-// Tune based on max expected pulse rate:
-//   max_wheel_rev_per_sec = MAX_SPEED / CIRCUMFERENCE_M
-//   max_pulses_per_sec    = max_wheel_rev_per_sec * PULSES_PER_REV
-//   min_pulse_interval_us = 1e6 / max_pulses_per_sec
-// Pick something a bit below that; default here is conservative.
+// =====================================================
+// ---------------- Encoder Noise Filtering -------------
+// =====================================================
+// NOTE ON HARDWARE NOISE: if counts drift upward even when the robot is
+// stationary, or only during motor activity, the most common real-world
+// cause is EMI coupling from the motor PWM lines into the encoder wiring,
+// not a software bug. If that's happening, route encoder wires away from
+// motor power leads (twisted pair / shielded cable, common ground), and
+// add a small decoupling cap (e.g. 0.1uF) across each motor's terminals.
+// The filtering below reduces the software-side symptoms but can't fully
+// fix a badly coupled signal.
+//
+// TWO-LAYER FILTER:
+//  1) Per-pulse validation in the ISR (this section): rejects edges that
+//     are either too close together (gap debounce) OR too narrow to be a
+//     real pulse (width validation). This is the main upgrade vs. the
+//     previous version, which only checked gap and would happily count a
+//     single sharp noise spike as a full pulse.
+//  2) Per-window burst filter in timer_callback (unchanged): rejects
+//     windows where too few *net* pulses arrived to be real motion.
+//
+// Minimum time between accepted pulse edges, in microseconds (gap debounce).
+// Depends on your wheel circumference and pulses-per-rev (now tracked in
+// Python): max_pulses_per_sec = (MAX_SPEED / circumference_m) * pulses_per_rev,
+// min_pulse_interval_us = 1e6 / max_pulses_per_sec. With this robot's old
+// values (125mm wheel, 1000 pulses/rev) that worked out to ~392us at
+// MAX_SPEED=1.0 m/s — keep this comfortably below your equivalent number
+// or you'll clip real high-speed pulses.
 const unsigned long ENCODER_DEBOUNCE_US = 200;
+
+// Minimum valid pulse WIDTH (time the pin stays HIGH), in microseconds.
+// Real encoder pulses at max speed are still on the order of hundreds of
+// us wide; EMI/electrical glitches are typically single-digit-to-tens of
+// us. Start conservative and tune down if you see real pulses being
+// rejected (watch the glitch counters below vs. expected motion).
+const unsigned long MIN_PULSE_WIDTH_US = 60;
 
 volatile unsigned long lastLeftPulseMicros = 0;
 volatile unsigned long lastRightPulseMicros = 0;
+volatile unsigned long leftRiseTime = 0;
+volatile unsigned long rightRiseTime = 0;
+
+// Diagnostic counters: how many edges were rejected as noise. Published
+// alongside the encoder data so you can watch these in real time (e.g.
+// `ros2 topic echo /wheel_encoder`) while wiggling wires or running the
+// motors, to actually see how much noise is present and tune the two
+// constants above with real numbers instead of guessing.
+volatile int64_t leftGlitchCount  = 0;
+volatile int64_t rightGlitchCount = 0;
 
 // ใช้ volatile สำหรับตัวแปรที่ถูกดัดแปลงในฟังก์ชัน Interrupt
 volatile int64_t leftPulseCount  = 0;
 volatile int64_t rightPulseCount = 0;
 
-// ---------------- Encoder noise filter -----------------
-// Rate-based filter: real movement produces a BURST of pulses within
-// each TIMER_PERIOD_MS window; isolated electrical noise produces only
-// 1-2 stray pulses per window. Each timer tick, we look at how many NEW
-// pulses arrived since the last tick — if that delta is below
-// ENCODER_NOISE_THRESHOLD_PULSES, we treat it as noise and drop it
-// (don't add it to distance). Otherwise we keep it.
-//
-// Raw ISR counts (leftPulseCount/rightPulseCount) are left untouched for
-// diagnostics; these filtered accumulators are what get converted to
-// meters and published.
-//
-// Tune this threshold based on testing: it must be higher than your
-// observed static-noise pulse count per window, but low enough that it
-// doesn't eat real slow-speed motion. At PULSES_PER_REV=1000 and
-// CIRCUMFERENCE_M computed above, one pulse per 50ms window corresponds
-// to roughly (CIRCUMFERENCE_M / PULSES_PER_REV) / (TIMER_PERIOD_MS/1000)
-// m/s of "invisible" minimum speed — keep that in mind if you raise it.
-const int64_t ENCODER_NOISE_THRESHOLD_PULSES = 3;
-
-int64_t leftFilteredPulses  = 0;
-int64_t rightFilteredPulses = 0;
-int64_t lastRawLeftPulse    = 0;
-int64_t lastRawRightPulse   = 0;
+// NOTE: the previous window/burst filter (which dropped small per-window
+// pulse deltas before converting to meters) has been removed along with
+// the meter conversion — raw pulses now go straight to Python, where
+// you're doing calibration and can apply whatever burst/threshold
+// filtering makes sense once you've characterized the noise per wheel.
 
 // =====================================================
 // ---------------- micro-ROS Objects ------------------
@@ -98,7 +114,12 @@ geometry_msgs__msg__Twist msg_cmd;
 sensor_msgs__msg__Imu msg_imu;
 std_msgs__msg__Float32MultiArray msg_encoder;
 
-float encoder_data[4]; // [0]=left_m, [1]=right_m, [2]=left_raw_pulses, [3]=right_raw_pulses
+// [0]=left_raw_pulses, [1]=right_raw_pulses,
+// [2]=left_glitch_count, [3]=right_glitch_count
+// (Meter conversion removed — do wheel geometry / calibration in Python.
+// You mentioned using left [0] as your primary encoder; right [1] is
+// still read and published for reference/diagnostics.)
+float encoder_data[4];
 
 rclc_executor_t executor;
 rclc_support_t support;
@@ -182,9 +203,33 @@ void cmd_vel_callback(const void * msgin) {
 // =====================================================
 // ---------------- Encoder Interrupts -----------------
 // =====================================================
+// Now triggered on CHANGE (both rising and falling) instead of RISING
+// only. A pulse is counted on the FALLING edge, once we can measure how
+// wide it was. This lets us reject narrow noise spikes that the old
+// RISING-only + gap-debounce scheme would have happily counted as a full
+// pulse, since it never checked pulse width at all.
 void leftEncoderISR() {
   unsigned long now = micros();
-  if (now - lastLeftPulseMicros < ENCODER_DEBOUNCE_US) return; // reject glitch
+  bool state = digitalRead(L_A_PLUS);
+
+  if (state == HIGH) {
+    // Rising edge: just remember when it happened, don't count yet.
+    leftRiseTime = now;
+    return;
+  }
+
+  // Falling edge: this completes a pulse. Validate width first.
+  unsigned long width = now - leftRiseTime;
+  if (width < MIN_PULSE_WIDTH_US) {
+    leftGlitchCount++;
+    return; // too narrow to be a real pulse — noise
+  }
+
+  // Then validate spacing since the last ACCEPTED pulse (gap debounce).
+  if (now - lastLeftPulseMicros < ENCODER_DEBOUNCE_US) {
+    leftGlitchCount++;
+    return;
+  }
   lastLeftPulseMicros = now;
 
   // อ่านสถานะของอีกขาเพื่อตัดสินทิศทาง (หากหมุนสลับทางให้สลับ HIGH/LOW)
@@ -197,7 +242,23 @@ void leftEncoderISR() {
 
 void rightEncoderISR() {
   unsigned long now = micros();
-  if (now - lastRightPulseMicros < ENCODER_DEBOUNCE_US) return; // reject glitch
+  bool state = digitalRead(R_A_PLUS);
+
+  if (state == HIGH) {
+    rightRiseTime = now;
+    return;
+  }
+
+  unsigned long width = now - rightRiseTime;
+  if (width < MIN_PULSE_WIDTH_US) {
+    rightGlitchCount++;
+    return;
+  }
+
+  if (now - lastRightPulseMicros < ENCODER_DEBOUNCE_US) {
+    rightGlitchCount++;
+    return;
+  }
   lastRightPulseMicros = now;
 
   if (digitalRead(R_A_MINUS) == HIGH) {
@@ -246,32 +307,23 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
   }
 
   // ---------- Encoder ----------
+  // Just snapshot and publish raw counts — no on-device filtering beyond
+  // the ISR-level pulse-width/gap rejection. Calibration, per-wheel
+  // scaling, and any additional burst filtering happen in Python now.
   noInterrupts();
   int64_t currentLeftPulse = leftPulseCount;
   int64_t currentRightPulse = rightPulseCount;
+  int64_t currentLeftGlitch = leftGlitchCount;
+  int64_t currentRightGlitch = rightGlitchCount;
   interrupts();
 
-  // Rate-based noise filter: only count this window's pulses as real
-  // motion if the burst size clears the noise threshold. See comment
-  // at ENCODER_NOISE_THRESHOLD_PULSES definition for tuning notes.
-  int64_t deltaLeft  = currentLeftPulse  - lastRawLeftPulse;
-  int64_t deltaRight = currentRightPulse - lastRawRightPulse;
-  lastRawLeftPulse  = currentLeftPulse;
-  lastRawRightPulse = currentRightPulse;
-
-  if (abs(deltaLeft) < ENCODER_NOISE_THRESHOLD_PULSES)  deltaLeft  = 0;
-  if (abs(deltaRight) < ENCODER_NOISE_THRESHOLD_PULSES) deltaRight = 0;
-
-  leftFilteredPulses  += deltaLeft;
-  rightFilteredPulses += deltaRight;
-
-  encoder_data[0] = (leftFilteredPulses / PULSES_PER_REV) * CIRCUMFERENCE_M;
-  encoder_data[1] = (rightFilteredPulses / PULSES_PER_REV) * CIRCUMFERENCE_M;
-  // Raw (unfiltered) pulse counts included for calibration/diagnostics —
-  // compare these against the filtered distance above to see the filter
-  // working, and against a known real-world distance to verify PULSES_PER_REV.
-  encoder_data[2] = (float)currentLeftPulse;
-  encoder_data[3] = (float)currentRightPulse;
+  encoder_data[0] = (float)currentLeftPulse;   // primary encoder (left)
+  encoder_data[1] = (float)currentRightPulse;  // reference/diagnostic only
+  // Rejected-edge counts (width or gap failures) — watch these while the
+  // robot sits still or the motors run to gauge how noisy the lines are,
+  // and tune MIN_PULSE_WIDTH_US / ENCODER_DEBOUNCE_US accordingly.
+  encoder_data[2] = (float)currentLeftGlitch;
+  encoder_data[3] = (float)currentRightGlitch;
 
   msg_encoder.data.data = encoder_data;
   msg_encoder.data.size = 4;
@@ -318,8 +370,10 @@ void setup() {
   pinMode(R_A_PLUS, INPUT_PULLUP);
   pinMode(R_A_MINUS, INPUT_PULLUP);
 
-  attachInterrupt(digitalPinToInterrupt(L_A_PLUS), leftEncoderISR, RISING);
-  attachInterrupt(digitalPinToInterrupt(R_A_PLUS), rightEncoderISR, RISING);
+  // CHANGE instead of RISING: the ISR now needs both edges to measure
+  // pulse width (see leftEncoderISR/rightEncoderISR comments above).
+  attachInterrupt(digitalPinToInterrupt(L_A_PLUS), leftEncoderISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(R_A_PLUS), rightEncoderISR, CHANGE);
 
   allocator = rcl_get_default_allocator();
   RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
