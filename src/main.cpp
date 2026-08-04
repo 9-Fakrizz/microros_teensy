@@ -71,14 +71,40 @@ const unsigned long CMD_TIMEOUT_MS    = 500;  // stop motors if no cmd_vel
 // values (125mm wheel, 1000 pulses/rev) that worked out to ~392us at
 // MAX_SPEED=1.0 m/s — keep this comfortably below your equivalent number
 // or you'll clip real high-speed pulses.
-const unsigned long ENCODER_DEBOUNCE_US = 200;
+//
+// Split per wheel: if one side is noisier than the other, raise ITS
+// thresholds without over-filtering the cleaner side.
+const unsigned long LEFT_ENCODER_DEBOUNCE_US  = 200;
+const unsigned long RIGHT_ENCODER_DEBOUNCE_US = 200;
 
 // Minimum valid pulse WIDTH (time the pin stays HIGH), in microseconds.
 // Real encoder pulses at max speed are still on the order of hundreds of
 // us wide; EMI/electrical glitches are typically single-digit-to-tens of
 // us. Start conservative and tune down if you see real pulses being
 // rejected (watch the glitch counters below vs. expected motion).
-const unsigned long MIN_PULSE_WIDTH_US = 60;
+const unsigned long LEFT_MIN_PULSE_WIDTH_US  = 60;
+const unsigned long RIGHT_MIN_PULSE_WIDTH_US = 60;
+
+// ---------------- Motor-start blanking window -----------------
+// The noise you described — counts creeping up right as the motor
+// starts, before the wheel is actually turning, then settling once real
+// motion begins — is a classic H-bridge/relay switching transient. It
+// couples onto the encoder wiring from the shared power rail the instant
+// PWM starts, regardless of which wheel is electrically noisier, and
+// happens before mechanical inertia lets the wheel actually spin.
+//
+// For a short window right after a stop->move transition, we treat
+// pulses as suspect and require BOTH stricter width and gap thresholds
+// before counting them. This is intentionally short (a few ms) so it
+// doesn't eat real fast-start motion — tune MOTOR_START_BLANK_MS down if
+// it's too aggressive, or up if noise is still slipping through right at
+// start.
+const unsigned long MOTOR_START_BLANK_MS = 15;
+const unsigned long BLANK_MIN_PULSE_WIDTH_US = 150; // stricter width during blanking
+const unsigned long BLANK_ENCODER_DEBOUNCE_US = 500; // stricter gap during blanking
+
+volatile unsigned long motorStartTime = 0;
+volatile bool motorsWereStopped = true;
 
 volatile unsigned long lastLeftPulseMicros = 0;
 volatile unsigned long lastRightPulseMicros = 0;
@@ -184,6 +210,15 @@ void set_motors(float lin_x, float ang_z) {
     float left  = (lin_x - ang_z) * LEFT_MOTOR_INVERT;
     float right = (lin_x + ang_z) * RIGHT_MOTOR_INVERT;
 
+    // Detect a stop -> move transition to arm the encoder blanking window.
+    // Uses a small deadband so residual near-zero commands don't repeatedly
+    // re-arm it.
+    bool commandingMotion = (fabs(left) > 0.02f) || (fabs(right) > 0.02f);
+    if (commandingMotion && motorsWereStopped) {
+        motorStartTime = millis();
+    }
+    motorsWereStopped = !commandingMotion;
+
     auto drive = [](int d_pin, int p_pin, float val) {
         digitalWrite(d_pin, val >= 0 ? HIGH : LOW);
         analogWrite(p_pin, (int)constrain(fabs(val) * 255.0f, 0, 255));
@@ -218,15 +253,21 @@ void leftEncoderISR() {
     return;
   }
 
+  // In the blanking window right after a stop->move transition, use
+  // stricter thresholds to reject the motor-start switching transient.
+  bool blanking = (millis() - motorStartTime) < MOTOR_START_BLANK_MS;
+  unsigned long minWidth = blanking ? BLANK_MIN_PULSE_WIDTH_US : LEFT_MIN_PULSE_WIDTH_US;
+  unsigned long debounce = blanking ? BLANK_ENCODER_DEBOUNCE_US : LEFT_ENCODER_DEBOUNCE_US;
+
   // Falling edge: this completes a pulse. Validate width first.
   unsigned long width = now - leftRiseTime;
-  if (width < MIN_PULSE_WIDTH_US) {
+  if (width < minWidth) {
     leftGlitchCount++;
     return; // too narrow to be a real pulse — noise
   }
 
   // Then validate spacing since the last ACCEPTED pulse (gap debounce).
-  if (now - lastLeftPulseMicros < ENCODER_DEBOUNCE_US) {
+  if (now - lastLeftPulseMicros < debounce) {
     leftGlitchCount++;
     return;
   }
@@ -249,13 +290,17 @@ void rightEncoderISR() {
     return;
   }
 
+  bool blanking = (millis() - motorStartTime) < MOTOR_START_BLANK_MS;
+  unsigned long minWidth = blanking ? BLANK_MIN_PULSE_WIDTH_US : RIGHT_MIN_PULSE_WIDTH_US;
+  unsigned long debounce = blanking ? BLANK_ENCODER_DEBOUNCE_US : RIGHT_ENCODER_DEBOUNCE_US;
+
   unsigned long width = now - rightRiseTime;
-  if (width < MIN_PULSE_WIDTH_US) {
+  if (width < minWidth) {
     rightGlitchCount++;
     return;
   }
 
-  if (now - lastRightPulseMicros < ENCODER_DEBOUNCE_US) {
+  if (now - lastRightPulseMicros < debounce) {
     rightGlitchCount++;
     return;
   }
@@ -321,7 +366,8 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
   encoder_data[1] = (float)currentRightPulse;  // reference/diagnostic only
   // Rejected-edge counts (width or gap failures) — watch these while the
   // robot sits still or the motors run to gauge how noisy the lines are,
-  // and tune MIN_PULSE_WIDTH_US / ENCODER_DEBOUNCE_US accordingly.
+  // and tune LEFT/RIGHT_MIN_PULSE_WIDTH_US / LEFT/RIGHT_ENCODER_DEBOUNCE_US
+  // (and MOTOR_START_BLANK_MS if noise clusters right at motor start).
   encoder_data[2] = (float)currentLeftGlitch;
   encoder_data[3] = (float)currentRightGlitch;
 
