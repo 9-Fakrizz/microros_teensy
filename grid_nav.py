@@ -61,7 +61,7 @@ ENCODER_INDEX_PRIMARY_PULSES = 0  # must be the LEFT wheel -- see module docstri
 PULSES_PER_CM = 183.5
 
 FORWARD_SPEED = 0.15           # m/s, straight-line drive speed
-ROTATE_SPEED = 0.12            # commanded speed magnitude while pivoting
+ROTATE_SPEED = 0.12            # max commanded speed magnitude while pivoting
 
 # If the robot pivots the WRONG way (heading error grows instead of
 # shrinking) during testing, flip this to -1. Left wheel stays at 0
@@ -71,10 +71,26 @@ PIVOT_SIGN = 1
 HEADING_TOLERANCE_DEG = 3.0    # stop pivoting once within this of target
 POSITION_EPSILON_CM = 1.0      # skip an axis leg smaller than this
 
-# Light heading-hold correction while driving straight (keeps the
-# robot from wandering off its cardinal heading mid-leg). Kept small
-# and clamped -- the ROTATE phase does the real turning, not this.
-HEADING_HOLD_KP = 1.0
+# Rotate-phase PID: scales pivot speed down as heading error shrinks
+# (instead of a constant speed followed by a hard stop at tolerance).
+# Output is clamped to +/-ROTATE_SPEED and applied to BOTH linear.x and
+# angular.z (see control_loop) -- that's what keeps the left wheel at
+# exactly 0 regardless of the PID output's sign/magnitude.
+ROTATE_KP = 0.8
+ROTATE_KI = 0.0
+ROTATE_KD = 0.05
+ROTATE_MAX_INTEGRAL = 0.3
+# PWM floor so the pivot doesn't stall out approaching zero error before
+# actually reaching HEADING_TOLERANCE_DEG.
+ROTATE_MIN_OUTPUT = 0.05
+
+# Drive-phase PID: keeps the robot on its cardinal heading while driving
+# straight. Kept small/clamped -- the ROTATE phase does the real turning,
+# not this.
+DRIVE_KP = 1.0
+DRIVE_KI = 0.0
+DRIVE_KD = 0.1
+DRIVE_MAX_INTEGRAL = 0.3
 MAX_ANGULAR_Z_HOLD = 0.3
 
 LOOP_HZ = 20.0                 # control loop rate
@@ -104,11 +120,40 @@ def normalize_angle(a):
     return angle_diff(a, 0.0)
 
 
+class PID:
+    def __init__(self, kp, ki, kd, out_min, out_max, i_max, dt):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.out_min, self.out_max = out_min, out_max
+        self.i_max = i_max
+        self.dt = dt
+        self.integral = 0.0
+        self.prev_error = 0.0
+
+    def reset(self):
+        self.integral = 0.0
+        self.prev_error = 0.0
+
+    def compute(self, error):
+        self.integral += error * self.dt
+        self.integral = max(-self.i_max, min(self.i_max, self.integral))
+        derivative = (error - self.prev_error) / self.dt
+        self.prev_error = error
+        output = self.kp * error + self.ki * self.integral + self.kd * derivative
+        return max(self.out_min, min(self.out_max, output))
+
+
 class GridNavNode(Node):
     def __init__(self):
         super().__init__('grid_nav_node')
 
         self.dt = 1.0 / LOOP_HZ
+
+        # Symmetric output range: PID sign follows error sign, PIVOT_SIGN is
+        # applied separately in control_loop.
+        self.rotate_pid = PID(ROTATE_KP, ROTATE_KI, ROTATE_KD,
+                               -ROTATE_SPEED, ROTATE_SPEED, ROTATE_MAX_INTEGRAL, self.dt)
+        self.drive_pid = PID(DRIVE_KP, DRIVE_KI, DRIVE_KD,
+                              -MAX_ANGULAR_Z_HOLD, MAX_ANGULAR_Z_HOLD, DRIVE_MAX_INTEGRAL, self.dt)
 
         self._lock = threading.Lock()
 
@@ -208,6 +253,7 @@ class GridNavNode(Node):
         self.leg_target_heading = normalize_angle(target)
         self.leg_target_distance_cm = abs(delta)
         self.phase = 'ROTATE'
+        self.rotate_pid.reset()
 
     # ---------------- Control loop ----------------
 
@@ -224,11 +270,16 @@ class GridNavNode(Node):
                 if abs(math.degrees(error)) <= HEADING_TOLERANCE_DEG:
                     self.leg_baseline_pulses = self.last_pulses
                     self.phase = 'DRIVE'
+                    self.drive_pid.reset()
                     self.cmd_pub.publish(twist)  # brief all-zero pause between phases
                     return
 
-                turn_dir = 1.0 if error > 0 else -1.0
-                cmd = ROTATE_SPEED * turn_dir * PIVOT_SIGN
+                cmd = self.rotate_pid.compute(error) * PIVOT_SIGN
+                # Floor the magnitude so the pivot doesn't stall out as the
+                # PID output shrinks near zero error, before actually
+                # reaching HEADING_TOLERANCE_DEG.
+                if abs(cmd) < ROTATE_MIN_OUTPUT:
+                    cmd = math.copysign(ROTATE_MIN_OUTPUT, cmd if cmd != 0 else error)
                 # linear.x == angular.z always zeroes the left-wheel term
                 # in the firmware's differential mix, regardless of sign.
                 twist.linear.x = cmd
@@ -261,7 +312,7 @@ class GridNavNode(Node):
                 return
 
             herr = angle_diff(self.leg_target_heading, self.current_yaw)
-            correction = max(-MAX_ANGULAR_Z_HOLD, min(MAX_ANGULAR_Z_HOLD, HEADING_HOLD_KP * herr))
+            correction = self.drive_pid.compute(herr)
             twist.linear.x = FORWARD_SPEED
             twist.angular.z = -correction  # sign convention matches heading_hold.py
             self.cmd_pub.publish(twist)
@@ -358,6 +409,25 @@ function draw(state) {
   ctx.beginPath(); ctx.moveTo(ox, 0); ctx.lineTo(ox, CANVAS_PX); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(0, oy); ctx.lineTo(CANVAS_PX, oy); ctx.stroke();
 
+  // axis tick labels (cm), skipping 0 on each axis to avoid overlap at the origin.
+  // View is a fixed +/-HALF_EXTENT square (no panning), so the origin (ox, oy)
+  // is always the canvas center -- labels always go below/right of the axes.
+  ctx.fillStyle = '#999';
+  ctx.font = '11px monospace';
+  for (let c = -HALF_EXTENT; c <= HALF_EXTENT; c += SPACING) {
+    if (c === 0) continue;
+    let [px, ] = toPx(c, 0);
+    ctx.textAlign = 'center';
+    ctx.fillText(c, px, oy + 14);
+    let [, py] = toPx(0, c);
+    ctx.textAlign = 'left';
+    ctx.fillText(c, ox + 4, py + 4);
+  }
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#ccc';
+  ctx.fillText('X (cm)', CANVAS_PX - 46, oy - 6);
+  ctx.fillText('Y (cm)', ox + 6, 12);
+
   // path
   if (path.length > 1) {
     ctx.strokeStyle = '#4da3ff';
@@ -399,6 +469,20 @@ function draw(state) {
   ctx.arc(rx, ry, 3, 0, 2 * Math.PI);
   ctx.fillStyle = '#4da3ff';
   ctx.fill();
+
+  // direction label next to the arrow tip: degrees + nearest axis direction
+  // (relative to heading_ref captured at startup, where 0deg = +X -- this
+  // is NOT true compass north, just this session's local reference frame)
+  ctx.fillStyle = '#ffa500';
+  ctx.font = 'bold 13px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(`${headingDeg.toFixed(0)}° (${axisLabel(headingDeg)})`, tipX + 8, tipY);
+}
+
+function axisLabel(deg) {
+  const dirs = ['+X', '+X/+Y', '+Y', '-X/+Y', '-X', '-X/-Y', '-Y', '+X/-Y'];
+  const idx = Math.round(((deg % 360) + 360) % 360 / 45) % 8;
+  return dirs[idx];
 }
 
 function fmt(v) { return (v === null || v === undefined) ? 'n/a' : v.toFixed(1) + 'deg'; }
