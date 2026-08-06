@@ -1,0 +1,152 @@
+=====================================================
+NOTEBOOK_DEBUG — microros_teensy
+=====================================================
+Running log of bugs/issues found in this project and how they were
+fixed. Project: microros_teensy. Add new dated entries at the bottom
+as new issues come up — this is not encoder-specific, log anything
+(motor, IMU, comms, build, etc.) here.
+
+=====================================================
+SECTION: Encoder noise / wheel_encoder counting
+=====================================================
+
+-----------------------------------------------------
+[2026-08-06] Issue: wheel_encoder count drifting/decreasing on its own
+-----------------------------------------------------
+
+SYMPTOM
+- Left-side encoder count would decrease continuously by itself.
+- First suspected: only happening right at motor start.
+- Confirmed by testing: it continues even while the robot is
+  completely idle (motors off, no cmd_vel commanding motion).
+
+ROOT CAUSE
+- The encoder ISR (leftEncoderISR / rightEncoderISR in src/main.cpp)
+  only validated two things per pulse:
+    1. Width  — pulse must stay HIGH long enough (LEFT/RIGHT_MIN_PULSE_WIDTH_US)
+    2. Gap    — must be spaced out from the last accepted pulse
+                (LEFT/RIGHT_ENCODER_DEBOUNCE_US)
+- Neither check knows whether the wheel is actually supposed to be
+  turning. Electrical noise (EMI, motor switching transients, etc.)
+  that happens to pass both checks gets counted as a real pulse,
+  and if it's biased in one direction, it looks like a steady drift
+  rather than random jitter.
+
+FIX APPLIED
+- Added a "stationary gate" to both ISRs: a pulse is only counted if
+  the robot is currently commanded to move (motorsWereStopped == false,
+  set from cmd_vel in set_motors()). If nothing should be turning the
+  wheel, any pulse that arrives is treated as noise — bumped into the
+  glitch counter instead of the pulse counter, no direction is even read.
+- Location: leftEncoderISR() / rightEncoderISR() in src/main.cpp,
+  right after the width+gap checks, before the direction read.
+
+TRADE-OFF TO REMEMBER
+- Manually spinning a wheel by hand (no cmd_vel sent) will NOT be
+  counted anymore. This is intentional — expected side effect of the
+  fix, not a bug.
+
+-----------------------------------------------------
+[2026-08-06] Regression: encoder stopped counting during real driving
+-----------------------------------------------------
+
+SYMPTOM
+- After the stationary-gate fix above, encoder count stayed flat
+  (stable) even while actively driving with teleop — not just at rest.
+
+ROOT CAUSE
+- The stationary gate is driven by commandingMotion in set_motors():
+    bool commandingMotion = (fabs(left) > DEADBAND) || (fabs(right) > DEADBAND);
+- DEADBAND was 0.02 (2% of full [-1,1] command scale). This was meant
+  only to filter floating-point noise around exact zero, but it ended
+  up rejecting real teleop commands whose per-wheel magnitude was
+  smaller than 0.02 — so motorsWereStopped never flipped to "moving"
+  even though PWM was clearly nonzero and the wheel was visibly
+  spinning (motor drive itself has no deadband).
+
+FIX APPLIED
+- Lowered the deadband from 0.02 to 0.005 (named MOTION_DEADBAND in
+  set_motors(), src/main.cpp). Still swallows float/controller noise
+  at exact zero, but no longer blocks legitimate slow-speed commands.
+
+-----------------------------------------------------
+[2026-08-06] Two-encoder hardware mismatch — decision to run on one encoder
+-----------------------------------------------------
+
+CONTEXT
+- Robot has two wheel encoders. In practice they don't track each
+  other reliably (large value difference between the two, one side
+  much noisier than the other even after filtering).
+- Decision: run on a single "primary" encoder rather than trying to
+  reconcile both in firmware. The disabled side is left in code
+  (commented attachInterrupt call) so it can be re-enabled for testing.
+
+CURRENT STATE (as of this entry)
+- Active encoder: RIGHT wheel (R_A_PLUS / R_A_MINUS, pins 16 / 17).
+- Disabled encoder: LEFT wheel (L_A_PLUS / L_A_MINUS, pins 14 / 15).
+  Its attachInterrupt() call is commented out in setup().
+- To swap which physical wheel is primary: comment/uncomment the
+  attachInterrupt() calls in setup(), AND swap which current*Pulse /
+  current*Glitch variable feeds encoder_data[0]/[2] in timer_callback()
+  — the code always publishes the ACTIVE encoder at index [0]/[2],
+  regardless of which physical wheel that is.
+
+-----------------------------------------------------
+CURRENT /wheel_encoder MESSAGE FORMAT (std_msgs/Int32MultiArray)
+-----------------------------------------------------
+encoder_data[0] = primary encoder pulse count   (currently: right wheel)
+encoder_data[1] = secondary encoder pulse count (currently: left wheel, disabled — always 0)
+encoder_data[2] = primary encoder glitch count   (rejected pulses: too narrow / too close together / arrived while stationary)
+encoder_data[3] = secondary encoder glitch count (always 0 while that encoder is disabled)
+
+Note: originally this was a Float32MultiArray. Switched to
+Int32MultiArray because pulse/glitch counts are exact integers and
+the robot is expected to run into the tens of thousands of wheel
+revolutions — float32 only represents integers exactly up to 2^24
+(~16.7M), beyond which consecutive counts start aliasing. int32 is
+exact up to ~2.1 billion, effectively no ceiling for this use case.
+If you ever see this on the Python side, it must subscribe as
+Int32MultiArray, not Float32MultiArray.
+
+=====================================================
+SECTION: micro-ROS / agent connection
+=====================================================
+
+1. IMU timestamp was never synced to real time
+   - rmw_uros_epoch_millis() was being used for msg_imu.header.stamp,
+     but rmw_uros_sync_session() was never called, so the epoch clock
+     was never set from the agent — timestamps were meaningless (0 or
+     time-since-boot).
+   - Fix: added RCCHECK(rmw_uros_sync_session(1000)); in setup(),
+     placed AFTER rclc_support_init() (that call is what actually
+     creates the session — calling sync before it exists made setup()
+     fail and drop the Teensy into the error-loop LED blink forever,
+     which looked like "the agent can't connect").
+
+2. Removed unused MAX_SPEED constant (dead code, only referenced in
+   comments, not in any actual calculation).
+
+-----------------------------------------------------
+HOW TO DEBUG FURTHER / WHAT TO WATCH
+-----------------------------------------------------
+- `ros2 topic echo /wheel_encoder` while:
+  a) robot sits still           -> [0]/[1] should not change; [2]/[3] may
+                                    tick up if there's noise, that's fine.
+  b) driving straight            -> [0] should increase/decrease smoothly
+                                    with real motion.
+  c) motor start (stop->move)    -> brief burst in [2] is expected
+                                    (blanking window, first ~15ms), not
+                                    a bug.
+- If glitch counts stay unexpectedly high during normal driving,
+  candidates to retune (src/main.cpp, near top "Encoder Noise Filtering"
+  section):
+    LEFT/RIGHT_ENCODER_DEBOUNCE_US   (gap between accepted pulses)
+    LEFT/RIGHT_MIN_PULSE_WIDTH_US    (minimum valid pulse width)
+    MOTOR_START_BLANK_MS             (length of stricter motor-start window)
+    BLANK_MIN_PULSE_WIDTH_US / BLANK_ENCODER_DEBOUNCE_US (stricter values
+                                       used only during that window)
+- Real hardware fix (not yet done, still just a note in code comments):
+  route encoder wires away from motor power leads, twisted pair /
+  shielded cable, common ground, small decoupling cap (~0.1uF) across
+  motor terminals — software filtering reduces symptoms but can't fully
+  fix a badly-coupled signal.

@@ -6,7 +6,7 @@
 #include <rclc/executor.h>
 #include <geometry_msgs/msg/twist.h>
 #include <sensor_msgs/msg/imu.h>
-#include <std_msgs/msg/float32_multi_array.h>
+#include <std_msgs/msg/int32_multi_array.h>
 #include <Wire.h>
 #include "SparkFun_BNO08x_Arduino_Library.h"
 
@@ -36,7 +36,6 @@ const int R_A_PLUS  = 17;
 // Wheel geometry / pulses-per-rev / meter conversion is now done on the
 // Python side during calibration, not here. Keep WHEEL_DIAMETER_MM and
 // PULSES_PER_REV in your Python calibration script for reference.
-const float MAX_SPEED = 1.0;     // m/s max speed, used below for debounce timing math
 
 // ---------------- Timing -----------------------------
 const uint32_t IMU_REPORT_INTERVAL_MS = 50;   // must match TIMER_PERIOD_MS
@@ -66,10 +65,10 @@ const unsigned long CMD_TIMEOUT_MS    = 500;  // stop motors if no cmd_vel
 //
 // Minimum time between accepted pulse edges, in microseconds (gap debounce).
 // Depends on your wheel circumference and pulses-per-rev (now tracked in
-// Python): max_pulses_per_sec = (MAX_SPEED / circumference_m) * pulses_per_rev,
+// Python): max_pulses_per_sec = (max_speed_mps / circumference_m) * pulses_per_rev,
 // min_pulse_interval_us = 1e6 / max_pulses_per_sec. With this robot's old
 // values (125mm wheel, 1000 pulses/rev) that worked out to ~392us at
-// MAX_SPEED=1.0 m/s — keep this comfortably below your equivalent number
+// 1.0 m/s max speed — keep this comfortably below your equivalent number
 // or you'll clip real high-speed pulses.
 //
 // Split per wheel: if one side is noisier than the other, raise ITS
@@ -138,14 +137,16 @@ rcl_publisher_t encoder_pub;
 
 geometry_msgs__msg__Twist msg_cmd;
 sensor_msgs__msg__Imu msg_imu;
-std_msgs__msg__Float32MultiArray msg_encoder;
+std_msgs__msg__Int32MultiArray msg_encoder;
 
 // [0]=left_raw_pulses, [1]=right_raw_pulses,
 // [2]=left_glitch_count, [3]=right_glitch_count
 // (Meter conversion removed — do wheel geometry / calibration in Python.
 // You mentioned using left [0] as your primary encoder; right [1] is
 // still read and published for reference/diagnostics.)
-float encoder_data[4];
+// int32 (not float32): pulse/glitch counts are exact integers and can
+// exceed float32's 2^24 exact-integer range on long-running sessions.
+int32_t encoder_data[4];
 
 rclc_executor_t executor;
 rclc_support_t support;
@@ -210,10 +211,15 @@ void set_motors(float lin_x, float ang_z) {
     float left  = (lin_x - ang_z) * LEFT_MOTOR_INVERT;
     float right = (lin_x + ang_z) * RIGHT_MOTOR_INVERT;
 
-    // Detect a stop -> move transition to arm the encoder blanking window.
-    // Uses a small deadband so residual near-zero commands don't repeatedly
-    // re-arm it.
-    bool commandingMotion = (fabs(left) > 0.02f) || (fabs(right) > 0.02f);
+    // Detect a stop -> move transition to arm the encoder blanking window,
+    // and to gate the encoder ISRs' stationary-noise filter (see
+    // leftEncoderISR/rightEncoderISR). Deadband only needs to be big enough
+    // to swallow floating-point/controller noise around exact zero — NOT a
+    // "minimum driving speed" cutoff. 0.02 (2% of full scale) was rejecting
+    // real slow-teleop commands and made the encoders stop counting during
+    // actual commanded motion, so this is intentionally tiny.
+    const float MOTION_DEADBAND = 0.005f;
+    bool commandingMotion = (fabs(left) > MOTION_DEADBAND) || (fabs(right) > MOTION_DEADBAND);
     if (commandingMotion && motorsWereStopped) {
         motorStartTime = millis();
     }
@@ -271,6 +277,17 @@ void leftEncoderISR() {
     leftGlitchCount++;
     return;
   }
+
+  // Stationary gate: nothing should be turning the wheel unless we're
+  // currently commanding motion. A pulse that passed width+gap validation
+  // but arrives while motorsWereStopped is true isn't a slow real pulse —
+  // it's noise on the line that happens to look pulse-shaped (this is what
+  // was causing the count to creep down at idle, not just at motor start).
+  if (motorsWereStopped) {
+    leftGlitchCount++;
+    return;
+  }
+
   lastLeftPulseMicros = now;
 
   // อ่านสถานะของอีกขาเพื่อตัดสินทิศทาง (หากหมุนสลับทางให้สลับ HIGH/LOW)
@@ -304,6 +321,13 @@ void rightEncoderISR() {
     rightGlitchCount++;
     return;
   }
+
+  // Same stationary gate as leftEncoderISR — see its comment.
+  if (motorsWereStopped) {
+    rightGlitchCount++;
+    return;
+  }
+
   lastRightPulseMicros = now;
 
   if (digitalRead(R_A_MINUS) == HIGH) {
@@ -362,14 +386,22 @@ void timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
   int64_t currentRightGlitch = rightGlitchCount;
   interrupts();
 
-  encoder_data[0] = (float)currentLeftPulse;   // primary encoder (left)
-  encoder_data[1] = (float)currentRightPulse;  // reference/diagnostic only
+  // Cast from int64_t counters to the int32_t wire format. Individual
+  // encoder/glitch counts are expected to stay well within int32 range;
+  // if a session ever runs long enough to overflow it, the underlying
+  // int64 counters remain correct internally.
+  // [0]/[2] are always the PRIMARY encoder slot regardless of which
+  // physical wheel is wired in (see the attachInterrupt swap in setup()).
+  // Currently: right wheel (R_A_PLUS/R_A_MINUS) is primary, left is
+  // disabled — so currentRightPulse/currentRightGlitch go in [0]/[2].
+  encoder_data[0] = (int32_t)currentRightPulse;
+  encoder_data[1] = (int32_t)currentLeftPulse;   // left encoder disabled — always 0, see setup()
   // Rejected-edge counts (width or gap failures) — watch these while the
   // robot sits still or the motors run to gauge how noisy the lines are,
   // and tune LEFT/RIGHT_MIN_PULSE_WIDTH_US / LEFT/RIGHT_ENCODER_DEBOUNCE_US
   // (and MOTOR_START_BLANK_MS if noise clusters right at motor start).
-  encoder_data[2] = (float)currentLeftGlitch;
-  encoder_data[3] = (float)currentRightGlitch;
+  encoder_data[2] = (int32_t)currentRightGlitch;
+  encoder_data[3] = (int32_t)currentLeftGlitch;
 
   msg_encoder.data.data = encoder_data;
   msg_encoder.data.size = 4;
@@ -418,11 +450,22 @@ void setup() {
 
   // CHANGE instead of RISING: the ISR now needs both edges to measure
   // pulse width (see leftEncoderISR/rightEncoderISR comments above).
-  attachInterrupt(digitalPinToInterrupt(L_A_PLUS), leftEncoderISR, CHANGE);
+  // Left encoder disabled — using the right-wheel encoder (R_A_PLUS/
+  // R_A_MINUS, pins 16/17) as the primary/only encoder instead. Swap this
+  // back if you want to go back to the left wheel (L_A_PLUS/L_A_MINUS,
+  // pins 14/15).
+  // attachInterrupt(digitalPinToInterrupt(L_A_PLUS), leftEncoderISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(R_A_PLUS), rightEncoderISR, CHANGE);
 
   allocator = rcl_get_default_allocator();
   RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
+
+  // Sync the RMW epoch clock to the agent's wall clock so that
+  // rmw_uros_epoch_millis() (used for msg_imu.header.stamp below) returns
+  // real time instead of 0 / time-since-boot. Must come after
+  // rclc_support_init(), which is what actually establishes the session.
+  RCCHECK(rmw_uros_sync_session(1000));
+
   RCCHECK(rclc_node_init_default(&node, "teensy_bot", "", &support));
 
   RCCHECK(rclc_subscription_init_default(
@@ -440,7 +483,7 @@ void setup() {
   RCCHECK(rclc_publisher_init_default(
     &encoder_pub,
     &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
+    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32MultiArray),
     "wheel_encoder"));
 
   RCCHECK(rclc_timer_init_default(
