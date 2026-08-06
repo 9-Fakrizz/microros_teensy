@@ -20,11 +20,17 @@ IMPORTANT -- firmware encoder wiring:
   to the left wheel before running this script.
 
 GUI:
-  A grid view shows the robot's tracked position (arrow = heading),
-  its path so far, and the current goal. Text boxes + a "Go" button
-  let you send a new goal (in cm) at any time, including while the
-  robot is mid-move. A status readout shows raw IMU yaw and the
-  current target heading in degrees, for debugging the IMU.
+  Served as a local web page (no display/X11 needed on the Pi) --
+  a grid view shows the robot's tracked position (arrow = heading),
+  its path so far, and the current goal. A form + "Go" button let you
+  send a new goal (in cm) at any time, including while the robot is
+  mid-move. A status readout shows raw IMU yaw and the current target
+  heading in degrees, for debugging the IMU.
+
+  Open it from any browser on the same network:
+      http://<pi5-ip-address>:8080
+
+Requires Flask (pip install flask) in addition to your ROS2 env.
 
 Run (after sourcing your ROS2 setup):
     python3 grid_nav.py
@@ -39,11 +45,9 @@ from sensor_msgs.msg import Imu
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Int32MultiArray
 
-import matplotlib.pyplot as plt
-from matplotlib.widgets import TextBox, Button
-import matplotlib.patches as patches
+from flask import Flask, jsonify, request, Response
 
-SCRIPT_VERSION = "v1.0"
+SCRIPT_VERSION = "v2.0 - web GUI"
 
 # ---------------- Configuration ----------------
 IMU_TOPIC = "/imu_data"
@@ -293,99 +297,193 @@ class GridNavNode(Node):
             }
 
 
-class GridNavGUI:
-    def __init__(self, node: GridNavNode):
-        self.node = node
+HTML_PAGE = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>grid_nav.py</title>
+<style>
+  body { font-family: sans-serif; background: #1e1e1e; color: #eee; margin: 0; padding: 16px; }
+  h1 { font-size: 16px; font-weight: normal; color: #aaa; }
+  #canvas { background: #111; border: 1px solid #444; display: block; margin-bottom: 12px; }
+  #status { white-space: pre; font-family: monospace; font-size: 13px; background: #262626;
+            border: 1px solid #444; padding: 10px; display: inline-block; min-width: 320px; }
+  form { margin-top: 12px; }
+  input { width: 70px; font-size: 14px; padding: 4px; }
+  button { font-size: 14px; padding: 5px 14px; margin-left: 6px; }
+  label { margin-right: 4px; }
+</style>
+</head>
+<body>
+<h1>grid_nav.py -- live position (poll __POLL_MS__ms)</h1>
+<canvas id="canvas" width="__CANVAS_PX__" height="__CANVAS_PX__"></canvas>
+<div id="status">connecting...</div>
+<form id="goalForm">
+  <label>Goal X (cm)</label><input id="goalX" type="number" value="0" step="1">
+  <label>Goal Y (cm)</label><input id="goalY" type="number" value="0" step="1">
+  <button type="submit">Go</button>
+</form>
 
-        self.fig, self.ax = plt.subplots(figsize=(7, 7))
-        plt.subplots_adjust(bottom=0.22)
-        self.ax.set_aspect('equal')
-        self.ax.set_xlabel('X (cm)')
-        self.ax.set_ylabel('Y (cm)')
-        self.ax.set_title('grid_nav.py -- live position')
+<script>
+const HALF_EXTENT = __HALF_EXTENT__;
+const SPACING = __SPACING__;
+const CANVAS_PX = __CANVAS_PX__;
+const SCALE = CANVAS_PX / (2 * HALF_EXTENT); // px per cm
 
-        e = GRID_HALF_EXTENT_CM
-        self.ax.set_xlim(-e, e)
-        self.ax.set_ylim(-e, e)
-        self.ax.set_xticks(range(-e, e + 1, GRID_SPACING_CM))
-        self.ax.set_yticks(range(-e, e + 1, GRID_SPACING_CM))
-        self.ax.grid(True, linewidth=0.5, alpha=0.5)
-        self.ax.axhline(0, color='gray', linewidth=0.8)
-        self.ax.axvline(0, color='gray', linewidth=0.8)
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+let path = [];
+let lastGoal = null;
 
-        (self.path_line,) = self.ax.plot([], [], '-', color='tab:blue', linewidth=1.5)
-        (self.goal_marker,) = self.ax.plot([], [], 'x', color='red', markersize=12, markeredgewidth=2)
-        self.robot_arrow = None
+function toPx(xcm, ycm) {
+  return [CANVAS_PX / 2 + xcm * SCALE, CANVAS_PX / 2 - ycm * SCALE];
+}
 
-        self.status_text = self.ax.text(
-            0.02, 0.98, '', transform=self.ax.transAxes,
-            va='top', ha='left', fontsize=9, family='monospace',
-            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8)
-        )
+function draw(state) {
+  ctx.clearRect(0, 0, CANVAS_PX, CANVAS_PX);
 
-        ax_x = plt.axes([0.15, 0.05, 0.15, 0.06])
-        ax_y = plt.axes([0.35, 0.05, 0.15, 0.06])
-        ax_go = plt.axes([0.55, 0.05, 0.15, 0.06])
-        self.tb_x = TextBox(ax_x, 'Goal X ', initial='0')
-        self.tb_y = TextBox(ax_y, 'Goal Y ', initial='0')
-        self.btn_go = Button(ax_go, 'Go')
-        self.btn_go.on_clicked(self._on_go)
+  // grid
+  ctx.strokeStyle = '#333';
+  ctx.lineWidth = 1;
+  for (let c = -HALF_EXTENT; c <= HALF_EXTENT; c += SPACING) {
+    let [px, ] = toPx(c, 0);
+    ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, CANVAS_PX); ctx.stroke();
+    let [, py] = toPx(0, c);
+    ctx.beginPath(); ctx.moveTo(0, py); ctx.lineTo(CANVAS_PX, py); ctx.stroke();
+  }
+  // axes
+  ctx.strokeStyle = '#666';
+  ctx.lineWidth = 1.5;
+  let [ox, oy] = toPx(0, 0);
+  ctx.beginPath(); ctx.moveTo(ox, 0); ctx.lineTo(ox, CANVAS_PX); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, oy); ctx.lineTo(CANVAS_PX, oy); ctx.stroke();
 
-        self.timer = self.fig.canvas.new_timer(interval=int(1000 / GUI_HZ))
-        self.timer.add_callback(self._redraw)
-        self.timer.start()
+  // path
+  if (path.length > 1) {
+    ctx.strokeStyle = '#4da3ff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let [sx, sy] = toPx(path[0][0], path[0][1]);
+    ctx.moveTo(sx, sy);
+    for (const p of path.slice(1)) {
+      let [px, py] = toPx(p[0], p[1]);
+      ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+  }
 
-    def _on_go(self, event):
+  // goal marker
+  if (state.goal) {
+    let [gx, gy] = toPx(state.goal[0], state.goal[1]);
+    ctx.strokeStyle = '#ff4d4d';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(gx - 6, gy - 6); ctx.lineTo(gx + 6, gy + 6); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(gx - 6, gy + 6); ctx.lineTo(gx + 6, gy - 6); ctx.stroke();
+  }
+
+  // robot arrow (heading: 0deg = +X, math convention; canvas Y is flipped)
+  const headingDeg = state.heading_deg ?? 0;
+  const rad = headingDeg * Math.PI / 180;
+  const [rx, ry] = toPx(state.x, state.y);
+  const len = SPACING * 0.8 * SCALE;
+  const tipX = rx + len * Math.cos(rad);
+  const tipY = ry - len * Math.sin(rad);
+  ctx.strokeStyle = '#ffa500';
+  ctx.fillStyle = '#ffa500';
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(rx, ry); ctx.lineTo(tipX, tipY); ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(tipX, tipY, 5, 0, 2 * Math.PI);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(rx, ry, 3, 0, 2 * Math.PI);
+  ctx.fillStyle = '#4da3ff';
+  ctx.fill();
+}
+
+function fmt(v) { return (v === null || v === undefined) ? 'n/a' : v.toFixed(1) + 'deg'; }
+
+function updateStatus(state) {
+  const legInfo = (state.state === 'RUNNING') ? `${state.leg_idx}/${state.leg_count}` : '-';
+  document.getElementById('status').textContent =
+    `pos:    (${state.x.toFixed(1)}, ${state.y.toFixed(1)}) cm\\n` +
+    `state:  ${state.state}  phase: ${state.phase}\\n` +
+    `leg:    ${legInfo}\\n` +
+    `IMU yaw (raw):     ${fmt(state.yaw_deg)}\\n` +
+    `heading (ref=0):   ${fmt(state.heading_deg)}\\n` +
+    `target heading:    ${fmt(state.target_heading_deg)}`;
+}
+
+async function poll() {
+  try {
+    const res = await fetch('/api/state');
+    const state = await res.json();
+    path = state.path;
+    lastGoal = state.goal;
+    draw(state);
+    updateStatus(state);
+  } catch (e) {
+    document.getElementById('status').textContent = 'connection lost: ' + e;
+  }
+}
+
+document.getElementById('goalForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const x = parseFloat(document.getElementById('goalX').value);
+  const y = parseFloat(document.getElementById('goalY').value);
+  await fetch('/api/goal', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({x: x, y: y})
+  });
+});
+
+setInterval(poll, __POLL_MS__);
+poll();
+</script>
+</body>
+</html>
+"""
+
+WEB_PORT = 8080
+GUI_POLL_MS = int(1000 / GUI_HZ)
+CANVAS_PX = 700
+
+
+def render_page():
+    return (HTML_PAGE
+            .replace('__HALF_EXTENT__', str(GRID_HALF_EXTENT_CM))
+            .replace('__SPACING__', str(GRID_SPACING_CM))
+            .replace('__CANVAS_PX__', str(CANVAS_PX))
+            .replace('__POLL_MS__', str(GUI_POLL_MS)))
+
+
+def create_app(node: GridNavNode) -> Flask:
+    app = Flask(__name__)
+    # Werkzeug's request logging is noisy at GUI_HZ polling rates.
+    import logging
+    logging.getLogger('werkzeug').setLevel(logging.WARNING)
+
+    @app.route('/')
+    def index():
+        return Response(render_page(), mimetype='text/html')
+
+    @app.route('/api/state')
+    def api_state():
+        return jsonify(node.get_snapshot())
+
+    @app.route('/api/goal', methods=['POST'])
+    def api_goal():
+        data = request.get_json(force=True)
         try:
-            gx = float(self.tb_x.text)
-            gy = float(self.tb_y.text)
-        except ValueError:
-            self.node.get_logger().warn(f'Invalid goal input: x={self.tb_x.text!r} y={self.tb_y.text!r}')
-            return
-        self.node.set_goal(gx, gy)
+            gx = float(data['x'])
+            gy = float(data['y'])
+        except (KeyError, TypeError, ValueError):
+            return jsonify({'ok': False, 'error': 'invalid x/y'}), 400
+        node.set_goal(gx, gy)
+        return jsonify({'ok': True})
 
-    def _redraw(self):
-        snap = self.node.get_snapshot()
-
-        xs = [p[0] for p in snap['path']]
-        ys = [p[1] for p in snap['path']]
-        self.path_line.set_data(xs, ys)
-
-        if snap['goal'] is not None:
-            self.goal_marker.set_data([snap['goal'][0]], [snap['goal'][1]])
-
-        if self.robot_arrow is not None:
-            self.robot_arrow.remove()
-            self.robot_arrow = None
-
-        heading_deg = snap['heading_deg'] if snap['heading_deg'] is not None else 0.0
-        heading_rad = math.radians(heading_deg)
-        arrow_len = GRID_SPACING_CM * 0.8
-        dx = arrow_len * math.cos(heading_rad)
-        dy = arrow_len * math.sin(heading_rad)
-        self.robot_arrow = self.ax.add_patch(patches.FancyArrow(
-            snap['x'], snap['y'], dx, dy,
-            width=2.5, head_width=8, head_length=8,
-            color='tab:orange', length_includes_head=True
-        ))
-
-        def fmt(v, suffix='deg'):
-            return f'{v:.1f}{suffix}' if v is not None else 'n/a'
-
-        leg_info = f"{snap['leg_idx']}/{snap['leg_count']}" if snap['state'] == 'RUNNING' else '-'
-        self.status_text.set_text(
-            f"pos:    ({snap['x']:.1f}, {snap['y']:.1f}) cm\n"
-            f"state:  {snap['state']}  phase: {snap['phase']}\n"
-            f"leg:    {leg_info}\n"
-            f"IMU yaw (raw):     {fmt(snap['yaw_deg'])}\n"
-            f"heading (ref=0):   {fmt(snap['heading_deg'])}\n"
-            f"target heading:    {fmt(snap['target_heading_deg'])}"
-        )
-
-        self.fig.canvas.draw_idle()
-
-    def show(self):
-        plt.show()
+    return app
 
 
 def main(args=None):
@@ -396,9 +494,10 @@ def main(args=None):
     spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     spin_thread.start()
 
-    gui = GridNavGUI(node)
+    app = create_app(node)
+    node.get_logger().info(f'Web GUI at http://<this-device-ip>:{WEB_PORT}')
     try:
-        gui.show()
+        app.run(host='0.0.0.0', port=WEB_PORT, threaded=True, use_reloader=False)
     except KeyboardInterrupt:
         pass
     finally:
