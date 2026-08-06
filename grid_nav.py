@@ -60,13 +60,29 @@ ENCODER_INDEX_PRIMARY_PULSES = 0  # must be the LEFT wheel -- see module docstri
 # if wheel/tire/encoder changes.
 PULSES_PER_CM = 183.5
 
-FORWARD_SPEED = 0.15           # m/s, straight-line drive speed
-ROTATE_SPEED = 0.12            # max commanded speed magnitude while pivoting
+FORWARD_SPEED = 0.20           # m/s, straight-line drive speed
+ROTATE_SPEED = 0.20            # max commanded speed magnitude while pivoting
 
 # If the robot pivots the WRONG way (heading error grows instead of
 # shrinking) during testing, flip this to -1. Left wheel stays at 0
 # regardless of this value -- it only affects rotation direction.
 PIVOT_SIGN = 1
+
+# During pivot, we send linear.x = cmd and angular.z = PIVOT_ANGULAR_SIGN * cmd.
+# The firmware's differential mix is:
+#   left  = (lin_x - ang_z) * INVERT
+#   right = (lin_x + ang_z) * INVERT
+# angular.z = +cmd zeroes "left" (lin_x - ang_z = 0); angular.z = -cmd
+# zeroes "right" (lin_x + ang_z = 0). Testing showed +cmd actually stops
+# the physical RIGHT wheel and drives the physical LEFT wheel -- backwards
+# from what we want -- so this is set to -1 to zero the other term instead.
+# Flip back to +1 if it turns out backwards again.
+PIVOT_ANGULAR_SIGN = -1
+
+# Flips which physical turn direction counts as "+Y". Confirmed backwards
+# during testing (positive Y goals were driving toward -Y), so this is
+# flipped from the default. Flip back to +1 if it turns out reversed again.
+Y_AXIS_SIGN = -1
 
 HEADING_TOLERANCE_DEG = 3.0    # stop pivoting once within this of target
 POSITION_EPSILON_CM = 1.0      # skip an axis leg smaller than this
@@ -76,9 +92,10 @@ POSITION_EPSILON_CM = 1.0      # skip an axis leg smaller than this
 # Output is clamped to +/-ROTATE_SPEED and applied to BOTH linear.x and
 # angular.z (see control_loop) -- that's what keeps the left wheel at
 # exactly 0 regardless of the PID output's sign/magnitude.
-ROTATE_KP = 0.8
+# Gains lowered (was KP=0.8, KD=0.05) -- response was too aggressive/jerky.
+ROTATE_KP = 0.5
 ROTATE_KI = 0.0
-ROTATE_KD = 0.05
+ROTATE_KD = 0.03
 ROTATE_MAX_INTEGRAL = 0.3
 # PWM floor so the pivot doesn't stall out approaching zero error before
 # actually reaching HEADING_TOLERANCE_DEG.
@@ -86,15 +103,23 @@ ROTATE_MIN_OUTPUT = 0.05
 
 # Drive-phase PID: keeps the robot on its cardinal heading while driving
 # straight. Kept small/clamped -- the ROTATE phase does the real turning,
-# not this.
-DRIVE_KP = 1.0
+# not this. Gains lowered (was KP=1.0, KD=0.1) -- same reason as ROTATE.
+DRIVE_KP = 0.6
 DRIVE_KI = 0.0
-DRIVE_KD = 0.1
+DRIVE_KD = 0.05
 DRIVE_MAX_INTEGRAL = 0.3
-MAX_ANGULAR_Z_HOLD = 0.3
+MAX_ANGULAR_Z_HOLD = 0.20
+
+# Same left/right term-swap issue as PIVOT_ANGULAR_SIGN above likely
+# applies here too: a heading-hold correction with the wrong sign fights
+# itself instead of converging ("tries to reach the setpoint but can't").
+# Flipped from the naive -correction convention (borrowed from
+# heading_hold.py, which assumed unswapped wiring) to match. If this makes
+# it noticeably worse (error grows instead of settling), flip back to -1.
+DRIVE_CORRECTION_SIGN = 1
 
 LOOP_HZ = 20.0                 # control loop rate
-GUI_HZ = 5.0                   # GUI redraw rate
+GUI_HZ = 12.0                  # GUI poll/redraw rate
 
 GRID_SPACING_CM = 20            # gridline spacing, cosmetic only
 GRID_HALF_EXTENT_CM = 200       # initial view: +/- this many cm
@@ -129,9 +154,15 @@ class PID:
         self.integral = 0.0
         self.prev_error = 0.0
 
-    def reset(self):
+    def reset(self, initial_error=0.0):
+        # Seed prev_error with the actual current error (not 0) so the
+        # first compute() after a reset doesn't see a fake error jump from
+        # 0 -> real_error and fire a derivative-kick spike (dominates the
+        # output on a large setpoint change, e.g. rotating to a new target
+        # heading -- this was causing the "very fast angular" burst at the
+        # start of each leg).
         self.integral = 0.0
-        self.prev_error = 0.0
+        self.prev_error = initial_error
 
     def compute(self, error):
         self.integral += error * self.dt
@@ -175,6 +206,7 @@ class GridNavNode(Node):
         self.leg_target_distance_cm = 0.0
         self.leg_baseline_pulses = 0
         self.goal = None             # (gx, gy) for display
+        self.end_dir_deg = None      # requested final heading, degrees (or None)
 
         self.path = [(0.0, 0.0)]     # visited points, for GUI trail
 
@@ -211,7 +243,7 @@ class GridNavNode(Node):
 
     # ---------------- Goal handling ----------------
 
-    def set_goal(self, gx, gy):
+    def set_goal(self, gx, gy, end_dir_deg=None):
         with self._lock:
             dx = gx - self.x
             dy = gy - self.y
@@ -220,8 +252,14 @@ class GridNavNode(Node):
                 legs.append(('x', dx))
             if abs(dy) >= POSITION_EPSILON_CM:
                 legs.append(('y', dy))
+            if end_dir_deg is not None:
+                # Rotate-only leg: no drive phase, just turn to face this
+                # heading (degrees, relative to heading_ref where 0 = +X)
+                # once position legs are done.
+                legs.append(('heading', end_dir_deg))
 
             self.goal = (gx, gy)
+            self.end_dir_deg = end_dir_deg
             self.legs = legs
             self.leg_idx = 0
 
@@ -247,13 +285,16 @@ class GridNavNode(Node):
 
         if axis == 'x':
             target = self.heading_ref if delta > 0 else self.heading_ref + math.pi
-        else:
-            target = self.heading_ref + (math.pi / 2.0) if delta > 0 else self.heading_ref - (math.pi / 2.0)
+        elif axis == 'y':
+            quarter_turn = Y_AXIS_SIGN * (math.pi / 2.0)
+            target = self.heading_ref + quarter_turn if delta > 0 else self.heading_ref - quarter_turn
+        else:  # 'heading' -- delta is an absolute end direction in degrees
+            target = self.heading_ref + math.radians(delta)
 
         self.leg_target_heading = normalize_angle(target)
-        self.leg_target_distance_cm = abs(delta)
+        self.leg_target_distance_cm = abs(delta) if axis in ('x', 'y') else 0.0
         self.phase = 'ROTATE'
-        self.rotate_pid.reset()
+        self.rotate_pid.reset(angle_diff(self.leg_target_heading, self.current_yaw))
 
     # ---------------- Control loop ----------------
 
@@ -268,9 +309,26 @@ class GridNavNode(Node):
             if self.phase == 'ROTATE':
                 error = angle_diff(self.leg_target_heading, self.current_yaw)
                 if abs(math.degrees(error)) <= HEADING_TOLERANCE_DEG:
+                    axis, _ = self.legs[self.leg_idx]
+                    if axis == 'heading':
+                        # Rotate-only leg (final end direction) -- no DRIVE
+                        # phase, no position change. Leg is done as soon as
+                        # heading is reached.
+                        self.leg_idx += 1
+                        self.cmd_pub.publish(twist)
+                        if self.leg_idx >= len(self.legs):
+                            self.state = 'IDLE'
+                            self.get_logger().info(
+                                f'Goal reached: ({self.x:.1f}, {self.y:.1f}) cm, '
+                                f'facing {math.degrees(self.leg_target_heading - self.heading_ref):.1f} deg'
+                            )
+                        else:
+                            self._start_leg_locked()
+                        return
+
                     self.leg_baseline_pulses = self.last_pulses
                     self.phase = 'DRIVE'
-                    self.drive_pid.reset()
+                    self.drive_pid.reset(error)
                     self.cmd_pub.publish(twist)  # brief all-zero pause between phases
                     return
 
@@ -280,10 +338,10 @@ class GridNavNode(Node):
                 # reaching HEADING_TOLERANCE_DEG.
                 if abs(cmd) < ROTATE_MIN_OUTPUT:
                     cmd = math.copysign(ROTATE_MIN_OUTPUT, cmd if cmd != 0 else error)
-                # linear.x == angular.z always zeroes the left-wheel term
-                # in the firmware's differential mix, regardless of sign.
+                # See PIVOT_ANGULAR_SIGN comment -- this zeroes the firmware
+                # term that corresponds to the physical LEFT wheel.
                 twist.linear.x = cmd
-                twist.angular.z = cmd
+                twist.angular.z = PIVOT_ANGULAR_SIGN * cmd
                 self.cmd_pub.publish(twist)
                 return
 
@@ -314,7 +372,7 @@ class GridNavNode(Node):
             herr = angle_diff(self.leg_target_heading, self.current_yaw)
             correction = self.drive_pid.compute(herr)
             twist.linear.x = FORWARD_SPEED
-            twist.angular.z = -correction  # sign convention matches heading_hold.py
+            twist.angular.z = DRIVE_CORRECTION_SIGN * correction
             self.cmd_pub.publish(twist)
 
     def stop_robot(self):
@@ -345,6 +403,7 @@ class GridNavNode(Node):
                 'target_heading_deg': target_deg,
                 'leg_idx': self.leg_idx,
                 'leg_count': len(self.legs),
+                'end_dir_deg': self.end_dir_deg,
             }
 
 
@@ -355,25 +414,48 @@ HTML_PAGE = """<!doctype html>
 <title>grid_nav.py</title>
 <style>
   body { font-family: sans-serif; background: #1e1e1e; color: #eee; margin: 0; padding: 16px; }
-  h1 { font-size: 16px; font-weight: normal; color: #aaa; }
-  #canvas { background: #111; border: 1px solid #444; display: block; margin-bottom: 12px; }
-  #status { white-space: pre; font-family: monospace; font-size: 13px; background: #262626;
-            border: 1px solid #444; padding: 10px; display: inline-block; min-width: 320px; }
-  form { margin-top: 12px; }
-  input { width: 70px; font-size: 14px; padding: 4px; }
-  button { font-size: 14px; padding: 5px 14px; margin-left: 6px; }
-  label { margin-right: 4px; }
+  h1 { font-size: 16px; font-weight: normal; color: #aaa; margin: 0 0 12px 0; }
+  .layout { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+  .left { display: flex; flex-direction: column; gap: 12px; min-width: 260px; }
+  .right { flex: 1; }
+  #canvas { background: #111; border: 1px solid #444; display: block; max-width: 100%; height: auto; }
+  form { background: #262626; border: 1px solid #444; padding: 10px; border-radius: 6px; }
+  form .row { margin-bottom: 8px; }
+  input { width: 90px; font-size: 14px; padding: 4px; }
+  button { font-size: 14px; padding: 6px 16px; margin-top: 4px; width: 100%; }
+  label { display: block; font-size: 12px; color: #aaa; margin-bottom: 2px; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .stat-box { background: #262626; border: 1px solid #444; border-radius: 6px; padding: 8px 10px; }
+  .stat-box .k { font-size: 11px; color: #999; text-transform: uppercase; }
+  .stat-box .v { font-family: monospace; font-size: 15px; color: #eee; margin-top: 2px; }
+  .stat-box.wide { grid-column: 1 / -1; }
 </style>
 </head>
 <body>
 <h1>grid_nav.py -- live position (poll __POLL_MS__ms)</h1>
-<canvas id="canvas" width="__CANVAS_PX__" height="__CANVAS_PX__"></canvas>
-<div id="status">connecting...</div>
-<form id="goalForm">
-  <label>Goal X (cm)</label><input id="goalX" type="number" value="0" step="1">
-  <label>Goal Y (cm)</label><input id="goalY" type="number" value="0" step="1">
-  <button type="submit">Go</button>
-</form>
+<div class="layout">
+  <div class="left">
+    <form id="goalForm">
+      <div class="row"><label>Goal X (cm)</label><input id="goalX" type="number" value="0" step="1"></div>
+      <div class="row"><label>Goal Y (cm)</label><input id="goalY" type="number" value="0" step="1"></div>
+      <div class="row"><label>End Direction (deg, 0=+X)</label><input id="goalDir" type="number" value="0" step="1"></div>
+      <button type="submit">Go</button>
+    </form>
+    <div class="stats" id="stats">
+      <div class="stat-box wide"><div class="k">Position</div><div class="v" id="s-pos">--</div></div>
+      <div class="stat-box"><div class="k">State</div><div class="v" id="s-state">--</div></div>
+      <div class="stat-box"><div class="k">Phase</div><div class="v" id="s-phase">--</div></div>
+      <div class="stat-box"><div class="k">Leg</div><div class="v" id="s-leg">--</div></div>
+      <div class="stat-box"><div class="k">End Dir</div><div class="v" id="s-enddir">--</div></div>
+      <div class="stat-box wide"><div class="k">IMU Yaw (raw)</div><div class="v" id="s-yaw">--</div></div>
+      <div class="stat-box wide"><div class="k">Heading (ref=0)</div><div class="v" id="s-heading">--</div></div>
+      <div class="stat-box wide"><div class="k">Target Heading</div><div class="v" id="s-target">--</div></div>
+    </div>
+  </div>
+  <div class="right">
+    <canvas id="canvas" width="__CANVAS_PX__" height="__CANVAS_PX__"></canvas>
+  </div>
+</div>
 
 <script>
 const HALF_EXTENT = __HALF_EXTENT__;
@@ -487,15 +569,19 @@ function axisLabel(deg) {
 
 function fmt(v) { return (v === null || v === undefined) ? 'n/a' : v.toFixed(1) + 'deg'; }
 
+function set(id, text) { document.getElementById(id).textContent = text; }
+
 function updateStatus(state) {
   const legInfo = (state.state === 'RUNNING') ? `${state.leg_idx}/${state.leg_count}` : '-';
-  document.getElementById('status').textContent =
-    `pos:    (${state.x.toFixed(1)}, ${state.y.toFixed(1)}) cm\\n` +
-    `state:  ${state.state}  phase: ${state.phase}\\n` +
-    `leg:    ${legInfo}\\n` +
-    `IMU yaw (raw):     ${fmt(state.yaw_deg)}\\n` +
-    `heading (ref=0):   ${fmt(state.heading_deg)}\\n` +
-    `target heading:    ${fmt(state.target_heading_deg)}`;
+  set('s-pos', `(${state.x.toFixed(1)}, ${state.y.toFixed(1)}) cm`);
+  set('s-state', state.state);
+  set('s-phase', state.phase ?? '-');
+  set('s-leg', legInfo);
+  set('s-enddir', state.end_dir_deg === null || state.end_dir_deg === undefined
+        ? 'n/a' : `${state.end_dir_deg.toFixed(0)}deg`);
+  set('s-yaw', fmt(state.yaw_deg));
+  set('s-heading', fmt(state.heading_deg));
+  set('s-target', fmt(state.target_heading_deg));
 }
 
 async function poll() {
@@ -507,7 +593,7 @@ async function poll() {
     draw(state);
     updateStatus(state);
   } catch (e) {
-    document.getElementById('status').textContent = 'connection lost: ' + e;
+    set('s-state', 'connection lost');
   }
 }
 
@@ -515,10 +601,11 @@ document.getElementById('goalForm').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const x = parseFloat(document.getElementById('goalX').value);
   const y = parseFloat(document.getElementById('goalY').value);
+  const dir = parseFloat(document.getElementById('goalDir').value);
   await fetch('/api/goal', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({x: x, y: y})
+    body: JSON.stringify({x: x, y: y, dir: dir})
   });
 });
 
@@ -564,7 +651,12 @@ def create_app(node: GridNavNode) -> Flask:
             gy = float(data['y'])
         except (KeyError, TypeError, ValueError):
             return jsonify({'ok': False, 'error': 'invalid x/y'}), 400
-        node.set_goal(gx, gy)
+        end_dir = data.get('dir', None)
+        try:
+            end_dir = float(end_dir) if end_dir not in (None, '') else None
+        except (TypeError, ValueError):
+            end_dir = None
+        node.set_goal(gx, gy, end_dir)
         return jsonify({'ok': True})
 
     return app
