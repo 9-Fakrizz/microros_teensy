@@ -170,3 +170,69 @@ HOW TO DEBUG FURTHER / WHAT TO WATCH
   shielded cable, common ground, small decoupling cap (~0.1uF) across
   motor terminals — software filtering reduces symptoms but can't fully
   fix a badly-coupled signal.
+
+=====================================================
+SECTION: Distance calibration (pulses -> real-world distance)
+=====================================================
+
+-----------------------------------------------------
+[2026-08-06] Raw calibration run data — heading_hold.py TARGET_PULSES stop test
+-----------------------------------------------------
+
+METHOD
+- heading_hold.py drives straight and auto-stops once
+  abs(pulses_traveled) >= abs(TARGET_PULSES) (see control_loop()).
+- For each run: TARGET_PULSES set, script run once, actual pulse count
+  at stop (raw, signed — this robot's encoder counts DOWN while
+  driving forward) and the real-world distance (measured by hand, cm)
+  were recorded.
+- Firmware constants at time of this data: WHEEL_DIAMETER_MM=125,
+  PULSES_PER_REV=1000, DISTANCE_SCALE_FACTOR=1.05 (see heading_hold.py).
+  These are what the "round"(pulses)/cm numbers below should be used
+  to re-derive, NOT numbers that were already applied to this data —
+  the table below is raw sensor pulses vs. raw measured distance.
+
+RAW DATA
+  TARGET_PULSES = -35000 (11 runs):
+    round(pulses)   cm
+    -35082          194
+    -35115          194
+    -35040          190
+    -35226          193
+    -35197          190
+    -35172          191
+    -35173          191
+    -35133          191
+    -35250          192
+    -35095          190
+    -35167          190
+
+  TARGET_PULSES = -70000 (5 runs):
+    round(pulses)   cm
+    -70155          385
+    -70187          382
+    -70183          383
+    -70126          380
+    -70105          382
+
+QUICK STATS (computed from the raw data above)
+  -35000 group:  avg |pulses| = 35150.9   avg cm = 191.45  ->  ~183.6 pulses/cm
+  -70000 group:  avg |pulses| = 70151.2   avg cm = 382.4   ->  ~183.5 pulses/cm
+  Both groups agree closely (~183.5 pulses/cm, i.e. ~18,350 pulses/meter),
+  which is a good sign — the relationship looks linear and repeatable
+  across the two distances tested.
+
+  For comparison, the CURRENT firmware/script constants
+  (WHEEL_DIAMETER_MM=125, PULSES_PER_REV=1000) imply only
+  ~25.46 pulses/cm — about 7.2x lower than what was actually measured.
+  This means the current METERS_PER_PULSE in heading_hold.py is far
+  off; DISTANCE_SCALE_FACTOR=1.05 (a ~5% correction) is nowhere near
+  enough to account for a ~7.2x gap. Likely explanation: PULSES_PER_REV
+  and/or WHEEL_DIAMETER_MM in heading_hold.py don't match this
+  encoder's real pulses-per-revolution or wheel size.
+
+NEXT STEP (not yet applied — for whenever ready to recalibrate)
+  Update heading_hold.py's WHEEL_DIAMETER_MM / PULSES_PER_REV (or just
+  DISTANCE_SCALE_FACTOR directly) so that METERS_PER_PULSE reflects
+  ~183.5 pulses/cm (~1.835 pulses/mm, ~18,350 pulses/m) instead of the
+  current ~25.46 pulses/cm assumption.

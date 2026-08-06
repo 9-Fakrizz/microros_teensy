@@ -63,7 +63,7 @@ PRINT_EVERY_N_LOOPS = 10       # print distance every N control loop ticks (~0.5
 # this many raw pulses since baseline, then stop and hold. Measure the
 # actual physical distance traveled and compare against the printed
 # value to (re-)derive DISTANCE_SCALE_FACTOR / METERS_PER_PULSE.
-TARGET_PULSES = 35000
+TARGET_PULSES = 70000
 # -------------------------------------------------
 
 
@@ -164,7 +164,7 @@ class HeadingHoldNode(Node):
         if self.target_yaw is None or self.current_yaw is None:
             return  # haven't received IMU data yet
 
-        if self.pulses_traveled >= TARGET_PULSES:
+        if abs(self.pulses_traveled) >= abs(TARGET_PULSES):
             self.stop_robot()
             self.finished = True
             self.get_logger().info(
