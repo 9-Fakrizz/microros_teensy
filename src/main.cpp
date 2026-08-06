@@ -7,6 +7,7 @@
 #include <geometry_msgs/msg/twist.h>
 #include <sensor_msgs/msg/imu.h>
 #include <std_msgs/msg/int32_multi_array.h>
+#include <std_msgs/msg/empty.h>
 #include <Wire.h>
 #include "SparkFun_BNO08x_Arduino_Library.h"
 
@@ -132,12 +133,14 @@ volatile int64_t rightPulseCount = 0;
 // ---------------- micro-ROS Objects ------------------
 // =====================================================
 rcl_subscription_t subscriber;
+rcl_subscription_t reset_encoder_sub;
 rcl_publisher_t imu_pub;
 rcl_publisher_t encoder_pub;
 
 geometry_msgs__msg__Twist msg_cmd;
 sensor_msgs__msg__Imu msg_imu;
 std_msgs__msg__Int32MultiArray msg_encoder;
+std_msgs__msg__Empty msg_reset_encoder;
 
 // [0]=left_raw_pulses, [1]=right_raw_pulses,
 // [2]=left_glitch_count, [3]=right_glitch_count
@@ -239,6 +242,20 @@ void cmd_vel_callback(const void * msgin) {
     last_cmd_time = millis();
     motors_stopped_by_watchdog = false;
     set_motors(msg->linear.x, msg->angular.z);
+}
+
+// Zeroes the pulse/glitch counters on command, so you don't have to
+// unplug/replug the Teensy (which resets everything, not just encoders)
+// just to re-baseline distance. Trigger from the Pi with:
+//   ros2 topic pub --once /reset_encoder std_msgs/msg/Empty {}
+void reset_encoder_callback(const void * msgin) {
+    (void) msgin;
+    noInterrupts();
+    leftPulseCount = 0;
+    rightPulseCount = 0;
+    leftGlitchCount = 0;
+    rightGlitchCount = 0;
+    interrupts();
 }
 
 // =====================================================
@@ -486,16 +503,25 @@ void setup() {
     ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32MultiArray),
     "wheel_encoder"));
 
+  RCCHECK(rclc_subscription_init_default(
+    &reset_encoder_sub,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Empty),
+    "reset_encoder"));
+
   RCCHECK(rclc_timer_init_default(
     &timer,
     &support,
     RCL_MS_TO_NS(TIMER_PERIOD_MS),
     timer_callback));
 
-  RCCHECK(rclc_executor_init(&executor, &support.context, 2, &allocator));
+  RCCHECK(rclc_executor_init(&executor, &support.context, 3, &allocator));
   RCCHECK(rclc_executor_add_subscription(
     &executor, &subscriber, &msg_cmd,
     &cmd_vel_callback, ON_NEW_DATA));
+  RCCHECK(rclc_executor_add_subscription(
+    &executor, &reset_encoder_sub, &msg_reset_encoder,
+    &reset_encoder_callback, ON_NEW_DATA));
   RCCHECK(rclc_executor_add_timer(&executor, &timer));
 
   // Set static frame_id once — no need to recompute strlen()/reassign every tick.

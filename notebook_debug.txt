@@ -108,6 +108,26 @@ exact up to ~2.1 billion, effectively no ceiling for this use case.
 If you ever see this on the Python side, it must subscribe as
 Int32MultiArray, not Float32MultiArray.
 
+-----------------------------------------------------
+[2026-08-06] Feature: /reset_encoder topic (no more USB unplug to zero counters)
+-----------------------------------------------------
+
+PROBLEM
+- Only way to zero the encoder pulse/glitch counters was to unplug and
+  replug the USB cable between Teensy and Pi5 (forces a full reset —
+  drops the whole micro-ROS session, not just the encoders).
+
+FIX APPLIED
+- Added a new subscription in src/main.cpp: /reset_encoder
+  (std_msgs/msg/Empty). Any message received zeroes leftPulseCount,
+  rightPulseCount, leftGlitchCount, rightGlitchCount under
+  noInterrupts()/interrupts().
+- rclc_executor_init() handle count bumped 2 -> 3 to fit the new
+  subscription alongside cmd_vel and the timer.
+
+USAGE (from the Pi)
+    ros2 topic pub --once /reset_encoder std_msgs/msg/Empty {}
+
 =====================================================
 SECTION: micro-ROS / agent connection
 =====================================================

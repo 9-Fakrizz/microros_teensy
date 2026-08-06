@@ -58,6 +58,12 @@ MAX_ANGULAR_Z = 1.0            # rad/s clamp on correction output
 MAX_INTEGRAL = 1.0             # anti-windup clamp
 
 PRINT_EVERY_N_LOOPS = 10       # print distance every N control loop ticks (~0.5s at 20Hz)
+
+# Calibration run: drive straight until the primary encoder has counted
+# this many raw pulses since baseline, then stop and hold. Measure the
+# actual physical distance traveled and compare against the printed
+# value to (re-)derive DISTANCE_SCALE_FACTOR / METERS_PER_PULSE.
+TARGET_PULSES = 35000
 # -------------------------------------------------
 
 
@@ -106,8 +112,10 @@ class HeadingHoldNode(Node):
 
         # Encoder / distance tracking (single active encoder)
         self.baseline_pulses = None
+        self.pulses_traveled = 0
         self.distance_cm = 0.0
         self._loop_count = 0
+        self.finished = False
 
         self.imu_sub = self.create_subscription(Imu, IMU_TOPIC, self.imu_callback, 10)
         self.encoder_sub = self.create_subscription(
@@ -145,12 +153,32 @@ class HeadingHoldNode(Node):
             self.get_logger().info(f'Encoder baseline set: pulses={pulses}')
             return
 
-        raw_m = (pulses - self.baseline_pulses) * METERS_PER_PULSE
+        self.pulses_traveled = pulses - self.baseline_pulses
+        raw_m = self.pulses_traveled * METERS_PER_PULSE
         self.distance_cm = raw_m * 100.0 * DISTANCE_SCALE_FACTOR
 
     def control_loop(self):
+        if self.finished:
+            return  # already stopped and reported, nothing more to do
+
         if self.target_yaw is None or self.current_yaw is None:
             return  # haven't received IMU data yet
+
+        if self.pulses_traveled >= TARGET_PULSES:
+            self.stop_robot()
+            self.finished = True
+            self.get_logger().info(
+                f'=== Reached target ({TARGET_PULSES} pulses) — stopped ==='
+            )
+            self.get_logger().info(
+                f'Pulses traveled: {self.pulses_traveled}   '
+                f'Program distance: {self.distance_cm:.1f}cm'
+            )
+            self.get_logger().info(
+                'Measure the actual distance and record it, then re-run '
+                'this script for the next trial.'
+            )
+            return
 
         error = angle_diff(self.target_yaw, self.current_yaw)
         correction = self.pid.compute(error)
