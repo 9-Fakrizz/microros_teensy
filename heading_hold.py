@@ -29,23 +29,24 @@ WHEEL_ENCODER_TOPIC = "/wheel_encoder"
 #   data[2] = primary encoder glitch count (pulses rejected as noise)
 #   data[3] = secondary encoder glitch count (always 0 while disabled)
 # Meter conversion is NOT done on the firmware side anymore -- it happens
-# here, using WHEEL_DIAMETER_MM / PULSES_PER_REV below.
+# here, using the calibrated PULSES_PER_CM below.
 ENCODER_INDEX_PRIMARY_PULSES = 0
 ENCODER_INDEX_PRIMARY_GLITCH = 2
 
-# Wheel geometry for pulses -> meters conversion. Update these if you
-# change wheels/tires or the encoder's pulses-per-revolution.
-WHEEL_DIAMETER_MM = 125.0
-PULSES_PER_REV = 1000.0
-WHEEL_CIRCUMFERENCE_M = math.pi * (WHEEL_DIAMETER_MM / 1000.0)
-METERS_PER_PULSE = WHEEL_CIRCUMFERENCE_M / PULSES_PER_REV
+# Pulses -> meters conversion, calibrated directly from measured runs
+# (see notebook_debug.txt, "Distance calibration" section) rather than
+# guessed wheel-diameter/pulses-per-rev numbers. Two calibration runs at
+# different distances (-35000 and -70000 raw pulses) both landed at
+# ~183.5 pulses/cm, so that's used directly. Re-run the TARGET_PULSES
+# stop test in grid_nav.py and update this if the wheel/tire changes.
+PULSES_PER_CM = 183.5
+METERS_PER_PULSE = 1.0 / (PULSES_PER_CM * 100.0)
 
-# Multiplicative calibration: measured_distance * DISTANCE_SCALE_FACTOR = actual distance.
-# NOTE: this was originally derived when the firmware did the pulses->meters
-# conversion itself; now that conversion happens here instead (see
-# METERS_PER_PULSE above), re-derive this against real measured distances
-# again before trusting it -- the old derivation no longer applies as-is.
-DISTANCE_SCALE_FACTOR = 1.05
+# Multiplicative calibration on top of the above, for any residual error
+# you measure later. Calibration data already reflects the true
+# pulses/cm relationship directly, so this starts at 1.0 (no-op) rather
+# than a guessed value.
+DISTANCE_SCALE_FACTOR = 1.0
 
 FORWARD_SPEED = 0.15         # m/s, constant forward speed
 LOOP_HZ = 20.0                 # control loop rate

@@ -60,8 +60,8 @@ ENCODER_INDEX_PRIMARY_PULSES = 0  # must be the LEFT wheel -- see module docstri
 # if wheel/tire/encoder changes.
 PULSES_PER_CM = 183.5
 
-FORWARD_SPEED = 0.20           # m/s, straight-line drive speed
-ROTATE_SPEED = 0.20            # max commanded speed magnitude while pivoting
+FORWARD_SPEED = 0.25           # m/s, straight-line drive speed
+ROTATE_SPEED = 0.25            # max commanded speed magnitude while pivoting
 
 # If the robot pivots the WRONG way (heading error grows instead of
 # shrinking) during testing, flip this to -1. Left wheel stays at 0
@@ -108,15 +108,23 @@ DRIVE_KP = 0.6
 DRIVE_KI = 0.0
 DRIVE_KD = 0.05
 DRIVE_MAX_INTEGRAL = 0.3
-MAX_ANGULAR_Z_HOLD = 0.20
+MAX_ANGULAR_Z_HOLD = 0.25
 
-# Same left/right term-swap issue as PIVOT_ANGULAR_SIGN above likely
-# applies here too: a heading-hold correction with the wrong sign fights
-# itself instead of converging ("tries to reach the setpoint but can't").
-# Flipped from the naive -correction convention (borrowed from
-# heading_hold.py, which assumed unswapped wiring) to match. If this makes
-# it noticeably worse (error grows instead of settling), flip back to -1.
-DRIVE_CORRECTION_SIGN = 1
+# Testing toggle: while False, DRIVE phase sends angular.z = 0 (pure
+# open-loop straight driving, no heading correction) so you can verify the
+# linear/distance side (encoder-based stop condition) in isolation before
+# re-enabling closed-loop heading hold. Set back to True to bring the
+# drive_pid correction back.
+DRIVE_HEADING_HOLD_ENABLED = False
+
+# Same left/right term-swap issue as PIVOT_ANGULAR_SIGN above was suspected
+# to apply here too, so this was flipped to +1 from the naive -correction
+# convention (borrowed from heading_hold.py). Testing showed +1 makes it
+# WORSE -- aggressive correction that never settles at the setpoint, the
+# exact "wrong sign fights itself" failure case -- so this is reverted to
+# -1. The pivot-phase wiring swap does NOT seem to carry over to this
+# phase's correction sign.
+DRIVE_CORRECTION_SIGN = -1
 
 LOOP_HZ = 20.0                 # control loop rate
 GUI_HZ = 12.0                  # GUI poll/redraw rate
@@ -369,10 +377,12 @@ class GridNavNode(Node):
                     self._start_leg_locked()
                 return
 
-            herr = angle_diff(self.leg_target_heading, self.current_yaw)
-            correction = self.drive_pid.compute(herr)
             twist.linear.x = FORWARD_SPEED
-            twist.angular.z = DRIVE_CORRECTION_SIGN * correction
+            if DRIVE_HEADING_HOLD_ENABLED:
+                herr = angle_diff(self.leg_target_heading, self.current_yaw)
+                correction = self.drive_pid.compute(herr)
+                twist.angular.z = DRIVE_CORRECTION_SIGN * correction
+            # else: angular.z stays 0 -- pure open-loop straight driving
             self.cmd_pub.publish(twist)
 
     def stop_robot(self):
