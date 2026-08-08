@@ -236,3 +236,64 @@ NEXT STEP (not yet applied — for whenever ready to recalibrate)
   DISTANCE_SCALE_FACTOR directly) so that METERS_PER_PULSE reflects
   ~183.5 pulses/cm (~1.835 pulses/mm, ~18,350 pulses/m) instead of the
   current ~25.46 pulses/cm assumption.
+
+-----------------------------------------------------
+[2026-08-08] PULSES_PER_CM (112) is only valid at FORWARD_SPEED=0.20 / ROTATE_SPEED=0.20
+-----------------------------------------------------
+
+FINDING
+- The current calibrated PULSES_PER_CM = 112 in grid_nav.py was derived
+  from runs at FORWARD_SPEED = 0.20 and ROTATE_SPEED = 0.20 (raw PWM
+  duty-cycle fractions, not real calibrated m/s or rad/s).
+- Changing either speed changes real-world wheel speed, which changes
+  the pulses-per-cm relationship (pulse width/gap relative to the
+  encoder noise filters, wheel slip, etc.). Confirmed by testing:
+  raising FORWARD_SPEED to 0.25 broke distance tracking badly enough
+  that the robot appeared to "never stop."
+- grid_nav.py's speed is now live-adjustable from the web GUI (Set
+  Speed form) specifically to explore this relationship, but any run
+  NOT at 0.20/0.20 should be treated as using an uncalibrated
+  PULSES_PER_CM until re-derived for that speed.
+
+RULE OF THUMB GOING FORWARD
+  Only FORWARD_SPEED = 0.20 and ROTATE_SPEED = 0.20 are currently
+  calibrated (PULSES_PER_CM = 112). If you run at any other speed,
+  treat distance readings as unreliable and re-run the step-mode
+  calibration procedure (drive box-by-box, measure with a ruler,
+  recompute pulses/cm) for that specific speed before trusting it.
+
+FUTURE IMPROVEMENT IDEA (not yet implemented)
+  A real pulses/cm ratio is a fixed mechanical property (encoder
+  pulses per wheel revolution, wheel circumference) -- it should NOT
+  change with speed. The fact that it does points to pulses actually
+  being dropped by the current software filtering in
+  leftEncoderISR()/rightEncoderISR() (src/main.cpp): at higher wheel
+  speed, real pulse widths/gaps shrink and start falling below
+  LEFT/RIGHT_MIN_PULSE_WIDTH_US (60us) and/or
+  LEFT/RIGHT_ENCODER_DEBOUNCE_US (200us), so they get miscounted as
+  noise instead of real motion -- undercounting distance, which is
+  consistent with the FORWARD_SPEED=0.25 "never stops" bug (target
+  distance in pulses is never reached because pulses aren't arriving
+  fast enough on the software side).
+
+  Two possible fixes, not yet applied:
+  1. BEST: switch to Teensy 4.1's dedicated hardware quadrature
+     decoder peripheral (e.g. via the PJRC `Encoder` library, or
+     QuadTimer/FlexPWM directly) instead of interrupt+debounce
+     heuristics. Hardware counts edges directly and doesn't drop
+     pulses at speed -- removes the need to ever recalibrate
+     PULSES_PER_CM per speed again. Requires reworking how
+     leftPulseCount/rightPulseCount are read (no more manual ISR
+     width/gap filtering) and possibly re-checking pin assignments
+     against what the hardware counter peripheral supports.
+  2. QUICK/CHEAPER: loosen LEFT/RIGHT_MIN_PULSE_WIDTH_US and
+     LEFT/RIGHT_ENCODER_DEBOUNCE_US so real pulses at higher speed
+     (0.25+) stop being rejected. Faster to try, but is a guess-and-
+     recheck loop and doesn't prevent the same problem recurring at
+     an even higher speed later.
+
+  Diagnostic step to confirm which pulses are being lost before
+  picking a fix: compare wheel_encoder data[2] (glitch count) growth
+  rate at 0.20 vs 0.25+ speed via `ros2 topic echo /wheel_encoder` --
+  if glitch count climbs much faster relative to pulse count at the
+  higher speed, that confirms the filter-clipping theory above.

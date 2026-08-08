@@ -55,13 +55,20 @@ CMD_VEL_TOPIC = "/cmd_vel"
 WHEEL_ENCODER_TOPIC = "/wheel_encoder"
 ENCODER_INDEX_PRIMARY_PULSES = 0  # must be the LEFT wheel -- see module docstring
 
-# From the calibration data in notebook_debug.txt (~183.5 pulses/cm,
-# consistent across the -35000 and -70000 pulse test runs). Re-derive
-# if wheel/tire/encoder changes.
-PULSES_PER_CM = 183.5
+# Final calibrated value (see notebook_debug.txt for the full derivation
+# history: 183.5 -> 118.4 -> 131.6 -> 122.3 -> 110 -> 105 -> this).
+# Derived from 14 runs at 250cm/box (26250 commanded pulses each) with
+# measured error averaging -5.79cm (undershoot), i.e. ~244.2cm real
+# distance -> 26250 / 244.2 = ~107.5 pulses/cm. Accepted tolerance going
+# forward is +-10cm at 250cm range (~4%); the raw run-to-run spread
+# (-13cm to 0cm) is wider than the systematic bias this value corrects
+# for, so don't expect this to zero out every individual run.
+# heading_hold.py is NOT updated to this value -- only validated
+# separately, at a different test distance.
+PULSES_PER_CM = 112
 
-FORWARD_SPEED = 0.25           # m/s, straight-line drive speed
-ROTATE_SPEED = 0.25            # max commanded speed magnitude while pivoting
+FORWARD_SPEED = 0.20           # m/s, straight-line drive speed
+ROTATE_SPEED = 0.20            # max commanded speed magnitude while pivoting
 
 # If the robot pivots the WRONG way (heading error grows instead of
 # shrinking) during testing, flip this to -1. Left wheel stays at 0
@@ -79,10 +86,10 @@ PIVOT_SIGN = 1
 # Flip back to +1 if it turns out backwards again.
 PIVOT_ANGULAR_SIGN = -1
 
-# Flips which physical turn direction counts as "+Y". Confirmed backwards
-# during testing (positive Y goals were driving toward -Y), so this is
-# flipped from the default. Flip back to +1 if it turns out reversed again.
-Y_AXIS_SIGN = -1
+# Flips which physical turn direction counts as "+Y". Was -1, but testing
+# at the 5m-scale/0.25-speed setup showed Y now goes the wrong way again --
+# flipped back to +1. Flip back to -1 if it turns out reversed again.
+Y_AXIS_SIGN = 1
 
 HEADING_TOLERANCE_DEG = 3.0    # stop pivoting once within this of target
 POSITION_EPSILON_CM = 1.0      # skip an axis leg smaller than this
@@ -108,14 +115,13 @@ DRIVE_KP = 0.6
 DRIVE_KI = 0.0
 DRIVE_KD = 0.05
 DRIVE_MAX_INTEGRAL = 0.3
-MAX_ANGULAR_Z_HOLD = 0.25
+MAX_ANGULAR_Z_HOLD = 0.20
 
 # Testing toggle: while False, DRIVE phase sends angular.z = 0 (pure
-# open-loop straight driving, no heading correction) so you can verify the
-# linear/distance side (encoder-based stop condition) in isolation before
-# re-enabling closed-loop heading hold. Set back to True to bring the
-# drive_pid correction back.
-DRIVE_HEADING_HOLD_ENABLED = False
+# open-loop straight driving, no heading correction). Distance calibration
+# is confirmed good now, and open-loop driving was letting the robot
+# slowly curve off its heading -- re-enabled to correct that.
+DRIVE_HEADING_HOLD_ENABLED = True
 
 # Same left/right term-swap issue as PIVOT_ANGULAR_SIGN above was suspected
 # to apply here too, so this was flipped to +1 from the naive -correction
@@ -129,8 +135,13 @@ DRIVE_CORRECTION_SIGN = -1
 LOOP_HZ = 20.0                 # control loop rate
 GUI_HZ = 12.0                  # GUI poll/redraw rate
 
-GRID_SPACING_CM = 20            # gridline spacing, cosmetic only
-GRID_HALF_EXTENT_CM = 200       # initial view: +/- this many cm
+GRID_SPACING_CM = 50            # gridline spacing (box size), cosmetic + step-mode size
+GRID_HALF_EXTENT_CM = 500       # initial view: +/- this many cm (10m x 10m total)
+
+# Step-mode distance per box, for isolating the distance calibration by
+# measuring one grid box at a time instead of a whole multi-box leg in one
+# go. Defaults to matching the visual grid spacing.
+STEP_SIZE_CM = GRID_SPACING_CM
 # -------------------------------------------------
 
 
@@ -194,6 +205,12 @@ class GridNavNode(Node):
         self.drive_pid = PID(DRIVE_KP, DRIVE_KI, DRIVE_KD,
                               -MAX_ANGULAR_Z_HOLD, MAX_ANGULAR_Z_HOLD, DRIVE_MAX_INTEGRAL, self.dt)
 
+        # Live-adjustable via the web GUI (see set_speed()) -- start from the
+        # module defaults above, but can be changed at runtime without
+        # restarting the node, to test how speed affects distance accuracy.
+        self.forward_speed = FORWARD_SPEED
+        self.rotate_speed = ROTATE_SPEED
+
         self._lock = threading.Lock()
 
         # Pose tracked at the left wheel, in cm. (0, 0) at node start.
@@ -213,8 +230,19 @@ class GridNavNode(Node):
         self.leg_target_heading = 0.0
         self.leg_target_distance_cm = 0.0
         self.leg_baseline_pulses = 0
+        self.leg_progress_cm = 0.0   # signed live progress along the current leg's axis
+                                      # (not yet committed to x/y -- see control_loop DRIVE)
+        self.leg_boxes_crossed = 0   # how many GRID_SPACING_CM boxes crossed so far this leg,
+                                      # for pushing live trail points as each box is reached
         self.goal = None             # (gx, gy) for display
         self.end_dir_deg = None      # requested final heading, degrees (or None)
+
+        # Step mode: pause fully after each STEP_SIZE_CM of DRIVE travel
+        # and wait for continue_step() before resuming, so you can measure
+        # one grid box at a time instead of a whole leg in one go.
+        self.step_mode = False
+        self.awaiting_continue = False
+        self.step_baseline_pulses = 0
 
         self.path = [(0.0, 0.0)]     # visited points, for GUI trail
 
@@ -251,7 +279,7 @@ class GridNavNode(Node):
 
     # ---------------- Goal handling ----------------
 
-    def set_goal(self, gx, gy, end_dir_deg=None):
+    def set_goal(self, gx, gy, end_dir_deg=None, step_mode=False):
         with self._lock:
             dx = gx - self.x
             dy = gy - self.y
@@ -270,6 +298,8 @@ class GridNavNode(Node):
             self.end_dir_deg = end_dir_deg
             self.legs = legs
             self.leg_idx = 0
+            self.step_mode = step_mode
+            self.awaiting_continue = False
 
             if not legs:
                 self.state = 'IDLE'
@@ -278,7 +308,19 @@ class GridNavNode(Node):
 
             self.state = 'RUNNING'
             self._start_leg_locked()
-            self.get_logger().info(f'New goal: ({gx:.1f}, {gy:.1f}) cm -- {len(legs)} leg(s)')
+            self.get_logger().info(
+                f'New goal: ({gx:.1f}, {gy:.1f}) cm -- {len(legs)} leg(s)'
+                f'{" [step mode]" if step_mode else ""}'
+            )
+
+    def continue_step(self):
+        """Resume DRIVE after a step-mode pause. No-op if not currently
+        paused (e.g. button clicked twice, or clicked while not running)."""
+        with self._lock:
+            if not self.awaiting_continue or self.last_pulses is None:
+                return
+            self.awaiting_continue = False
+            self.step_baseline_pulses = self.last_pulses
 
     def _start_leg_locked(self):
         """Caller must hold self._lock."""
@@ -301,8 +343,23 @@ class GridNavNode(Node):
 
         self.leg_target_heading = normalize_angle(target)
         self.leg_target_distance_cm = abs(delta) if axis in ('x', 'y') else 0.0
+        self.leg_progress_cm = 0.0
+        self.leg_boxes_crossed = 0
         self.phase = 'ROTATE'
         self.rotate_pid.reset(angle_diff(self.leg_target_heading, self.current_yaw))
+
+    def set_speed(self, forward=None, rotate=None):
+        """Adjust drive/rotate speed live, without restarting the node."""
+        with self._lock:
+            if forward is not None and forward > 0:
+                self.forward_speed = forward
+            if rotate is not None and rotate > 0:
+                self.rotate_speed = rotate
+                self.rotate_pid.out_min = -rotate
+                self.rotate_pid.out_max = rotate
+        self.get_logger().info(
+            f'Speed updated: forward={self.forward_speed:.3f} rotate={self.rotate_speed:.3f}'
+        )
 
     # ---------------- Control loop ----------------
 
@@ -312,6 +369,10 @@ class GridNavNode(Node):
         with self._lock:
             if self.state != 'RUNNING' or self.current_yaw is None or self.last_pulses is None:
                 self.cmd_pub.publish(twist)  # all-zero
+                return
+
+            if self.awaiting_continue:
+                self.cmd_pub.publish(twist)  # all-zero -- paused between step-mode boxes
                 return
 
             if self.phase == 'ROTATE':
@@ -335,6 +396,7 @@ class GridNavNode(Node):
                         return
 
                     self.leg_baseline_pulses = self.last_pulses
+                    self.step_baseline_pulses = self.last_pulses
                     self.phase = 'DRIVE'
                     self.drive_pid.reset(error)
                     self.cmd_pub.publish(twist)  # brief all-zero pause between phases
@@ -343,7 +405,9 @@ class GridNavNode(Node):
                 cmd = self.rotate_pid.compute(error) * PIVOT_SIGN
                 # Floor the magnitude so the pivot doesn't stall out as the
                 # PID output shrinks near zero error, before actually
-                # reaching HEADING_TOLERANCE_DEG.
+                # reaching HEADING_TOLERANCE_DEG. (rotate_speed is live-
+                # adjustable, but the floor stays a fixed fraction so it
+                # keeps working across the adjustable range.)
                 if abs(cmd) < ROTATE_MIN_OUTPUT:
                     cmd = math.copysign(ROTATE_MIN_OUTPUT, cmd if cmd != 0 else error)
                 # See PIVOT_ANGULAR_SIGN comment -- this zeroes the firmware
@@ -356,15 +420,32 @@ class GridNavNode(Node):
             # phase == 'DRIVE'
             traveled_pulses = self.last_pulses - self.leg_baseline_pulses
             traveled_cm = abs(traveled_pulses) / PULSES_PER_CM
+            axis, delta = self.legs[self.leg_idx]
+            # Live progress along this leg's axis, updated every tick (not
+            # yet committed to x/y) -- lets the GUI show real-time position
+            # and distance-so-far while driving, like heading_hold.py's
+            # periodic distance print, instead of only jumping at leg end.
+            self.leg_progress_cm = math.copysign(traveled_cm, delta)
+
+            # Push a live trail point each time a full grid box is crossed
+            # (not just when the whole leg finishes), so the GUI path/trail
+            # updates progressively as the robot passes each box instead of
+            # only jumping once at leg completion.
+            boxes_crossed = int(traveled_cm // GRID_SPACING_CM)
+            if boxes_crossed > self.leg_boxes_crossed:
+                self.leg_boxes_crossed = boxes_crossed
+                box_x = self.x + (self.leg_progress_cm if axis == 'x' else 0.0)
+                box_y = self.y + (self.leg_progress_cm if axis == 'y' else 0.0)
+                self.path.append((box_x, box_y))
 
             if traveled_cm >= self.leg_target_distance_cm:
-                axis, delta = self.legs[self.leg_idx]
-                signed_cm = math.copysign(traveled_cm, delta)
+                signed_cm = self.leg_progress_cm
                 if axis == 'x':
                     self.x += signed_cm
                 else:
                     self.y += signed_cm
                 self.path.append((self.x, self.y))
+                self.leg_progress_cm = 0.0
 
                 self.leg_idx += 1
                 self.cmd_pub.publish(twist)  # all-zero between legs
@@ -377,7 +458,19 @@ class GridNavNode(Node):
                     self._start_leg_locked()
                 return
 
-            twist.linear.x = FORWARD_SPEED
+            if self.step_mode:
+                step_traveled_cm = abs(self.last_pulses - self.step_baseline_pulses) / PULSES_PER_CM
+                if step_traveled_cm >= STEP_SIZE_CM:
+                    self.awaiting_continue = True
+                    self.cmd_pub.publish(twist)  # all-zero -- full stop for measuring
+                    self.get_logger().info(
+                        f'Step complete ({step_traveled_cm:.1f}cm this box, '
+                        f'{traveled_cm:.1f}/{self.leg_target_distance_cm:.1f}cm total). '
+                        f'Waiting for continue.'
+                    )
+                    return
+
+            twist.linear.x = self.forward_speed
             if DRIVE_HEADING_HOLD_ENABLED:
                 herr = angle_diff(self.leg_target_heading, self.current_yaw)
                 correction = self.drive_pid.compute(herr)
@@ -387,6 +480,24 @@ class GridNavNode(Node):
 
     def stop_robot(self):
         self.cmd_pub.publish(Twist())  # all zeros
+
+    def reset_position(self):
+        """Zero the tracked (x, y) without restarting the node. Goals are
+        relative to this tracked position, not the physical start point --
+        if it drifts from reality (e.g. a prior run stopped early), later
+        goals will be off by exactly that drift. Call this right before a
+        fresh test run to realign tracked (0, 0) with wherever the robot
+        physically is right now."""
+        with self._lock:
+            self.state = 'IDLE'
+            self.x = 0.0
+            self.y = 0.0
+            self.path = [(0.0, 0.0)]
+            self.goal = None
+            self.legs = []
+            self.leg_idx = 0
+        self.stop_robot()
+        self.get_logger().info('Position reset to (0, 0).')
 
     # ---------------- Snapshot for the GUI thread ----------------
 
@@ -400,9 +511,22 @@ class GridNavNode(Node):
             target_deg = None
             if self.state == 'RUNNING':
                 target_deg = math.degrees(angle_diff(self.leg_target_heading, self.heading_ref))
+
+            # Live display position: committed x/y plus in-progress DRIVE
+            # movement along the current leg's axis, so the GUI marker and
+            # position readout move in real time instead of jumping only
+            # when a leg completes.
+            display_x, display_y = self.x, self.y
+            if self.state == 'RUNNING' and self.phase == 'DRIVE' and self.legs:
+                axis, _ = self.legs[self.leg_idx]
+                if axis == 'x':
+                    display_x = self.x + self.leg_progress_cm
+                elif axis == 'y':
+                    display_y = self.y + self.leg_progress_cm
+
             return {
-                'x': self.x,
-                'y': self.y,
+                'x': display_x,
+                'y': display_y,
                 'path': list(self.path),
                 'goal': self.goal,
                 'state': self.state,
@@ -414,6 +538,12 @@ class GridNavNode(Node):
                 'leg_idx': self.leg_idx,
                 'leg_count': len(self.legs),
                 'end_dir_deg': self.end_dir_deg,
+                'step_mode': self.step_mode,
+                'awaiting_continue': self.awaiting_continue,
+                'leg_progress_cm': abs(self.leg_progress_cm) if self.phase == 'DRIVE' else None,
+                'leg_target_distance_cm': self.leg_target_distance_cm if self.phase == 'DRIVE' else None,
+                'forward_speed': self.forward_speed,
+                'rotate_speed': self.rotate_speed,
             }
 
 
@@ -449,14 +579,24 @@ HTML_PAGE = """<!doctype html>
       <div class="row"><label>Goal X (cm)</label><input id="goalX" type="number" value="0" step="1"></div>
       <div class="row"><label>Goal Y (cm)</label><input id="goalY" type="number" value="0" step="1"></div>
       <div class="row"><label>End Direction (deg, 0=+X)</label><input id="goalDir" type="number" value="0" step="1"></div>
+      <div class="row"><label style="display:inline"><input id="goalStep" type="checkbox" style="width:auto"> Step mode (pause every __STEP_SIZE__m box)</label></div>
       <button type="submit">Go</button>
+    </form>
+    <button id="resetBtn" style="background:#5a2a2a;">Reset Position to (0,0)</button>
+    <button id="continueBtn" style="background:#2a5a2a; display:none;">Continue to Next Box</button>
+    <form id="speedForm">
+      <div class="row"><label>Drive Speed (0-1)</label><input id="speedFwd" type="number" value="__FORWARD_SPEED__" step="0.01" min="0.01" max="1"></div>
+      <div class="row"><label>Rotate Speed (0-1)</label><input id="speedRot" type="number" value="__ROTATE_SPEED__" step="0.01" min="0.01" max="1"></div>
+      <button type="submit">Set Speed</button>
     </form>
     <div class="stats" id="stats">
       <div class="stat-box wide"><div class="k">Position</div><div class="v" id="s-pos">--</div></div>
       <div class="stat-box"><div class="k">State</div><div class="v" id="s-state">--</div></div>
       <div class="stat-box"><div class="k">Phase</div><div class="v" id="s-phase">--</div></div>
       <div class="stat-box"><div class="k">Leg</div><div class="v" id="s-leg">--</div></div>
+      <div class="stat-box wide"><div class="k">Leg Progress</div><div class="v" id="s-progress">--</div></div>
       <div class="stat-box"><div class="k">End Dir</div><div class="v" id="s-enddir">--</div></div>
+      <div class="stat-box wide"><div class="k">Speed (drive / rotate)</div><div class="v" id="s-speed">--</div></div>
       <div class="stat-box wide"><div class="k">IMU Yaw (raw)</div><div class="v" id="s-yaw">--</div></div>
       <div class="stat-box wide"><div class="k">Heading (ref=0)</div><div class="v" id="s-heading">--</div></div>
       <div class="stat-box wide"><div class="k">Target Heading</div><div class="v" id="s-target">--</div></div>
@@ -501,24 +641,27 @@ function draw(state) {
   ctx.beginPath(); ctx.moveTo(ox, 0); ctx.lineTo(ox, CANVAS_PX); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(0, oy); ctx.lineTo(CANVAS_PX, oy); ctx.stroke();
 
-  // axis tick labels (cm), skipping 0 on each axis to avoid overlap at the origin.
-  // View is a fixed +/-HALF_EXTENT square (no panning), so the origin (ox, oy)
-  // is always the canvas center -- labels always go below/right of the axes.
+  // axis tick labels, in meters (1 decimal) -- internal math stays in cm
+  // throughout, this only affects the displayed text. Skips 0 on each axis
+  // to avoid overlap at the origin. View is a fixed +/-HALF_EXTENT square
+  // (no panning), so the origin (ox, oy) is always the canvas center --
+  // labels always go below/right of the axes.
   ctx.fillStyle = '#999';
   ctx.font = '11px monospace';
   for (let c = -HALF_EXTENT; c <= HALF_EXTENT; c += SPACING) {
     if (c === 0) continue;
+    const m = (c / 100).toFixed(1);
     let [px, ] = toPx(c, 0);
     ctx.textAlign = 'center';
-    ctx.fillText(c, px, oy + 14);
+    ctx.fillText(m, px, oy + 14);
     let [, py] = toPx(0, c);
     ctx.textAlign = 'left';
-    ctx.fillText(c, ox + 4, py + 4);
+    ctx.fillText(m, ox + 4, py + 4);
   }
   ctx.textAlign = 'left';
   ctx.fillStyle = '#ccc';
-  ctx.fillText('X (cm)', CANVAS_PX - 46, oy - 6);
-  ctx.fillText('Y (cm)', ox + 6, 12);
+  ctx.fillText('X (m)', CANVAS_PX - 40, oy - 6);
+  ctx.fillText('Y (m)', ox + 6, 12);
 
   // path
   if (path.length > 1) {
@@ -583,15 +726,19 @@ function set(id, text) { document.getElementById(id).textContent = text; }
 
 function updateStatus(state) {
   const legInfo = (state.state === 'RUNNING') ? `${state.leg_idx}/${state.leg_count}` : '-';
-  set('s-pos', `(${state.x.toFixed(1)}, ${state.y.toFixed(1)}) cm`);
-  set('s-state', state.state);
+  set('s-pos', `(${(state.x / 100).toFixed(1)}, ${(state.y / 100).toFixed(1)}) m`);
+  set('s-state', state.awaiting_continue ? 'PAUSED (measure now)' : state.state);
   set('s-phase', state.phase ?? '-');
   set('s-leg', legInfo);
+  set('s-progress', (state.leg_progress_cm === null || state.leg_progress_cm === undefined)
+        ? '-' : `${(state.leg_progress_cm / 100).toFixed(1)} / ${(state.leg_target_distance_cm / 100).toFixed(1)} m`);
   set('s-enddir', state.end_dir_deg === null || state.end_dir_deg === undefined
         ? 'n/a' : `${state.end_dir_deg.toFixed(0)}deg`);
+  set('s-speed', `${state.forward_speed.toFixed(2)} / ${state.rotate_speed.toFixed(2)}`);
   set('s-yaw', fmt(state.yaw_deg));
   set('s-heading', fmt(state.heading_deg));
   set('s-target', fmt(state.target_heading_deg));
+  document.getElementById('continueBtn').style.display = state.awaiting_continue ? 'block' : 'none';
 }
 
 async function poll() {
@@ -612,11 +759,31 @@ document.getElementById('goalForm').addEventListener('submit', async (ev) => {
   const x = parseFloat(document.getElementById('goalX').value);
   const y = parseFloat(document.getElementById('goalY').value);
   const dir = parseFloat(document.getElementById('goalDir').value);
+  const step = document.getElementById('goalStep').checked;
   await fetch('/api/goal', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({x: x, y: y, dir: dir})
+    body: JSON.stringify({x: x, y: y, dir: dir, step: step})
   });
+});
+
+document.getElementById('continueBtn').addEventListener('click', async () => {
+  await fetch('/api/continue_step', {method: 'POST'});
+});
+
+document.getElementById('speedForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const forward = parseFloat(document.getElementById('speedFwd').value);
+  const rotate = parseFloat(document.getElementById('speedRot').value);
+  await fetch('/api/set_speed', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({forward: forward, rotate: rotate})
+  });
+});
+
+document.getElementById('resetBtn').addEventListener('click', async () => {
+  await fetch('/api/reset_position', {method: 'POST'});
 });
 
 setInterval(poll, __POLL_MS__);
@@ -628,7 +795,7 @@ poll();
 
 WEB_PORT = 8080
 GUI_POLL_MS = int(1000 / GUI_HZ)
-CANVAS_PX = 700
+CANVAS_PX = 900  # bumped up from 700 for a bigger view of the 5m x 5m grid
 
 
 def render_page():
@@ -636,7 +803,10 @@ def render_page():
             .replace('__HALF_EXTENT__', str(GRID_HALF_EXTENT_CM))
             .replace('__SPACING__', str(GRID_SPACING_CM))
             .replace('__CANVAS_PX__', str(CANVAS_PX))
-            .replace('__POLL_MS__', str(GUI_POLL_MS)))
+            .replace('__POLL_MS__', str(GUI_POLL_MS))
+            .replace('__STEP_SIZE__', f'{STEP_SIZE_CM / 100:.1f}')
+            .replace('__FORWARD_SPEED__', f'{FORWARD_SPEED:.2f}')
+            .replace('__ROTATE_SPEED__', f'{ROTATE_SPEED:.2f}'))
 
 
 def create_app(node: GridNavNode) -> Flask:
@@ -666,7 +836,31 @@ def create_app(node: GridNavNode) -> Flask:
             end_dir = float(end_dir) if end_dir not in (None, '') else None
         except (TypeError, ValueError):
             end_dir = None
-        node.set_goal(gx, gy, end_dir)
+        step_mode = bool(data.get('step', False))
+        node.set_goal(gx, gy, end_dir, step_mode)
+        return jsonify({'ok': True})
+
+    @app.route('/api/set_speed', methods=['POST'])
+    def api_set_speed():
+        data = request.get_json(force=True)
+        forward = data.get('forward', None)
+        rotate = data.get('rotate', None)
+        try:
+            forward = float(forward) if forward not in (None, '') else None
+            rotate = float(rotate) if rotate not in (None, '') else None
+        except (TypeError, ValueError):
+            return jsonify({'ok': False, 'error': 'invalid speed value'}), 400
+        node.set_speed(forward=forward, rotate=rotate)
+        return jsonify({'ok': True})
+
+    @app.route('/api/reset_position', methods=['POST'])
+    def api_reset_position():
+        node.reset_position()
+        return jsonify({'ok': True})
+
+    @app.route('/api/continue_step', methods=['POST'])
+    def api_continue_step():
+        node.continue_step()
         return jsonify({'ok': True})
 
     return app

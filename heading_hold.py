@@ -34,12 +34,13 @@ ENCODER_INDEX_PRIMARY_PULSES = 0
 ENCODER_INDEX_PRIMARY_GLITCH = 2
 
 # Pulses -> meters conversion, calibrated directly from measured runs
-# (see notebook_debug.txt, "Distance calibration" section) rather than
-# guessed wheel-diameter/pulses-per-rev numbers. Two calibration runs at
-# different distances (-35000 and -70000 raw pulses) both landed at
-# ~183.5 pulses/cm, so that's used directly. Re-run the TARGET_PULSES
-# stop test in grid_nav.py and update this if the wheel/tire changes.
-PULSES_PER_CM = 183.5
+# (see notebook_debug.txt, "Distance calibration" section). The original
+# 183.5 value drifted out of date after extensive testing/rewiring
+# shifted something physically -- re-derived down to 110 via several
+# rounds of ruler-measured step tests, confirmed on both this script and
+# grid_nav.py. Re-run the TARGET_PULSES stop test and update this if the
+# wheel/tire changes again.
+PULSES_PER_CM = 110.0
 METERS_PER_PULSE = 1.0 / (PULSES_PER_CM * 100.0)
 
 # Multiplicative calibration on top of the above, for any residual error
