@@ -33,9 +33,10 @@ GUI:
   heading in degrees, for debugging the IMU. A live MJPEG feed from a
   USB webcam (see CAMERA_DEVICE_INDEX) is also shown, if available, with
   a backup-camera-style distance HUD (see CameraRangefinder) and live
-  obstacle detection boxes (see ObstacleDetector) drawn over it -- people
-  and blocky/angular objects are flagged as obstacles, round objects
-  (tennis balls -- what this robot collects, not avoids) are ignored.
+  obstacle detection boxes (see ObstacleDetector) drawn over it -- big,
+  blocky/angular objects farther than DETECTION_MIN_DISTANCE_CM are
+  flagged as obstacles; small and/or round objects (tennis balls -- what
+  this robot collects, not avoids) are filtered out by size and shape.
 
   Open it from any browser on the same network:
       http://<pi5-ip-address>:8080
@@ -181,15 +182,41 @@ CAMERA_JPEG_QUALITY = 80        # 0-100, higher = better quality/more bandwidth
 # for the current calibration are simply skipped.
 GUIDE_DISTANCES_CM = [50, 100, 150, 200, 250, 300]
 
-# Lightweight obstacle detector (ObstacleDetector) -- no trained model file
-# to download: people via OpenCV's built-in HOG pedestrian detector, and
-# everything else via edge/contour shape analysis. This robot collects
-# tennis balls with its mechanism, so ROUND contours (circularity above
-# the threshold below) are deliberately NOT treated as obstacles -- only
-# blocky/angular shapes (boxes, furniture, walls) and people are.
-DETECTION_FPS = 5.0                     # detection is much heavier than streaming; runs at its own slower rate
+# Lightweight obstacle detector (ObstacleDetector) -- no trained model
+# file, no HOG (dropped -- it was the expensive part). Just segmentation +
+# contour shape analysis, kept cheap with two aggressive filters: only
+# process pixels beyond DETECTION_MIN_DISTANCE_CM (crops out the near
+# field, which also cuts the processed pixel area roughly in half), and
+# only keep contours wide enough to be a real obstacle
+# (DETECTION_MIN_WIDTH_FRACTION of the frame width) -- small stuff,
+# including tennis balls (this robot collects those, doesn't avoid them),
+# is ignored by size alone rather than relying only on roundness.
+DETECTION_FPS = 5.0                     # detection is heavier than streaming; runs at its own slower rate
 DETECTION_MIN_CONTOUR_AREA = 1500       # px^2 at CAMERA_WIDTH x CAMERA_HEIGHT -- filters out small noise contours
 DETECTION_CIRCULARITY_THRESHOLD = 0.78  # 4*pi*area/perimeter^2; 1.0 = perfect circle. Above this = "round enough to be a ball", skipped
+DETECTION_MIN_DISTANCE_CM = 50.0        # ignore/crop out everything closer than this
+DETECTION_MAX_DISTANCE_CM = 300.0       # ignore/crop out everything farther than this
+DETECTION_MIN_WIDTH_FRACTION = 0.5      # bounding-box width must exceed this fraction of the frame width to count
+
+# Locked-in default calibration so the HUD/obstacle detector work
+# immediately at startup without re-calibrating through the GUI every
+# run -- height=26cm, tilt derived from calibrating at 100cm (see
+# notebook_debug.txt, "Camera HUD / distance rangefinder" section).
+# Recalibrate via the GUI form any time the physical camera mount changes.
+CAMERA_DEFAULT_HEIGHT_CM = 26.0
+CAMERA_DEFAULT_TILT_DEG = 14.6
+
+# Obstacle-confirmation safety supervisor (ObstacleWatcher): a single
+# detection tick could be a glitch (lighting flicker, motion blur, a
+# passing shadow), so a detection alone doesn't get pinned into the A*
+# obstacle map immediately. Instead, the robot HOLDS (stops) for
+# OBSTACLE_HOLD_DURATION_S seconds and counts how many separate ticks
+# during that hold still see something in the 100-150cm band. Only if
+# that count reaches OBSTACLE_CONFIRM_COUNT does it get pinned + trigger
+# an A* replan; otherwise it's treated as a glitch and the interrupted
+# leg just resumes. Both are live-adjustable from the GUI.
+OBSTACLE_HOLD_DURATION_S = 5.0
+OBSTACLE_CONFIRM_COUNT = 5
 # -------------------------------------------------
 
 
@@ -417,12 +444,15 @@ class CameraRangefinder:
     horizon just like the real floor does.
     """
 
-    DEFAULT_VFOV_DEG = 45.0  # typical-ish USB webcam vertical FOV; tune via the GUI for your camera
+    DEFAULT_VFOV_DEG = 60.0  # typical-ish USB webcam vertical FOV; tune via the GUI for your camera
 
     def __init__(self):
         self._lock = threading.Lock()
-        self.height_cm = None
-        self.tilt_deg = None
+        # Pre-populated with the locked-in defaults (see CAMERA_DEFAULT_*
+        # above) so the HUD/obstacle detector are usable immediately at
+        # startup -- recalibrate via the GUI form to override these.
+        self.height_cm = CAMERA_DEFAULT_HEIGHT_CM
+        self.tilt_deg = CAMERA_DEFAULT_TILT_DEG
         self.vfov_deg = self.DEFAULT_VFOV_DEG
 
     def calibrate(self, height_cm, known_distance_cm, vfov_deg=None):
@@ -456,6 +486,17 @@ class CameraRangefinder:
             return None
         return y
 
+    def row_for_distance(self, distance_cm, frame_height_px):
+        """Public entry point used by ObstacleDetector to crop the frame to
+        only the region farther than a given real-world distance."""
+        with self._lock:
+            height_cm = self.height_cm
+            tilt_deg = self.tilt_deg
+            vfov_deg = self.vfov_deg
+        if height_cm is None or tilt_deg is None:
+            return None
+        return self._row_for_distance(height_cm, tilt_deg, vfov_deg, distance_cm, frame_height_px)
+
     @staticmethod
     def _distance_for_row(height_cm, tilt_deg, vfov_deg, y_px, frame_height_px):
         """Inverse of _row_for_distance: real-world floor distance for a
@@ -480,6 +521,24 @@ class CameraRangefinder:
         if height_cm is None or tilt_deg is None:
             return None
         return self._distance_for_row(height_cm, tilt_deg, vfov_deg, y_px, frame_height_px)
+
+    def bearing_deg_for_column(self, x_px, frame_width_px, frame_height_px):
+        """Horizontal angle (deg) of a pixel column from the camera's
+        forward boresight -- positive = to the right. Reuses the SAME
+        pixel focal length as the vertical projection (square-pixel
+        assumption: one focal length in pixels serves both axes; the
+        horizontal and vertical FOVs only differ because frame width !=
+        frame height), so no separate horizontal-FOV calibration is
+        needed. Used to convert a detected box's horizontal position into
+        a bearing for placing it on the world map."""
+        with self._lock:
+            tilt_deg = self.tilt_deg
+            vfov_deg = self.vfov_deg
+        if tilt_deg is None:
+            return None
+        f_px = (frame_height_px / 2.0) / math.tan(math.radians(vfov_deg) / 2.0)
+        angle = math.atan((x_px - frame_width_px / 2.0) / f_px)
+        return math.degrees(angle)
 
     def get_snapshot(self, frame_height_px):
         with self._lock:
@@ -507,19 +566,35 @@ class CameraRangefinder:
 
 
 class ObstacleDetector:
-    """Lightweight obstacle detection with NO trained model file to manage:
-      - People: OpenCV's built-in HOG + default people-detector SVM (ships
-        with OpenCV itself, no download needed). Meant to catch a person's
-        legs/lower body in frame given the camera's low, floor-level mount.
-      - Everything else: classic edge/contour shape analysis. A blocky or
-        angular contour (box, furniture leg, wall edge) is treated as an
-        obstacle; a round contour is assumed to be a tennis ball -- the
-        thing this robot is built to COLLECT, not avoid -- and is skipped.
-    Runs in its own background thread at DETECTION_FPS (much slower than
-    the video stream itself; detection is the expensive part), reading the
-    latest raw frame from a CameraStreamer and estimating each detected
-    box's distance via CameraRangefinder, using the box's bottom edge as
-    its floor-contact point (standard monocular ground-plane range trick --
+    """Lightweight obstacle detection -- no trained model file, no HOG
+    (dropped: it was the expensive part and CPU usage was too high for a
+    5Hz+ background thread on the Pi). Just segmentation + contour shape
+    analysis, kept cheap with two aggressive filters:
+
+      1. Only the DETECTION_MIN_DISTANCE_CM-DETECTION_MAX_DISTANCE_CM band
+         is even processed -- the frame is cropped to just the rows
+         between those two guide lines before segmentation runs, which
+         both shrinks the pixel area to process and guarantees anything
+         found already overlaps the band.
+      2. Of what's left, only contours wide enough to matter are kept --
+         bounding-box width > min_width_fraction of the frame width.
+      3. Round contours (circularity above circularity_threshold) are
+         still skipped even if they pass the size filter, as a second
+         line of defense against a large round object being flagged --
+         this robot collects tennis balls, doesn't avoid them.
+      4. Contours smaller than min_contour_area are dropped outright as
+         noise before either of the above checks even run.
+
+    None of these are a trained model's confidence score -- there isn't
+    one here -- but min_width_fraction, circularity_threshold, and
+    min_contour_area together are the closest equivalent: the "how
+    strict/important" knobs that decide whether something counts as a
+    real obstacle. All three are live-adjustable from the GUI.
+
+    Runs in its own background thread at DETECTION_FPS, reading the latest
+    raw frame from a CameraStreamer and estimating each detected box's
+    distance via CameraRangefinder, using the box's bottom edge as its
+    floor-contact point (standard monocular ground-plane range trick --
     assumes the object rests on the floor, so it breaks down for things
     like an overhanging table edge or a ball currently in the air).
     """
@@ -527,20 +602,68 @@ class ObstacleDetector:
     def __init__(self, camera: 'CameraStreamer', rangefinder: CameraRangefinder,
                  fps=DETECTION_FPS,
                  min_contour_area=DETECTION_MIN_CONTOUR_AREA,
-                 circularity_threshold=DETECTION_CIRCULARITY_THRESHOLD):
+                 circularity_threshold=DETECTION_CIRCULARITY_THRESHOLD,
+                 min_distance_cm=DETECTION_MIN_DISTANCE_CM,
+                 max_distance_cm=DETECTION_MAX_DISTANCE_CM,
+                 min_width_fraction=DETECTION_MIN_WIDTH_FRACTION):
         self.camera = camera
         self.rangefinder = rangefinder
         self.fps = fps
-        self.min_contour_area = min_contour_area
-        self.circularity_threshold = circularity_threshold
+        self.min_distance_cm = min_distance_cm
+        self.max_distance_cm = max_distance_cm
 
-        self._hog = cv2.HOGDescriptor()
-        self._hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        self._settings_lock = threading.Lock()
+        self._min_width_fraction = min_width_fraction
+        self._circularity_threshold = circularity_threshold
+        self._min_contour_area = min_contour_area
 
         self._lock = threading.Lock()
         self._detections = []
         self._running = False
         self._thread = None
+
+    def set_min_width_fraction(self, fraction):
+        """Live-adjustable from the GUI -- how wide (as a fraction of frame
+        width) a contour must be to count as an obstacle. Lower = more
+        sensitive (flags smaller things), higher = only flags big/wide
+        obstacles."""
+        if not (0.0 < fraction <= 1.0):
+            return False
+        with self._settings_lock:
+            self._min_width_fraction = fraction
+        return True
+
+    def get_min_width_fraction(self):
+        with self._settings_lock:
+            return self._min_width_fraction
+
+    def set_circularity_threshold(self, threshold):
+        """Live-adjustable -- how round (0-1, 1=perfect circle) a contour
+        can be before it's assumed to be a ball and skipped. Lower = more
+        aggressive at excluding round-ish shapes; higher = only excludes
+        near-perfect circles."""
+        if not (0.0 < threshold <= 1.0):
+            return False
+        with self._settings_lock:
+            self._circularity_threshold = threshold
+        return True
+
+    def get_circularity_threshold(self):
+        with self._settings_lock:
+            return self._circularity_threshold
+
+    def set_min_contour_area(self, area_px2):
+        """Live-adjustable -- minimum contour area (px^2) before it's even
+        considered; smaller is treated as noise and dropped immediately."""
+        if area_px2 <= 0:
+            return False
+        with self._settings_lock:
+            self._min_contour_area = area_px2
+        return True
+
+    def get_min_contour_area(self):
+        with self._settings_lock:
+            return self._min_contour_area
 
     def start(self):
         self._running = True
@@ -565,42 +688,259 @@ class ObstacleDetector:
             time.sleep(max(0.0, interval - elapsed))
 
     def _detect(self, frame):
-        frame_height_px = frame.shape[0]
-        detections = []
+        frame_height_px, frame_width_px = frame.shape[:2]
 
-        people_boxes, _weights = self._hog.detectMultiScale(
-            frame, winStride=(8, 8), padding=(8, 8), scale=1.05
-        )
-        for (x, y, w, h) in people_boxes:
-            detections.append(self._make_detection('person', x, y, w, h, frame_height_px))
+        # Crop to ONLY the min_distance_cm-max_distance_cm band before doing
+        # any real work: rows below the near line (closer than
+        # min_distance_cm) and rows above the far line (farther than
+        # max_distance_cm) are both cut, which shrinks the processed pixel
+        # area (cheaper) and means any contour findContours can even see is
+        # already guaranteed to overlap the band.
+        roi_bottom = self.rangefinder.row_for_distance(self.min_distance_cm, frame_height_px)
+        roi_top = self.rangefinder.row_for_distance(self.max_distance_cm, frame_height_px)
+        roi_bottom = frame_height_px if roi_bottom is None else int(roi_bottom)
+        roi_top = 0 if roi_top is None else int(roi_top)
+        roi_top = max(0, min(roi_top, frame_height_px))
+        roi_bottom = max(roi_top + 1, min(roi_bottom, frame_height_px))
+        roi = frame[roi_top:roi_bottom, :]
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         edges = cv2.dilate(cv2.Canny(blurred, 50, 150), None, iterations=1)
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        min_width_px = self.get_min_width_fraction() * frame_width_px
+        circularity_threshold = self.get_circularity_threshold()
+        min_contour_area = self.get_min_contour_area()
+        detections = []
         for c in contours:
             area = cv2.contourArea(c)
-            if area < self.min_contour_area:
+            if area < min_contour_area:
                 continue
+            # x, y are relative to the ROI's own top-left -- the crop trims
+            # rows off BOTH top and bottom, so y must be shifted back by
+            # roi_top to get full-frame coordinates (x is unaffected, only
+            # rows were cropped).
+            x, y_roi, w, h = cv2.boundingRect(c)
+            if w < min_width_px:
+                continue  # not wide enough to be the "big obstacle" we care about
             perimeter = cv2.arcLength(c, True)
             if perimeter <= 0:
                 continue
             circularity = 4.0 * math.pi * area / (perimeter * perimeter)
-            if circularity > self.circularity_threshold:
-                continue  # round -- likely a tennis ball, a target not an obstacle
-            x, y, w, h = cv2.boundingRect(c)
-            detections.append(self._make_detection('object', x, y, w, h, frame_height_px))
+            if circularity > circularity_threshold:
+                continue  # round -- likely a ball even at this size, skip
+
+            y = y_roi + roi_top
+            distance_cm = self.rangefinder.distance_for_row(y + h, frame_height_px)
+            # Center bearing for display/legacy use, plus left/right edge
+            # bearings so the pinned obstacle can cover the box's actual
+            # lateral footprint, not just a single point.
+            bearing_deg = self.rangefinder.bearing_deg_for_column(x + w / 2.0, frame_width_px, frame_height_px)
+            left_bearing_deg = self.rangefinder.bearing_deg_for_column(x, frame_width_px, frame_height_px)
+            right_bearing_deg = self.rangefinder.bearing_deg_for_column(x + w, frame_width_px, frame_height_px)
+            detections.append({'label': 'obstacle', 'x': int(x), 'y': int(y),
+                                'w': int(w), 'h': int(h), 'distance_cm': distance_cm,
+                                'bearing_deg': bearing_deg,
+                                'left_bearing_deg': left_bearing_deg,
+                                'right_bearing_deg': right_bearing_deg})
 
         return detections
-
-    def _make_detection(self, label, x, y, w, h, frame_height_px):
-        distance_cm = self.rangefinder.distance_for_row(y + h, frame_height_px)
-        return {'label': label, 'x': int(x), 'y': int(y), 'w': int(w), 'h': int(h),
-                'distance_cm': distance_cm}
 
     def get_detections(self):
         with self._lock:
             return list(self._detections)
+
+
+class ObstacleWatcher:
+    """Safety supervisor bridging ObstacleDetector's vision output and
+    GridNavNode's motion planner -- glitch protection for obstacle
+    confirmation.
+
+    A single detection tick could easily be a glitch (motion blur,
+    lighting flicker, a passing shadow), so nothing gets pinned into the
+    A* obstacle map off one frame. Instead:
+
+      1. The first tick that sees ANY obstacle while the robot is
+         actively driving immediately HOLDS it (stops, freezes the
+         current leg mid-flight) for hold_duration_s seconds.
+      2. Every detection tick during that hold increments a hit counter.
+      3. When the hold window ends: if the hit count reached
+         confirm_count, the obstacle is real -- pin its world cell(s)
+         into the node's A* obstacle map and re-submit the current goal
+         so it replans around them. If not, treat it as a glitch: clear
+         the hold and let the interrupted leg resume exactly where it
+         left off.
+
+    A confirmed/pinned obstacle stays in the map permanently (it's just
+    added to node.obstacles) -- but critically, a NEW hold is only
+    started if at least one of the currently-seen detection's cells is
+    NOT already pinned. Without this check, the same real, already-mapped
+    obstacle would keep re-triggering a fresh 5-second stop every time it
+    re-enters the camera's view (e.g. while executing nearby legs of the
+    replanned route), which looked like "still glitching" even though the
+    obstacle itself was already correctly known.
+
+    Both hold_duration_s and confirm_count are live-adjustable from the
+    GUI, and the whole watcher can be toggled on/off (enabled) -- when
+    disabled, detection/streaming keep running for display, but no holds
+    are ever started (and any in-progress hold is released immediately).
+    Runs its own background thread polling the detector at DETECTION_FPS
+    (no point checking faster than new detections arrive).
+    """
+
+    def __init__(self, node: 'GridNavNode', detector: ObstacleDetector,
+                 hold_duration_s=OBSTACLE_HOLD_DURATION_S,
+                 confirm_count=OBSTACLE_CONFIRM_COUNT):
+        self.node = node
+        self.detector = detector
+
+        self._lock = threading.Lock()
+        self.hold_duration_s = hold_duration_s
+        self.confirm_count = confirm_count
+        self.enabled = True
+        self._holding = False
+        self._hold_start = 0.0
+        self._hit_count = 0
+        self._accumulated_cells = set()
+
+        self._running = False
+        self._thread = None
+
+    def set_hold_duration(self, seconds):
+        if seconds <= 0:
+            return False
+        with self._lock:
+            self.hold_duration_s = seconds
+        return True
+
+    def set_confirm_count(self, count):
+        if count <= 0:
+            return False
+        with self._lock:
+            self.confirm_count = int(count)
+        return True
+
+    def set_enabled(self, enabled: bool):
+        """Master on/off toggle from the GUI. Turning it off immediately
+        releases any in-progress hold so the robot isn't left stuck."""
+        with self._lock:
+            self.enabled = enabled
+            was_holding = self._holding
+            if not enabled:
+                self._holding = False
+        if not enabled and was_holding:
+            self.node.set_obstacle_hold(False)
+        return True
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _loop(self):
+        interval = 1.0 / DETECTION_FPS
+        while self._running:
+            self._tick()
+            time.sleep(interval)
+
+    def _tick(self):
+        with self._lock:
+            enabled = self.enabled
+            holding = self._holding
+        if not enabled:
+            return
+
+        detections = self.detector.get_detections()
+        obstacle_seen = len(detections) > 0
+
+        if not holding:
+            if obstacle_seen and self.node.is_driving():
+                # Only start a new hold if something here isn't already
+                # pinned -- otherwise a known, already-mapped obstacle
+                # would keep re-triggering stops every time it re-enters
+                # the camera's view.
+                has_new_cell = any(
+                    not self.node.is_cell_pinned(cell)
+                    for det in detections
+                    for cell in self.node.detection_cells(det)
+                )
+                if has_new_cell:
+                    seed_cells = set()
+                    for det in detections:
+                        seed_cells.update(self.node.detection_cells(det))
+                    with self._lock:
+                        self._holding = True
+                        self._hold_start = time.monotonic()
+                        self._hit_count = 1
+                        self._accumulated_cells = seed_cells
+                    self.node.set_obstacle_hold(True)
+            return
+
+        if obstacle_seen:
+            # Accumulate cells across the WHOLE hold, not just whatever the
+            # final tick happens to see -- a single missed tick right at
+            # the end (motion blur, a flicker) used to mean nothing got
+            # pinned even after enough earlier ticks confirmed it. Now the
+            # union of every tick's cells during the hold is what gets
+            # pinned, so one bad frame at the end can't erase the whole
+            # confirmation.
+            new_cells = set()
+            for det in detections:
+                new_cells.update(self.node.detection_cells(det))
+            with self._lock:
+                self._hit_count += 1
+                self._accumulated_cells.update(new_cells)
+
+        with self._lock:
+            elapsed = time.monotonic() - self._hold_start
+            hold_duration_s = self.hold_duration_s
+            hit_count = self._hit_count
+            confirm_count = self.confirm_count
+            accumulated_cells = set(self._accumulated_cells)
+
+        if elapsed >= hold_duration_s:
+            if hit_count >= confirm_count and accumulated_cells:
+                self._confirm_and_replan(accumulated_cells)
+            with self._lock:
+                self._holding = False
+                self._accumulated_cells = set()
+            self.node.set_obstacle_hold(False)
+
+    def _confirm_and_replan(self, cells):
+        pinned = self.node.pin_cells(cells)
+        if pinned:
+            self.node.replan_current_goal()
+
+    def get_candidate_cells(self):
+        """Cells accumulated so far during an in-progress hold -- lets the
+        GUI show a stable 'being confirmed' box for the whole hold window
+        instead of a flickering per-tick marker."""
+        with self._lock:
+            return list(self._accumulated_cells)
+
+    def get_status(self):
+        with self._lock:
+            holding = self._holding
+            hit_count = self._hit_count
+            hold_start = self._hold_start
+            hold_duration_s = self.hold_duration_s
+            confirm_count = self.confirm_count
+            enabled = self.enabled
+        remaining_s = max(0.0, hold_duration_s - (time.monotonic() - hold_start)) if holding else 0.0
+        return {
+            'enabled': enabled,
+            'holding': holding,
+            'hit_count': hit_count,
+            'confirm_count': confirm_count,
+            'hold_duration_s': hold_duration_s,
+            'remaining_s': remaining_s,
+        }
 
 
 class PID:
@@ -684,6 +1024,11 @@ class GridNavNode(Node):
         # cell (i, j) centered at (i * GRID_SPACING_CM, j * GRID_SPACING_CM).
         # Edited live from the GUI (click a cell to toggle it).
         self.obstacles = set()
+        # Subset of self.obstacles that came from a CONFIRMED camera
+        # detection (ObstacleWatcher), not a manual GUI click -- tracked
+        # separately purely so the GUI can draw them solid red/distinctly
+        # from manually-toggled cells.
+        self.pinned_cells = set()
         self.planned_path = []       # [(x_cm, y_cm), ...] cell centers of the last A* route, for GUI overlay
 
         # Step mode: pause fully after each STEP_SIZE_CM of DRIVE travel
@@ -692,6 +1037,13 @@ class GridNavNode(Node):
         self.step_mode = False
         self.awaiting_continue = False
         self.step_baseline_pulses = 0
+
+        # Set True by ObstacleWatcher while confirming a camera-detected
+        # obstacle (stop-and-recheck window) -- control_loop holds all-zero
+        # cmd_vel and does nothing else while this is set, then resumes the
+        # SAME leg from where it left off once cleared (nothing about the
+        # leg's phase/baseline pulses is touched during a hold).
+        self.obstacle_hold = False
 
         self.path = [(0.0, 0.0)]     # visited points, for GUI trail
 
@@ -737,12 +1089,14 @@ class GridNavNode(Node):
             cell = (i, j)
             if cell in self.obstacles:
                 self.obstacles.discard(cell)
+                self.pinned_cells.discard(cell)
             else:
                 self.obstacles.add(cell)
 
     def clear_obstacles(self):
         with self._lock:
             self.obstacles.clear()
+            self.pinned_cells.clear()
 
     def set_goal(self, gx, gy, end_dir_deg=None, step_mode=False):
         with self._lock:
@@ -850,6 +1204,10 @@ class GridNavNode(Node):
         twist = Twist()
 
         with self._lock:
+            if self.obstacle_hold:
+                self.cmd_pub.publish(twist)  # all-zero -- held for obstacle confirmation
+                return
+
             if self.state != 'RUNNING' or self.current_yaw is None or self.last_pulses is None:
                 self.cmd_pub.publish(twist)  # all-zero
                 return
@@ -962,6 +1320,90 @@ class GridNavNode(Node):
     def stop_robot(self):
         self.cmd_pub.publish(Twist())  # all zeros
 
+    # ---------------- Obstacle confirmation hooks (used by ObstacleWatcher) ----------------
+
+    def is_driving(self):
+        """True if control_loop is actively working a leg right now --
+        i.e. there's real motion an obstacle hold would actually interrupt."""
+        with self._lock:
+            return self.state == 'RUNNING' and not self.awaiting_continue and not self.obstacle_hold
+
+    def set_obstacle_hold(self, hold: bool):
+        with self._lock:
+            self.obstacle_hold = hold
+        if hold:
+            self.stop_robot()
+
+    def detection_cells(self, detection):
+        """Compute the world grid cells a camera detection's box would
+        cover (left edge to right edge, at its estimated distance) WITHOUT
+        pinning anything -- used both by pin_obstacle_box_from_detection
+        and by ObstacleWatcher to check whether a detection is already
+        fully accounted for in the obstacle map before bothering with a
+        hold. Returns [] if position/heading/distance aren't available."""
+        distance_cm = detection.get('distance_cm')
+        center_bearing = detection.get('bearing_deg')
+        if distance_cm is None or center_bearing is None:
+            return []
+        bearings = [b for b in (detection.get('left_bearing_deg'),
+                                 center_bearing,
+                                 detection.get('right_bearing_deg')) if b is not None]
+
+        with self._lock:
+            if self.heading_ref is None or self.current_yaw is None:
+                return []
+            heading_deg = math.degrees(angle_diff(self.current_yaw, self.heading_ref))
+
+            corner_cells = []
+            for bearing_deg in bearings:
+                world_bearing_rad = math.radians(heading_deg + bearing_deg)
+                obstacle_x = self.x + distance_cm * math.cos(world_bearing_rad)
+                obstacle_y = self.y + distance_cm * math.sin(world_bearing_rad)
+                corner_cells.append(self._to_cell(obstacle_x, obstacle_y))
+
+        i_vals = [c[0] for c in corner_cells]
+        j_vals = [c[1] for c in corner_cells]
+        return [(i, j) for i in range(min(i_vals), max(i_vals) + 1)
+                for j in range(min(j_vals), max(j_vals) + 1)]
+
+    def is_cell_pinned(self, cell):
+        with self._lock:
+            return cell in self.obstacles
+
+    def pin_cells(self, cells):
+        """Permanently add an arbitrary collection of (i, j) grid cells to
+        the A* obstacle map, tracked in pinned_cells (a subset of
+        obstacles) so the GUI can draw confirmed/camera-pinned cells
+        distinctly (solid) from manually-toggled ones (light). Returns the
+        list of cells actually pinned (may be empty)."""
+        cells = list(cells)
+        if not cells:
+            return []
+        with self._lock:
+            self.obstacles.update(cells)
+            self.pinned_cells.update(cells)
+        self.get_logger().warn(f'Obstacle confirmed -- pinned {len(cells)} grid cell(s): {sorted(cells)}')
+        return cells
+
+    def pin_obstacle_box_from_detection(self, detection):
+        """Convert a single camera detection into a BOX of world grid
+        cells (its left edge to its right edge, at its estimated
+        distance) and pin them. Returns the list of pinned cells (may be
+        empty)."""
+        return self.pin_cells(self.detection_cells(detection))
+
+    def replan_current_goal(self):
+        """Re-submit the current goal so set_goal()'s A* search picks up
+        newly pinned obstacle cells and routes around them."""
+        with self._lock:
+            goal = self.goal
+            end_dir_deg = self.end_dir_deg
+            step_mode = self.step_mode
+        if goal is None:
+            return
+        self.get_logger().warn(f'Replanning path to {goal} around newly pinned obstacle(s)')
+        self.set_goal(goal[0], goal[1], end_dir_deg, step_mode)
+
     def reset_position(self):
         """Zero the tracked (x, y) without restarting the node. Goals are
         relative to this tracked position, not the physical start point --
@@ -1010,6 +1452,7 @@ class GridNavNode(Node):
                 'path': list(self.path),
                 'planned_path': list(self.planned_path),
                 'obstacles': [list(c) for c in self.obstacles],
+                'pinned_cells': [list(c) for c in self.pinned_cells],
                 'goal': self.goal,
                 'state': self.state,
                 'phase': self.phase,
@@ -1035,14 +1478,14 @@ HTML_PAGE = """<!doctype html>
 <meta charset="utf-8">
 <title>grid_nav.py</title>
 <style>
-  body { font-family: sans-serif; background: #1e1e1e; color: #eee; margin: 0; padding: 16px; }
-  h1 { font-size: 16px; font-weight: normal; color: #aaa; margin: 0 0 12px 0; }
-  .layout { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
-  .left { display: flex; flex-direction: column; gap: 12px; min-width: 260px; }
-  .camera { display: flex; flex-direction: column; gap: 6px; min-width: 320px; max-width: 480px; }
+  body { font-family: sans-serif; background: #1e1e1e; color: #eee; margin: 0; padding: 8px; font-size: 13px; }
+  h1 { font-size: 13px; font-weight: normal; color: #aaa; margin: 0 0 6px 0; }
+  .layout { display: flex; gap: 8px; align-items: flex-start; flex-wrap: wrap; }
+  .left { display: flex; flex-direction: column; gap: 6px; min-width: 220px; }
+  .camera { display: flex; flex-direction: column; gap: 4px; min-width: 260px; max-width: 400px; }
   .camera-wrap { position: relative; }
   .camera img { width: 100%; background: #111; border: 1px solid #444; border-radius: 4px; display: block; }
-  .camera .k { font-size: 11px; color: #999; text-transform: uppercase; }
+  .camera .k { font-size: 10px; color: #999; text-transform: uppercase; }
   /* Small "+" fixed at the optical-axis center -- what you physically aim
      at a known-distance floor mark to calibrate. */
   .crosshair { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
@@ -1065,15 +1508,15 @@ HTML_PAGE = """<!doctype html>
                           text-shadow: 0 0 3px #000, 0 0 3px #000; }
   .right { flex: 1; }
   #canvas { background: #111; border: 1px solid #444; display: block; max-width: 100%; height: auto; cursor: crosshair; }
-  form { background: #262626; border: 1px solid #444; padding: 10px; border-radius: 6px; }
-  form .row { margin-bottom: 8px; }
-  input { width: 90px; font-size: 14px; padding: 4px; }
-  button { font-size: 14px; padding: 6px 16px; margin-top: 4px; width: 100%; }
-  label { display: block; font-size: 12px; color: #aaa; margin-bottom: 2px; }
-  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-  .stat-box { background: #262626; border: 1px solid #444; border-radius: 6px; padding: 8px 10px; }
-  .stat-box .k { font-size: 11px; color: #999; text-transform: uppercase; }
-  .stat-box .v { font-family: monospace; font-size: 15px; color: #eee; margin-top: 2px; }
+  form { background: #262626; border: 1px solid #444; padding: 6px 8px; border-radius: 5px; }
+  form .row { margin-bottom: 4px; }
+  input { width: 80px; font-size: 12px; padding: 2px 3px; }
+  button { font-size: 12px; padding: 4px 10px; margin-top: 2px; width: 100%; }
+  label { display: block; font-size: 10px; color: #aaa; margin-bottom: 1px; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+  .stat-box { background: #262626; border: 1px solid #444; border-radius: 5px; padding: 4px 6px; }
+  .stat-box .k { font-size: 9px; color: #999; text-transform: uppercase; }
+  .stat-box .v { font-family: monospace; font-size: 12px; color: #eee; margin-top: 1px; }
   .stat-box.wide { grid-column: 1 / -1; }
 </style>
 </head>
@@ -1108,7 +1551,14 @@ HTML_PAGE = """<!doctype html>
       <div class="stat-box wide"><div class="k">IMU Yaw (raw)</div><div class="v" id="s-yaw">--</div></div>
       <div class="stat-box wide"><div class="k">Heading (ref=0)</div><div class="v" id="s-heading">--</div></div>
       <div class="stat-box wide"><div class="k">Target Heading</div><div class="v" id="s-target">--</div></div>
+      <div class="stat-box wide"><div class="k">Obstacle Watch</div><div class="v" id="s-obwatch">--</div></div>
     </div>
+    <form id="obWatchForm">
+      <div class="row"><label style="display:inline"><input id="obEnabled" type="checkbox" style="width:auto" checked> Obstacle Avoidance Enabled</label></div>
+      <div class="row"><label>Obstacle Hold Duration (sec)</label><input id="obHoldSec" type="number" value="5" step="0.5" min="0.5"></div>
+      <div class="row"><label>Confirm Count (hits during hold)</label><input id="obConfirmCount" type="number" value="5" step="1" min="1"></div>
+      <button type="submit">Set Obstacle Watch</button>
+    </form>
   </div>
   <div class="camera">
     <div class="k">Camera</div>
@@ -1123,10 +1573,17 @@ HTML_PAGE = """<!doctype html>
     <form id="camCalibForm">
       <div class="row"><label>Camera Height Above Floor (cm)</label><input id="camHeight" type="number" value="26" step="0.5"></div>
       <div class="row"><label>Known Distance at Crosshair (cm)</label><input id="camDist" type="number" value="100" step="1"></div>
-      <div class="row"><label>Vertical FOV (deg, tune for accuracy)</label><input id="camVfov" type="number" value="45" step="1"></div>
+      <div class="row"><label>Vertical FOV (deg, tune for accuracy)</label><input id="camVfov" type="number" value="60" step="1"></div>
       <button type="submit">Calibrate (crosshair on floor mark)</button>
     </form>
     <div class="stat-box wide"><div class="k">Tilt / Crosshair Distance</div><div class="v" id="s-cam">not calibrated</div></div>
+    <form id="detectSizeForm">
+      <div class="row"><label>Min Obstacle Width (% of frame)</label><input id="detectSizePct" type="number" value="50" step="1" min="1" max="100"></div>
+      <div class="row"><label>Roundness Threshold (0-1, higher = stricter ball filter)</label><input id="detectCircularity" type="number" value="0.78" step="0.01" min="0.01" max="1"></div>
+      <div class="row"><label>Min Contour Area (px²)</label><input id="detectMinArea" type="number" value="1500" step="50" min="1"></div>
+      <button type="submit">Set Detection Params</button>
+    </form>
+    <div class="stat-box wide"><div class="k">Detection Params</div><div class="v" id="s-detect-size">--</div></div>
   </div>
   <div class="right">
     <canvas id="canvas" width="__CANVAS_PX__" height="__CANVAS_PX__"></canvas>
@@ -1143,6 +1600,23 @@ const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 let path = [];
 let lastGoal = null;
+let liveDetections = [];  // latest camera detections (distance_cm/bearing_deg), updated by pollDetections()
+let candidateCells = [];  // cells accumulated so far during an in-progress obstacle hold, updated by pollObstacleWatch()
+
+// Draw a single SPACING x SPACING world-cm grid cell as a filled+stroked
+// box on the canvas -- shared by obstacles/pinned-cells/candidate-cells/
+// live-detection rendering so they all look like consistent grid boxes.
+function drawCellBox(i, j, fillStyle, strokeStyle) {
+  const cx = i * SPACING;
+  const cy = j * SPACING;
+  const [px, py] = toPx(cx - SPACING / 2, cy + SPACING / 2);
+  const size = SPACING * SCALE;
+  ctx.fillStyle = fillStyle;
+  ctx.strokeStyle = strokeStyle;
+  ctx.lineWidth = 1;
+  ctx.fillRect(px, py, size, size);
+  ctx.strokeRect(px, py, size, size);
+}
 
 function toPx(xcm, ycm) {
   return [CANVAS_PX / 2 + xcm * SCALE, CANVAS_PX / 2 - ycm * SCALE];
@@ -1189,18 +1663,18 @@ function draw(state) {
   ctx.fillText('X (m)', CANVAS_PX - 40, oy - 6);
   ctx.fillText('Y (m)', ox + 6, 12);
 
-  // obstacles (blocked A* cells)
+  // obstacles (blocked A* cells) -- manually-toggled cells drawn light/
+  // semi-transparent; CONFIRMED camera-pinned cells (a subset) drawn
+  // solid full red so they visually stand out as "this one is real,
+  // camera-confirmed, not just a manual test block." These are permanent
+  // (stay until manually cleared/toggled) -- if a cell you expect to see
+  // pinned isn't here, it was never actually confirmed (see candidate/live
+  // boxes below for what's still being evaluated).
   if (state.obstacles) {
-    ctx.fillStyle = 'rgba(255,60,60,0.35)';
-    ctx.strokeStyle = '#ff3c3c';
-    ctx.lineWidth = 1;
+    const pinnedKeys = new Set((state.pinned_cells || []).map(c => `${c[0]},${c[1]}`));
     for (const cell of state.obstacles) {
-      const cx = cell[0] * SPACING;
-      const cy = cell[1] * SPACING;
-      const [px, py] = toPx(cx - SPACING / 2, cy + SPACING / 2);
-      const size = SPACING * SCALE;
-      ctx.fillRect(px, py, size, size);
-      ctx.strokeRect(px, py, size, size);
+      const isPinned = pinnedKeys.has(`${cell[0]},${cell[1]}`);
+      drawCellBox(cell[0], cell[1], isPinned ? '#ff0000' : 'rgba(255,60,60,0.35)', '#ff3c3c');
     }
   }
 
@@ -1233,6 +1707,35 @@ function draw(state) {
       ctx.lineTo(px, py);
     }
     ctx.stroke();
+  }
+
+  // candidate cells -- accumulated across the WHOLE current hold window
+  // (not just the latest tick), so this box stays stable/visible for the
+  // full hold instead of flickering with every noisy per-frame detection.
+  // Drawn yellow: "being evaluated, not confirmed yet."
+  for (const cell of candidateCells) {
+    drawCellBox(cell[0], cell[1], 'rgba(255,220,0,0.45)', '#ffdc00');
+  }
+
+  // live camera-detected obstacles (this instant's raw detections, not yet
+  // even part of a hold) -- projected from the camera's distance+bearing
+  // onto the world map using the robot's current position/heading, then
+  // snapped to the same SPACING grid cell as everything else so it reads
+  // as a proper 50cm box instead of a single point. Expected to flicker
+  // frame to frame -- it's the raw/unconfirmed signal, not the persisted
+  // obstacle map (see the solid red boxes above for what's actually
+  // pinned).
+  if (state.heading_deg !== null && state.heading_deg !== undefined) {
+    for (const det of liveDetections) {
+      if (det.distance_cm === null || det.distance_cm === undefined) continue;
+      if (det.bearing_deg === null || det.bearing_deg === undefined) continue;
+      const worldBearingRad = (state.heading_deg + det.bearing_deg) * Math.PI / 180;
+      const ox = state.x + det.distance_cm * Math.cos(worldBearingRad);
+      const oy = state.y + det.distance_cm * Math.sin(worldBearingRad);
+      const ci = Math.round(ox / SPACING);
+      const cj = Math.round(oy / SPACING);
+      drawCellBox(ci, cj, 'rgba(255,165,0,0.35)', '#ffa500');
+    }
   }
 
   // goal marker
@@ -1420,14 +1923,15 @@ async function pollCamera() {
   }
 }
 
-function detectionColor(label) {
-  return label === 'person' ? '#4da3ff' : '#ffa500';
+function detectionColor() {
+  return '#ffa500';
 }
 
 async function pollDetections() {
   try {
     const res = await fetch('/api/detections');
     const ds = await res.json();
+    liveDetections = ds.detections;  // cached for draw() to project onto the grid map
     const container = document.getElementById('detectionBoxes');
     container.innerHTML = '';
     for (const det of ds.detections) {
@@ -1450,17 +1954,72 @@ async function pollDetections() {
 
       container.appendChild(box);
     }
+    if (ds.min_width_fraction !== null && ds.min_width_fraction !== undefined) {
+      set('s-detect-size', `width>${(ds.min_width_fraction * 100).toFixed(0)}%, `
+            + `round<${ds.circularity_threshold.toFixed(2)}, area>${ds.min_contour_area.toFixed(0)}px²`);
+    } else {
+      set('s-detect-size', 'n/a (no camera)');
+    }
   } catch (e) {
     // detection endpoint unavailable -- leave last-drawn boxes as-is
   }
 }
 
+document.getElementById('detectSizeForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const pct = parseFloat(document.getElementById('detectSizePct').value);
+  const circularity = parseFloat(document.getElementById('detectCircularity').value);
+  const minArea = parseFloat(document.getElementById('detectMinArea').value);
+  await fetch('/api/detection_settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      min_width_fraction: pct / 100,
+      circularity_threshold: circularity,
+      min_contour_area: minArea
+    })
+  });
+});
+
+async function pollObstacleWatch() {
+  try {
+    const res = await fetch('/api/obstacle_watch');
+    const ow = await res.json();
+    candidateCells = ow.candidate_cells || [];
+    if (!ow.active) {
+      set('s-obwatch', 'n/a (no camera)');
+    } else if (!ow.enabled) {
+      set('s-obwatch', 'DISABLED');
+    } else if (ow.holding) {
+      set('s-obwatch', `HOLDING -- ${ow.hit_count}/${ow.confirm_count} confirmations, ${ow.remaining_s.toFixed(1)}s left`);
+    } else {
+      set('s-obwatch', `clear (hold=${ow.hold_duration_s}s, confirm=${ow.confirm_count})`);
+    }
+  } catch (e) {
+    set('s-obwatch', 'connection lost');
+  }
+}
+
+document.getElementById('obWatchForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const enabled = document.getElementById('obEnabled').checked;
+  const holdSec = parseFloat(document.getElementById('obHoldSec').value);
+  const confirmCount = parseInt(document.getElementById('obConfirmCount').value, 10);
+  await fetch('/api/obstacle_watch_settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({enabled: enabled, hold_duration_s: holdSec, confirm_count: confirmCount})
+  });
+});
+
 setInterval(poll, __POLL_MS__);
 setInterval(pollCamera, __POLL_MS__);
 setInterval(pollDetections, __POLL_MS__);
+setInterval(pollObstacleWatch, __POLL_MS__);
 poll();
 pollCamera();
 pollDetections();
+pollObstacleWatch();
 </script>
 </body>
 </html>
@@ -1484,7 +2043,8 @@ def render_page():
 
 def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
                rangefinder: CameraRangefinder,
-               detector: 'ObstacleDetector | None') -> Flask:
+               detector: 'ObstacleDetector | None',
+               watcher: 'ObstacleWatcher | None') -> Flask:
     app = Flask(__name__)
     # Werkzeug's request logging is noisy at GUI_HZ polling rates (and would
     # be far worse for the continuous /video_feed stream).
@@ -1538,7 +2098,66 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
             'frame_width': CAMERA_WIDTH,
             'frame_height': CAMERA_HEIGHT,
             'detections': detector.get_detections() if detector is not None else [],
+            'min_width_fraction': detector.get_min_width_fraction() if detector is not None else None,
+            'circularity_threshold': detector.get_circularity_threshold() if detector is not None else None,
+            'min_contour_area': detector.get_min_contour_area() if detector is not None else None,
         })
+
+    @app.route('/api/detection_settings', methods=['POST'])
+    def api_detection_settings():
+        if detector is None:
+            return jsonify({'ok': False, 'error': 'no detector running (camera unavailable)'}), 400
+        data = request.get_json(force=True)
+        ok = True
+        if 'min_width_fraction' in data:
+            try:
+                ok = detector.set_min_width_fraction(float(data['min_width_fraction'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if 'circularity_threshold' in data:
+            try:
+                ok = detector.set_circularity_threshold(float(data['circularity_threshold'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if 'min_contour_area' in data:
+            try:
+                ok = detector.set_min_contour_area(float(data['min_contour_area'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if not ok:
+            return jsonify({'ok': False, 'error': 'invalid detection settings'}), 400
+        return jsonify({'ok': True})
+
+    @app.route('/api/obstacle_watch')
+    def api_obstacle_watch():
+        if watcher is None:
+            return jsonify({'active': False})
+        status = watcher.get_status()
+        status['active'] = True
+        status['candidate_cells'] = [list(c) for c in watcher.get_candidate_cells()]
+        return jsonify(status)
+
+    @app.route('/api/obstacle_watch_settings', methods=['POST'])
+    def api_obstacle_watch_settings():
+        if watcher is None:
+            return jsonify({'ok': False, 'error': 'no obstacle watcher running (camera unavailable)'}), 400
+        data = request.get_json(force=True)
+        ok = True
+        if 'hold_duration_s' in data:
+            try:
+                ok = watcher.set_hold_duration(float(data['hold_duration_s'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if 'confirm_count' in data:
+            try:
+                ok = watcher.set_confirm_count(int(data['confirm_count'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if 'enabled' in data:
+            watcher.set_enabled(bool(data['enabled']))
+        if not ok:
+            return jsonify({'ok': False, 'error': 'invalid hold_duration_s/confirm_count'}), 400
+        return jsonify({'ok': True})
 
     @app.route('/api/state')
     def api_state():
@@ -1625,18 +2244,25 @@ def main(args=None):
     rangefinder = CameraRangefinder()
 
     detector = None
+    watcher = None
     if camera is not None:
         detector = ObstacleDetector(camera, rangefinder)
         detector.start()
         node.get_logger().info(f'Obstacle detector running at {DETECTION_FPS} Hz')
 
-    app = create_app(node, camera, rangefinder, detector)
+        watcher = ObstacleWatcher(node, detector)
+        watcher.start()
+        node.get_logger().info('Obstacle confirmation watcher running')
+
+    app = create_app(node, camera, rangefinder, detector, watcher)
     node.get_logger().info(f'Web GUI at http://<this-device-ip>:{WEB_PORT}')
     try:
         app.run(host='0.0.0.0', port=WEB_PORT, threaded=True, use_reloader=False)
     except KeyboardInterrupt:
         pass
     finally:
+        if watcher is not None:
+            watcher.stop()
         if detector is not None:
             detector.stop()
         if camera is not None:
