@@ -297,3 +297,80 @@ FUTURE IMPROVEMENT IDEA (not yet implemented)
   rate at 0.20 vs 0.25+ speed via `ros2 topic echo /wheel_encoder` --
   if glitch count climbs much faster relative to pulse count at the
   higher speed, that confirms the filter-clipping theory above.
+
+=====================================================
+SECTION: Camera HUD / distance rangefinder (grid_nav.py)
+=====================================================
+
+-----------------------------------------------------
+[2026-08-08] Feature: USB webcam stream + backup-camera-style distance HUD
+-----------------------------------------------------
+
+WHAT WAS ADDED
+- USB webcam streamed into the grid_nav.py GUI via OpenCV
+  (CameraStreamer class) as MJPEG over a new /video_feed route.
+  Requires `python3-opencv` (apt) or `opencv-python` (pip) on the Pi.
+  CAMERA_DEVICE_INDEX picks which /dev/videoN to open (0 by default).
+- CameraRangefinder class: turns the camera into a rough floor
+  rangefinder using a small "+" crosshair fixed at the exact center
+  of the video frame (the camera's optical axis).
+
+HOW CALIBRATION WORKS (single-point, no lens data needed for this part)
+- You physically point the robot/camera so the on-screen crosshair
+  lines up with a floor mark at a KNOWN real-world distance, enter
+  that distance + the camera's mounted height above the floor, and
+  hit Calibrate.
+- Because the crosshair point sits exactly on the optical axis, the
+  camera-height/floor-distance/line-of-sight forms a simple right
+  triangle -- no FOV or lens data needed to solve it:
+      tilt_deg = atan(height_cm / known_distance_cm)
+  tilt_deg is measured FROM HORIZONTAL (i.e. how far below level the
+  camera's line of sight is) -- 0 deg = camera aimed dead level at
+  the horizon, 90 deg = camera aimed straight down at its own feet.
+  (If you want the angle from the vertical mounting pole instead,
+  that's just 90 - tilt_deg.)
+- Real numbers from this robot: height=26cm, calibrated at 100cm ->
+  tilt_deg ~= 14.6 deg. That's a shallow, mostly-forward-looking
+  angle, consistent with a low-mounted camera aimed at a fairly
+  distant floor point.
+- CALIBRATION DISTANCE CHOICE: originally tried calibrating at
+  200cm, but that put the target mark too near the top of frame /
+  vanishing point where a small pixel-alignment error maps to a
+  large angular error -- switched to 100cm (closer, easier to align
+  precisely, and roughly centered in the frame) for a more accurate
+  tilt_deg. General rule: pick a calibration mark you can position
+  precisely and that lands somewhere in the middle of the frame, not
+  right at the blurry/compressed far edge.
+
+FULL-FRAME PERSPECTIVE (the backup-camera-style guide lines)
+- The single-point calibration above is enough to get tilt_deg (and
+  therefore "distance at the crosshair"), but mapping ANY OTHER row
+  of the image to a real-world distance additionally needs the
+  camera's vertical field of view (vfov_deg), to get a pixel focal
+  length:
+      f_px = (frame_height_px / 2) / tan(vfov_deg / 2)
+  then for a target real-world distance d:
+      phi(d) = atan(height_cm / d)             -- required look-down angle
+      y = frame_height_px/2 + f_px * tan(phi(d) - tilt_deg)
+- vfov_deg is NOT solved from calibration -- it's a GUI-editable
+  guess (default 45 deg, "typical-ish" for a USB webcam) since exact
+  values aren't usually on the spec sheet. If the near guide line
+  (e.g. the one at your calibration distance) looks right but
+  farther lines (150cm+) don't match a tape measure, that's the
+  value to nudge up/down and recalibrate against.
+- GUIDE_DISTANCES_CM = [50, 100, 150, 200, 250, 300] draws horizontal
+  lines at those real-world distances, color-coded red (<=100cm) /
+  yellow (100-200cm) / green (>200cm), like a car's parking-assist
+  camera -- lines naturally compress together near the horizon as
+  distance increases, matching real floor perspective. Lines that
+  would fall outside the visible frame for the current calibration
+  are just skipped (not drawn).
+
+NOT YET DONE / CAVEATS
+- vfov_deg is a guess, not measured -- for real accuracy on the
+  150cm+ lines, would need a second calibration point at a different
+  known distance (two-point calibration solving both tilt_deg and
+  vfov_deg together) instead of a fixed default.
+- This whole feature assumes a perfectly flat, level floor and a
+  rigidly fixed camera mount (no vibration/drift changing the tilt
+  over time).

@@ -169,6 +169,13 @@ CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAMERA_FPS = 15
 CAMERA_JPEG_QUALITY = 80        # 0-100, higher = better quality/more bandwidth
+
+# Real-world floor distances (cm) the backup-camera-style HUD draws a
+# horizontal guide line for, once CameraRangefinder is calibrated. Each is
+# projected to whatever pixel row it actually falls at (near = low in
+# frame, far = near the horizon line) -- lines outside the visible frame
+# for the current calibration are simply skipped.
+GUIDE_DISTANCES_CM = [50, 100, 150, 200, 250, 300]
 # -------------------------------------------------
 
 
@@ -345,6 +352,113 @@ class CameraStreamer:
             self._thread.join(timeout=1.0)
         if self._cap is not None:
             self._cap.release()
+
+
+class CameraRangefinder:
+    """'Aim and measure' floor-distance calibration + a backup-camera-style
+    perspective HUD (horizontal distance guide lines) for the camera feed.
+
+    The crosshair drawn on the video feed sits dead-center of the frame,
+    i.e. exactly on the camera's optical axis. To calibrate: physically
+    point the robot/camera so the crosshair lines up with a floor mark at
+    a KNOWN real-world distance, enter that distance plus the camera's
+    mounted height above the floor, and calibrate. Because the crosshair
+    point is on the optical axis by definition, no lens/FOV data is needed
+    for THIS step -- simple right-triangle trig solves the camera's
+    downward tilt angle directly:
+
+        tan(tilt) = height / distance  =>  tilt = atan(height / distance)
+
+    Pick a calibration distance you can position precisely and that lands
+    somewhere in the middle of the frame, not right at the far/blurry edge
+    -- a close, easy-to-align mark (e.g. 100cm) calibrates the tilt angle
+    more precisely than a far one, since the same pixel-alignment error
+    corresponds to a smaller angular error up close.
+
+    The floor is flat but the camera's projection of it is NOT linear --
+    equal steps of real-world distance get squeezed into shrinking bands
+    of image row as you look toward the horizon (this is why a distant
+    30cm gap looks like a sliver of pixels while the same 30cm right in
+    front of the camera spans a big chunk of the frame). To map that
+    correctly for the OTHER rows of the image (not just the crosshair
+    row), we additionally need the camera's vertical field of view
+    (vfov_deg) to get a pixel focal length:
+
+        f_px = (frame_height_px / 2) / tan(vfov_deg / 2)
+
+    Then for any real-world floor distance d, the row it projects to is:
+
+        phi(d) = atan(height / d)              -- look-down angle to d
+        y = frame_height_px/2 + f_px * tan(phi(d) - tilt)
+
+    This is exactly what draws the perspective guide lines -- like a car's
+    backup camera overlay -- showing where fixed real-world distances
+    actually fall in the live image, which shrink together near the
+    horizon just like the real floor does.
+    """
+
+    DEFAULT_VFOV_DEG = 45.0  # typical-ish USB webcam vertical FOV; tune via the GUI for your camera
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.height_cm = None
+        self.tilt_deg = None
+        self.vfov_deg = self.DEFAULT_VFOV_DEG
+
+    def calibrate(self, height_cm, known_distance_cm, vfov_deg=None):
+        if height_cm <= 0 or known_distance_cm <= 0:
+            return False
+        if vfov_deg is not None and vfov_deg <= 0:
+            return False
+        tilt_deg = math.degrees(math.atan(height_cm / known_distance_cm))
+        with self._lock:
+            self.height_cm = height_cm
+            self.tilt_deg = tilt_deg
+            if vfov_deg is not None:
+                self.vfov_deg = vfov_deg
+        return True
+
+    @staticmethod
+    def _row_for_distance(height_cm, tilt_deg, vfov_deg, distance_cm, frame_height_px):
+        """Pixel row (0 = top) that real-world floor distance distance_cm
+        projects to, or None if it falls outside the visible frame (too
+        close/behind the camera, or beyond the horizon)."""
+        if distance_cm <= 0:
+            return None
+        phi = math.atan(height_cm / distance_cm)
+        theta = math.radians(tilt_deg)
+        angle_offset = phi - theta
+        if abs(angle_offset) >= math.radians(89.0):
+            return None  # numerically unstable this close to the horizon/behind-camera limit
+        f_px = (frame_height_px / 2.0) / math.tan(math.radians(vfov_deg) / 2.0)
+        y = frame_height_px / 2.0 + f_px * math.tan(angle_offset)
+        if y < 0.0 or y > frame_height_px:
+            return None
+        return y
+
+    def get_snapshot(self, frame_height_px):
+        with self._lock:
+            height_cm = self.height_cm
+            tilt_deg = self.tilt_deg
+            vfov_deg = self.vfov_deg
+
+        crosshair_distance_cm = None
+        guide_lines = []
+        if height_cm is not None and tilt_deg is not None and tilt_deg > 0:
+            crosshair_distance_cm = height_cm / math.tan(math.radians(tilt_deg))
+            for d in GUIDE_DISTANCES_CM:
+                y = self._row_for_distance(height_cm, tilt_deg, vfov_deg, d, frame_height_px)
+                if y is not None:
+                    guide_lines.append({'distance_cm': d, 'y_frac': y / frame_height_px})
+
+        return {
+            'calibrated': tilt_deg is not None,
+            'height_cm': height_cm,
+            'tilt_deg': tilt_deg,
+            'vfov_deg': vfov_deg,
+            'crosshair_distance_cm': crosshair_distance_cm,
+            'guide_lines': guide_lines,
+        }
 
 
 class PID:
@@ -784,8 +898,23 @@ HTML_PAGE = """<!doctype html>
   .layout { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
   .left { display: flex; flex-direction: column; gap: 12px; min-width: 260px; }
   .camera { display: flex; flex-direction: column; gap: 6px; min-width: 320px; max-width: 480px; }
+  .camera-wrap { position: relative; }
   .camera img { width: 100%; background: #111; border: 1px solid #444; border-radius: 4px; display: block; }
   .camera .k { font-size: 11px; color: #999; text-transform: uppercase; }
+  /* Small "+" fixed at the optical-axis center -- what you physically aim
+     at a known-distance floor mark to calibrate. */
+  .crosshair { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+  .crosshair::before, .crosshair::after { content: ''; position: absolute; top: 50%; left: 50%; background: #fff; box-shadow: 0 0 2px #000; }
+  .crosshair::before { width: 18px; height: 2px; transform: translate(-50%, -50%); }
+  .crosshair::after { width: 2px; height: 18px; transform: translate(-50%, -50%); }
+  /* Dashed "straight ahead" reference line, like a backup camera's path guide. */
+  .center-line { position: absolute; top: 0; left: 50%; width: 0; height: 100%;
+                 border-left: 2px dashed rgba(255,255,255,0.35); pointer-events: none; }
+  /* Perspective distance guide lines, positioned/colored dynamically by JS. */
+  .guide-lines { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+  .guide-line { position: absolute; left: 0; width: 100%; height: 2px; box-shadow: 0 0 3px #000; }
+  .guide-line-label { position: absolute; right: 4px; font-size: 11px; font-family: monospace;
+                       text-shadow: 0 0 3px #000, 0 0 3px #000; transform: translateY(-100%); }
   .right { flex: 1; }
   #canvas { background: #111; border: 1px solid #444; display: block; max-width: 100%; height: auto; cursor: crosshair; }
   form { background: #262626; border: 1px solid #444; padding: 10px; border-radius: 6px; }
@@ -835,8 +964,20 @@ HTML_PAGE = """<!doctype html>
   </div>
   <div class="camera">
     <div class="k">Camera</div>
-    <img id="cameraFeed" src="/video_feed" alt="camera feed"
-         onerror="this.replaceWith(Object.assign(document.createElement('div'), {textContent: 'Camera unavailable', style: 'color:#999; padding:12px; border:1px solid #444; border-radius:4px;'}))">
+    <div class="camera-wrap">
+      <img id="cameraFeed" src="/video_feed" alt="camera feed"
+           onerror="this.replaceWith(Object.assign(document.createElement('div'), {textContent: 'Camera unavailable', style: 'color:#999; padding:12px; border:1px solid #444; border-radius:4px;'}))">
+      <div class="center-line"></div>
+      <div class="guide-lines" id="guideLines"></div>
+      <div class="crosshair"></div>
+    </div>
+    <form id="camCalibForm">
+      <div class="row"><label>Camera Height Above Floor (cm)</label><input id="camHeight" type="number" value="26" step="0.5"></div>
+      <div class="row"><label>Known Distance at Crosshair (cm)</label><input id="camDist" type="number" value="100" step="1"></div>
+      <div class="row"><label>Vertical FOV (deg, tune for accuracy)</label><input id="camVfov" type="number" value="45" step="1"></div>
+      <button type="submit">Calibrate (crosshair on floor mark)</button>
+    </form>
+    <div class="stat-box wide"><div class="k">Tilt / Crosshair Distance</div><div class="v" id="s-cam">not calibrated</div></div>
   </div>
   <div class="right">
     <canvas id="canvas" width="__CANVAS_PX__" height="__CANVAS_PX__"></canvas>
@@ -1073,8 +1214,67 @@ canvas.addEventListener('click', async (ev) => {
   });
 });
 
+document.getElementById('camCalibForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const height = parseFloat(document.getElementById('camHeight').value);
+  const dist = parseFloat(document.getElementById('camDist').value);
+  const vfov = parseFloat(document.getElementById('camVfov').value);
+  await fetch('/api/camera_calibrate', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({height_cm: height, distance_cm: dist, vfov_deg: vfov})
+  });
+});
+
+function guideLineColor(distanceCm) {
+  if (distanceCm <= 100) return '#ff4d4d';   // near -- red
+  if (distanceCm <= 200) return '#ffd24d';   // mid -- yellow
+  return '#4dff88';                          // far -- green
+}
+
+function renderGuideLines(cs) {
+  const container = document.getElementById('guideLines');
+  container.innerHTML = '';
+  if (!cs.calibrated) return;
+  for (const g of cs.guide_lines) {
+    const color = guideLineColor(g.distance_cm);
+    const topPct = `${(g.y_frac * 100).toFixed(2)}%`;
+
+    const line = document.createElement('div');
+    line.className = 'guide-line';
+    line.style.top = topPct;
+    line.style.background = color;
+    container.appendChild(line);
+
+    const label = document.createElement('div');
+    label.className = 'guide-line-label';
+    label.style.top = topPct;
+    label.style.color = color;
+    label.textContent = `${g.distance_cm}cm`;
+    container.appendChild(label);
+  }
+}
+
+async function pollCamera() {
+  try {
+    const res = await fetch('/api/camera_state');
+    const cs = await res.json();
+    if (cs.calibrated) {
+      set('s-cam', `${cs.tilt_deg.toFixed(1)}° tilt, ${cs.vfov_deg.toFixed(0)}° vfov -- `
+            + `${(cs.crosshair_distance_cm / 100).toFixed(2)} m at crosshair`);
+    } else {
+      set('s-cam', 'not calibrated');
+    }
+    renderGuideLines(cs);
+  } catch (e) {
+    set('s-cam', 'connection lost');
+  }
+}
+
 setInterval(poll, __POLL_MS__);
+setInterval(pollCamera, __POLL_MS__);
 poll();
+pollCamera();
 </script>
 </body>
 </html>
@@ -1096,7 +1296,8 @@ def render_page():
             .replace('__ROTATE_SPEED__', f'{ROTATE_SPEED:.2f}'))
 
 
-def create_app(node: GridNavNode, camera: 'CameraStreamer | None') -> Flask:
+def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
+               rangefinder: CameraRangefinder) -> Flask:
     app = Flask(__name__)
     # Werkzeug's request logging is noisy at GUI_HZ polling rates (and would
     # be far worse for the continuous /video_feed stream).
@@ -1122,6 +1323,27 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None') -> Flask:
                 time.sleep(interval)
 
         return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+    @app.route('/api/camera_calibrate', methods=['POST'])
+    def api_camera_calibrate():
+        data = request.get_json(force=True)
+        try:
+            height_cm = float(data['height_cm'])
+            distance_cm = float(data['distance_cm'])
+        except (KeyError, TypeError, ValueError):
+            return jsonify({'ok': False, 'error': 'invalid height/distance'}), 400
+        vfov_deg = data.get('vfov_deg', None)
+        try:
+            vfov_deg = float(vfov_deg) if vfov_deg not in (None, '') else None
+        except (TypeError, ValueError):
+            vfov_deg = None
+        if not rangefinder.calibrate(height_cm, distance_cm, vfov_deg):
+            return jsonify({'ok': False, 'error': 'height/distance/vfov must be positive'}), 400
+        return jsonify({'ok': True})
+
+    @app.route('/api/camera_state')
+    def api_camera_state():
+        return jsonify(rangefinder.get_snapshot(CAMERA_HEIGHT))
 
     @app.route('/api/state')
     def api_state():
@@ -1205,7 +1427,9 @@ def main(args=None):
         )
         camera = None
 
-    app = create_app(node, camera)
+    rangefinder = CameraRangefinder()
+
+    app = create_app(node, camera, rangefinder)
     node.get_logger().info(f'Web GUI at http://<this-device-ip>:{WEB_PORT}')
     try:
         app.run(host='0.0.0.0', port=WEB_PORT, threaded=True, use_reloader=False)
