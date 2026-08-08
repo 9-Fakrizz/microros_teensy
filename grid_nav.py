@@ -31,7 +31,11 @@ GUI:
   send a new goal (in cm) at any time, including while the robot is
   mid-move. A status readout shows raw IMU yaw and the current target
   heading in degrees, for debugging the IMU. A live MJPEG feed from a
-  USB webcam (see CAMERA_DEVICE_INDEX) is also shown, if available.
+  USB webcam (see CAMERA_DEVICE_INDEX) is also shown, if available, with
+  a backup-camera-style distance HUD (see CameraRangefinder) and live
+  obstacle detection boxes (see ObstacleDetector) drawn over it -- people
+  and blocky/angular objects are flagged as obstacles, round objects
+  (tennis balls -- what this robot collects, not avoids) are ignored.
 
   Open it from any browser on the same network:
       http://<pi5-ip-address>:8080
@@ -176,6 +180,16 @@ CAMERA_JPEG_QUALITY = 80        # 0-100, higher = better quality/more bandwidth
 # frame, far = near the horizon line) -- lines outside the visible frame
 # for the current calibration are simply skipped.
 GUIDE_DISTANCES_CM = [50, 100, 150, 200, 250, 300]
+
+# Lightweight obstacle detector (ObstacleDetector) -- no trained model file
+# to download: people via OpenCV's built-in HOG pedestrian detector, and
+# everything else via edge/contour shape analysis. This robot collects
+# tennis balls with its mechanism, so ROUND contours (circularity above
+# the threshold below) are deliberately NOT treated as obstacles -- only
+# blocky/angular shapes (boxes, furniture, walls) and people are.
+DETECTION_FPS = 5.0                     # detection is much heavier than streaming; runs at its own slower rate
+DETECTION_MIN_CONTOUR_AREA = 1500       # px^2 at CAMERA_WIDTH x CAMERA_HEIGHT -- filters out small noise contours
+DETECTION_CIRCULARITY_THRESHOLD = 0.78  # 4*pi*area/perimeter^2; 1.0 = perfect circle. Above this = "round enough to be a ball", skipped
 # -------------------------------------------------
 
 
@@ -311,6 +325,7 @@ class CameraStreamer:
         self._cap = None
         self._lock = threading.Lock()
         self._latest_jpeg = None
+        self._latest_frame = None   # raw BGR ndarray, for ObstacleDetector -- avoids a JPEG decode round-trip
         self._running = False
         self._thread = None
 
@@ -339,12 +354,17 @@ class CameraStreamer:
                 if ok2:
                     with self._lock:
                         self._latest_jpeg = buf.tobytes()
+                        self._latest_frame = frame
             elapsed = time.monotonic() - start
             time.sleep(max(0.0, interval - elapsed))
 
     def get_jpeg(self):
         with self._lock:
             return self._latest_jpeg
+
+    def get_frame(self):
+        with self._lock:
+            return self._latest_frame
 
     def stop(self):
         self._running = False
@@ -436,6 +456,31 @@ class CameraRangefinder:
             return None
         return y
 
+    @staticmethod
+    def _distance_for_row(height_cm, tilt_deg, vfov_deg, y_px, frame_height_px):
+        """Inverse of _row_for_distance: real-world floor distance for a
+        given pixel row, or None if that row looks above the horizon (never
+        hits the floor) or calibration is missing."""
+        theta = math.radians(tilt_deg)
+        f_px = (frame_height_px / 2.0) / math.tan(math.radians(vfov_deg) / 2.0)
+        angle_offset = math.atan((y_px - frame_height_px / 2.0) / f_px)
+        phi = theta + angle_offset
+        if phi <= 0.0 or phi >= math.radians(89.5):
+            return None
+        return height_cm / math.tan(phi)
+
+    def distance_for_row(self, y_px, frame_height_px):
+        """Public entry point used by ObstacleDetector to estimate distance
+        to a detected box from the pixel row of its floor-contact point
+        (bottom edge of the bounding box)."""
+        with self._lock:
+            height_cm = self.height_cm
+            tilt_deg = self.tilt_deg
+            vfov_deg = self.vfov_deg
+        if height_cm is None or tilt_deg is None:
+            return None
+        return self._distance_for_row(height_cm, tilt_deg, vfov_deg, y_px, frame_height_px)
+
     def get_snapshot(self, frame_height_px):
         with self._lock:
             height_cm = self.height_cm
@@ -459,6 +504,103 @@ class CameraRangefinder:
             'crosshair_distance_cm': crosshair_distance_cm,
             'guide_lines': guide_lines,
         }
+
+
+class ObstacleDetector:
+    """Lightweight obstacle detection with NO trained model file to manage:
+      - People: OpenCV's built-in HOG + default people-detector SVM (ships
+        with OpenCV itself, no download needed). Meant to catch a person's
+        legs/lower body in frame given the camera's low, floor-level mount.
+      - Everything else: classic edge/contour shape analysis. A blocky or
+        angular contour (box, furniture leg, wall edge) is treated as an
+        obstacle; a round contour is assumed to be a tennis ball -- the
+        thing this robot is built to COLLECT, not avoid -- and is skipped.
+    Runs in its own background thread at DETECTION_FPS (much slower than
+    the video stream itself; detection is the expensive part), reading the
+    latest raw frame from a CameraStreamer and estimating each detected
+    box's distance via CameraRangefinder, using the box's bottom edge as
+    its floor-contact point (standard monocular ground-plane range trick --
+    assumes the object rests on the floor, so it breaks down for things
+    like an overhanging table edge or a ball currently in the air).
+    """
+
+    def __init__(self, camera: 'CameraStreamer', rangefinder: CameraRangefinder,
+                 fps=DETECTION_FPS,
+                 min_contour_area=DETECTION_MIN_CONTOUR_AREA,
+                 circularity_threshold=DETECTION_CIRCULARITY_THRESHOLD):
+        self.camera = camera
+        self.rangefinder = rangefinder
+        self.fps = fps
+        self.min_contour_area = min_contour_area
+        self.circularity_threshold = circularity_threshold
+
+        self._hog = cv2.HOGDescriptor()
+        self._hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+
+        self._lock = threading.Lock()
+        self._detections = []
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _loop(self):
+        interval = 1.0 / self.fps
+        while self._running:
+            start = time.monotonic()
+            frame = self.camera.get_frame()
+            if frame is not None:
+                detections = self._detect(frame)
+                with self._lock:
+                    self._detections = detections
+            elapsed = time.monotonic() - start
+            time.sleep(max(0.0, interval - elapsed))
+
+    def _detect(self, frame):
+        frame_height_px = frame.shape[0]
+        detections = []
+
+        people_boxes, _weights = self._hog.detectMultiScale(
+            frame, winStride=(8, 8), padding=(8, 8), scale=1.05
+        )
+        for (x, y, w, h) in people_boxes:
+            detections.append(self._make_detection('person', x, y, w, h, frame_height_px))
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.dilate(cv2.Canny(blurred, 50, 150), None, iterations=1)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < self.min_contour_area:
+                continue
+            perimeter = cv2.arcLength(c, True)
+            if perimeter <= 0:
+                continue
+            circularity = 4.0 * math.pi * area / (perimeter * perimeter)
+            if circularity > self.circularity_threshold:
+                continue  # round -- likely a tennis ball, a target not an obstacle
+            x, y, w, h = cv2.boundingRect(c)
+            detections.append(self._make_detection('object', x, y, w, h, frame_height_px))
+
+        return detections
+
+    def _make_detection(self, label, x, y, w, h, frame_height_px):
+        distance_cm = self.rangefinder.distance_for_row(y + h, frame_height_px)
+        return {'label': label, 'x': int(x), 'y': int(y), 'w': int(w), 'h': int(h),
+                'distance_cm': distance_cm}
+
+    def get_detections(self):
+        with self._lock:
+            return list(self._detections)
 
 
 class PID:
@@ -915,6 +1057,12 @@ HTML_PAGE = """<!doctype html>
   .guide-line { position: absolute; left: 0; width: 100%; height: 2px; box-shadow: 0 0 3px #000; }
   .guide-line-label { position: absolute; right: 4px; font-size: 11px; font-family: monospace;
                        text-shadow: 0 0 3px #000, 0 0 3px #000; transform: translateY(-100%); }
+  /* Detected obstacle boxes, positioned/sized dynamically by JS as % of frame. */
+  .detection-boxes { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+  .detection-box { position: absolute; border: 2px solid; box-sizing: border-box; }
+  .detection-box-label { position: absolute; top: 0; left: 0; transform: translateY(-100%);
+                          font-size: 11px; font-family: monospace; white-space: nowrap;
+                          text-shadow: 0 0 3px #000, 0 0 3px #000; }
   .right { flex: 1; }
   #canvas { background: #111; border: 1px solid #444; display: block; max-width: 100%; height: auto; cursor: crosshair; }
   form { background: #262626; border: 1px solid #444; padding: 10px; border-radius: 6px; }
@@ -969,6 +1117,7 @@ HTML_PAGE = """<!doctype html>
            onerror="this.replaceWith(Object.assign(document.createElement('div'), {textContent: 'Camera unavailable', style: 'color:#999; padding:12px; border:1px solid #444; border-radius:4px;'}))">
       <div class="center-line"></div>
       <div class="guide-lines" id="guideLines"></div>
+      <div class="detection-boxes" id="detectionBoxes"></div>
       <div class="crosshair"></div>
     </div>
     <form id="camCalibForm">
@@ -1271,10 +1420,47 @@ async function pollCamera() {
   }
 }
 
+function detectionColor(label) {
+  return label === 'person' ? '#4da3ff' : '#ffa500';
+}
+
+async function pollDetections() {
+  try {
+    const res = await fetch('/api/detections');
+    const ds = await res.json();
+    const container = document.getElementById('detectionBoxes');
+    container.innerHTML = '';
+    for (const det of ds.detections) {
+      const color = detectionColor(det.label);
+      const box = document.createElement('div');
+      box.className = 'detection-box';
+      box.style.left = `${(det.x / ds.frame_width * 100).toFixed(2)}%`;
+      box.style.top = `${(det.y / ds.frame_height * 100).toFixed(2)}%`;
+      box.style.width = `${(det.w / ds.frame_width * 100).toFixed(2)}%`;
+      box.style.height = `${(det.h / ds.frame_height * 100).toFixed(2)}%`;
+      box.style.borderColor = color;
+
+      const label = document.createElement('div');
+      label.className = 'detection-box-label';
+      label.style.color = color;
+      const distText = (det.distance_cm === null || det.distance_cm === undefined)
+            ? '?m' : `${(det.distance_cm / 100).toFixed(2)}m`;
+      label.textContent = `${det.label} ~${distText}`;
+      box.appendChild(label);
+
+      container.appendChild(box);
+    }
+  } catch (e) {
+    // detection endpoint unavailable -- leave last-drawn boxes as-is
+  }
+}
+
 setInterval(poll, __POLL_MS__);
 setInterval(pollCamera, __POLL_MS__);
+setInterval(pollDetections, __POLL_MS__);
 poll();
 pollCamera();
+pollDetections();
 </script>
 </body>
 </html>
@@ -1297,7 +1483,8 @@ def render_page():
 
 
 def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
-               rangefinder: CameraRangefinder) -> Flask:
+               rangefinder: CameraRangefinder,
+               detector: 'ObstacleDetector | None') -> Flask:
     app = Flask(__name__)
     # Werkzeug's request logging is noisy at GUI_HZ polling rates (and would
     # be far worse for the continuous /video_feed stream).
@@ -1344,6 +1531,14 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
     @app.route('/api/camera_state')
     def api_camera_state():
         return jsonify(rangefinder.get_snapshot(CAMERA_HEIGHT))
+
+    @app.route('/api/detections')
+    def api_detections():
+        return jsonify({
+            'frame_width': CAMERA_WIDTH,
+            'frame_height': CAMERA_HEIGHT,
+            'detections': detector.get_detections() if detector is not None else [],
+        })
 
     @app.route('/api/state')
     def api_state():
@@ -1429,13 +1624,21 @@ def main(args=None):
 
     rangefinder = CameraRangefinder()
 
-    app = create_app(node, camera, rangefinder)
+    detector = None
+    if camera is not None:
+        detector = ObstacleDetector(camera, rangefinder)
+        detector.start()
+        node.get_logger().info(f'Obstacle detector running at {DETECTION_FPS} Hz')
+
+    app = create_app(node, camera, rangefinder, detector)
     node.get_logger().info(f'Web GUI at http://<this-device-ip>:{WEB_PORT}')
     try:
         app.run(host='0.0.0.0', port=WEB_PORT, threaded=True, use_reloader=False)
     except KeyboardInterrupt:
         pass
     finally:
+        if detector is not None:
+            detector.stop()
         if camera is not None:
             camera.stop()
         node.stop_robot()
