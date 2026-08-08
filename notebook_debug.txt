@@ -374,3 +374,224 @@ NOT YET DONE / CAVEATS
 - This whole feature assumes a perfectly flat, level floor and a
   rigidly fixed camera mount (no vibration/drift changing the tilt
   over time).
+
+=====================================================
+SECTION: Obstacle detection + avoidance (grid_nav.py)
+=====================================================
+
+-----------------------------------------------------
+[2026-08-09] Feature: ObstacleDetector (no model file) + ObstacleWatcher
+(glitch-protected confirm) + robot-footprint-aware A*
+-----------------------------------------------------
+
+DETECTION -- ObstacleDetector class
+- No trained model, no HOG (tried HOG for people detection first --
+  too expensive for the Pi, dropped). Just OpenCV segmentation/contour
+  analysis: Canny edges -> contours -> filters.
+- Cheap by construction: only the DETECTION_MIN_DISTANCE_CM (50cm) to
+  DETECTION_MAX_DISTANCE_CM (300cm) band of the frame is even cropped
+  and processed (CameraRangefinder.row_for_distance() picks the crop
+  rows) -- anything closer or farther is invisible to the detector,
+  no wasted CPU on it.
+- Round contours (circularity > DETECTION_CIRCULARITY_THRESHOLD, default
+  0.78) are skipped even if big -- assumed to be a tennis ball, which
+  this robot collects, not avoids. Also filters tiny contours
+  (DETECTION_MIN_CONTOUR_AREA) and narrow ones
+  (DETECTION_MIN_WIDTH_FRACTION of frame width, default 50%). All three
+  thresholds are live-adjustable from the GUI (closest thing to a
+  "confidence" knob this non-ML approach has).
+- Each detection carries distance_cm (from the box's bottom/near edge,
+  via CameraRangefinder.distance_for_row()) and THREE bearings --
+  left/center/right edge, via the new bearing_deg_for_column() (reuses
+  the same pixel focal length as the vertical HUD math, square-pixel
+  assumption, so no separate horizontal-FOV calibration needed).
+
+GLITCH PROTECTION -- ObstacleWatcher class
+- A single detection tick could be a glitch (motion blur, lighting,
+  a stray edge) -- nothing gets pinned into the A* obstacle map off
+  one frame. Instead: first tick that sees anything NEW (not already
+  pinned) while the robot is driving -> HOLD (stop, freeze the current
+  leg) for hold_duration_s (default 5s), counting hits each tick.
+  If hit_count reaches confirm_count (default 5) by the time the hold
+  ends, it's real -- pin it and replan; otherwise treat as a glitch,
+  release the hold, the leg just resumes where it left off.
+- BUG FOUND AND FIXED: confirmation originally only used the LAST
+  tick's detections to decide what to pin. If that one final tick
+  (right as the hold window ends) happened to miss the obstacle
+  (flicker), NOTHING got pinned even though hit_count had already
+  reached confirm_count earlier in the window -- this is what looked
+  like "appears then disappears, never sticks" to the user. Fixed by
+  accumulating the UNION of detected cells across the whole hold
+  window (_accumulated_cells) and pinning from that instead of a
+  single tick's snapshot.
+- Also added: don't re-trigger a new hold for an obstacle whose cells
+  are ALREADY pinned (checked via GridNavNode.is_cell_pinned() /
+  detection_cells()) -- without this, an already-confirmed obstacle
+  kept re-triggering fresh 5-second stops every time it re-entered the
+  camera's view while executing nearby legs of the replanned route.
+- enabled flag (GUI toggle "Obstacle Avoidance Enabled") -- master
+  on/off; detection/streaming keep running for display when disabled,
+  but no new holds start, and disabling mid-hold immediately releases
+  the robot instead of leaving it stuck.
+
+OBSTACLE BOX SIZE + SHAPE -- not centered on the measurement point
+- Originally pinned a single 50cm cell per detection (just the
+  point straight ahead of the box's center) -- too small/imprecise
+  per user feedback, wanted a bigger box.
+- distance_cm is the obstacle's NEAREST surface (bottom edge of the
+  detection box), not its center -- so blocking a box CENTERED on
+  that point would incorrectly treat clear floor between the robot
+  and the obstacle's actual near edge as blocked. Fixed by projecting
+  both the near distance AND a far distance (near + OBSTACLE_BOX_DEPTH_CM,
+  100cm) for the left/center/right bearings, then blocking the full
+  cell-range bounding box spanning all of those points -- the box's
+  near edge sits exactly at the measured surface and extends 100cm
+  further away, not centered on it. Same logic (GridNavNode.
+  detection_cells()) is now shared by pinning, the mid-hold "candidate"
+  GUI overlay, AND the live/unconfirmed GUI overlay (the live JS
+  rendering was originally NOT updated to match and kept showing old
+  single-point boxes -- had to fix that separately).
+- GUI color coding on the grid canvas: solid red = confirmed/pinned
+  (permanent, in the A* map), yellow = candidate cells accumulated
+  during an in-progress hold (stable for the whole hold, doesn't
+  flicker), translucent orange = raw live per-frame detections
+  (expected to flicker -- it's the unconfirmed signal).
+
+ROBOT FOOTPRINT -- modeled as a box, not a point, for A*
+- Robot is ROBOT_SIZE_CM x ROBOT_SIZE_CM (60x60cm). Position (x, y) is
+  tracked at the FRONT-LEFT wheel, which is one CORNER of that box,
+  not its center.
+- Because a corner-referenced footprint's orientation relative to
+  world axes rotates with heading, and A* here plans over a static
+  cell graph with no per-step heading awareness, obstacles are
+  inflated by the WORST-CASE distance from that corner to the box's
+  farthest (diagonally opposite) corner before every A* search --
+  i.e. the full diagonal (60 * sqrt(2) ~= 85cm), NOT half the side
+  length. Inflating by only half would under-protect the far side of
+  the robot precisely because the reference point isn't centered.
+  Rounds up to ROBOT_INFLATION_CELLS = 2 cells (at 50cm grid spacing).
+- inflate_obstacles() does a circular stamp expansion of the raw
+  obstacle set, used ONLY for the A* search itself (set_goal()) --
+  the real self.obstacles set used for GUI display/manual toggling is
+  never modified, inflation is computed fresh each time.
+- GUI: the robot's actual 60x60cm footprint is now drawn on the grid
+  canvas too (translucent blue box, rotated with current heading) --
+  previously only the small heading arrow was shown, no box.
+
+NOT YET VERIFIED LIVE
+- Whether ROBOT_INFLATION_CELLS (2 cells / ~85cm worst-case radius) is
+  overly conservative for the actual space -- if A* starts rejecting
+  gaps the robot can physically fit through, that's the value to look
+  at relaxing.
+- Whether the robot footprint box's rotation direction (local +y =
+  left) matches reality, same kind of sign convention that needed
+  empirical correction before (PIVOT_ANGULAR_SIGN, Y_AXIS_SIGN) --
+  hasn't been visually confirmed against the physical robot yet.
+
+=====================================================
+SECTION: SUMMARY -- all issues so far and current state
+=====================================================
+Quick-reference index of every issue hit across this project and where
+each one currently stands, newest work at the bottom. See the dated
+entries above for full root-cause writeups -- this is just the map.
+
+FIRMWARE (src/main.cpp)
+- rmw_uros_sync_session() called before rclc_support_init() -> Teensy
+  stuck in error_loop(1), looked like "agent can't see the Teensy".
+  FIXED: moved the call to right after rclc_support_init().
+- Encoder count drifting on its own at idle (electrical noise read as
+  real pulses). FIXED: added a "stationary gate" -- pulses only count
+  while motion is actually commanded.
+- That fix then blocked counting during REAL slow driving too (motion
+  deadband 0.02 was bigger than real teleop command magnitudes).
+  FIXED: lowered MOTION_DEADBAND to 0.005.
+- Two wheel encoders didn't agree with each other reliably. DECIDED:
+  run on one "primary" encoder only (currently right wheel), left
+  wheel's attachInterrupt() left commented out for future testing.
+- No way to zero encoder counters without a USB unplug/replug (which
+  drops the whole micro-ROS session). FIXED: added /reset_encoder
+  (std_msgs/Empty) topic.
+- IMU init failure (myIMU.begin() failing) was blocking the ENTIRE
+  ROS node from ever standing up, which looked like a connection
+  problem but was actually error_loop(2) before any topics existed.
+  FIXED by the user via a hardware fix (not code).
+- PULSES_PER_CM required many rounds of real-world recalibration as
+  it drifted: 183.5 -> 118.4 -> 131.6 -> 122.3 -> 110 -> 105.8 -> 107.5
+  -> current locked value 112 (see heading_hold.py/grid_nav.py).
+  CURRENT STATE: 112 is only valid at FORWARD_SPEED=0.20 /
+  ROTATE_SPEED=0.20 -- confirmed by testing that raising speed to 0.25
+  broke distance tracking so badly the robot appeared to never stop.
+  NOT YET FIXED: leading theory is the encoder ISR's noise-rejection
+  filters (LEFT/RIGHT_MIN_PULSE_WIDTH_US=60, ENCODER_DEBOUNCE_US=200)
+  start clipping real pulses at higher wheel speed, undercounting
+  distance. Real fix (not applied) would be switching to Teensy's
+  hardware quadrature decoder instead of interrupt+debounce heuristics.
+  WORKAROUND FOR NOW: stay at 0.20/0.20 for any distance-critical run.
+
+heading_hold.py
+- Updated for the Int32MultiArray wheel_encoder format and given its
+  own directly-calibrated PULSES_PER_CM (110.0) -- NOT updated to
+  match grid_nav.py's 112, only independently validated at a
+  different test distance. Still an open item if you want the two
+  scripts to agree exactly.
+
+grid_nav.py -- built up from nothing to its current feature set:
+- Core nav: PID rotate+drive, pivot-about-left-wheel turning, X/Y/
+  diagonal movement via A*, all through several physical-wiring sign
+  flips found by hands-on testing (PIVOT_ANGULAR_SIGN=-1,
+  Y_AXIS_SIGN=1, DRIVE_CORRECTION_SIGN=-1) -- these are NOT guessable
+  from firmware code, only from watching which physical wheel moves.
+- PID derivative-kick bug (huge angular burst at the start of each
+  leg) -- FIXED by seeding PID.reset() with the real current error
+  instead of 0.
+- Stale tracked (x, y) surviving across multiple GUI goal submissions
+  looked like a calibration bug but wasn't -- FIXED with an explicit
+  reset_position() GUI button; real calibration error was still there
+  underneath and needed its own separate fix (the PULSES_PER_CM saga
+  above).
+- Diagonal movement + obstacle map added via A* (octile heuristic --
+  plain Manhattan is NOT admissible once diagonal moves are allowed,
+  would break A*'s shortest-path guarantee).
+- Camera: USB webcam MJPEG stream, backup-camera-style distance HUD
+  (CameraRangefinder, single-point calibration + guessed vfov_deg),
+  locked default calibration (height=26cm, tilt=14.6deg) so it works
+  out of the box without re-calibrating every run.
+- Obstacle detection: dropped an early HOG-based person detector (too
+  expensive) in favor of plain contour/shape analysis, cropped to a
+  distance band (now 50-300cm) for both cost and relevance, filtered
+  by size/roundness so tennis balls (the thing this robot collects)
+  don't get flagged as obstacles.
+- Glitch-protected confirmation (ObstacleWatcher): stop-and-recheck
+  before trusting a detection. Found and fixed a real bug here where
+  confirmation only looked at the LAST tick's detections, so a single
+  missed frame right at the end of the hold window could silently
+  discard an otherwise-confirmed obstacle ("appears then disappears").
+  FIXED by accumulating cells across the whole hold window instead.
+- Obstacle box shape: originally a single 50cm point-cell centered on
+  the measurement -- WRONG, since distance_cm is the obstacle's NEAR
+  edge, not its center. FIXED: box now starts at the measured near
+  surface and extends 100cm further away (OBSTACLE_BOX_DEPTH_CM).
+- Robot modeled as a 60x60cm box (not a point) for A*, referenced at
+  its front-left wheel (a CORNER, not center) -- obstacles are
+  inflated by the box's full diagonal (~85cm worst case), not half
+  the side length, before every A* search, since a corner reference
+  point's clearance needs are NOT symmetric like a centered one would
+  be. Drawn on the GUI map now too (previously only a heading arrow).
+- A ForwardRef NameError bug (ObstacleWatcher referenced GridNavNode
+  as a bare type hint before that class existed later in the file) --
+  FIXED by quoting it as a string forward reference.
+
+OPEN ITEMS / NOT YET DONE
+- Speed-dependent PULSES_PER_CM undercounting (see FIRMWARE section
+  above) -- root cause theorized, not fixed; only a workaround
+  (stay at 0.20/0.20) exists.
+- heading_hold.py and grid_nav.py use different PULSES_PER_CM values
+  (110 vs 112), never reconciled.
+- CameraRangefinder's vfov_deg is a guessed default (60deg), not
+  measured -- affects accuracy of anything beyond the single
+  calibrated crosshair point.
+- ROBOT_INFLATION_CELLS conservativeness and the robot footprint box's
+  rotation direction are both unverified against the real robot (see
+  previous section).
+- Two wheel encoders still don't agree -- only one is active; the
+  other's wiring/interrupt is left disabled, not actually fixed.

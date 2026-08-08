@@ -2,7 +2,10 @@
 Grid navigation with live GUI -- runs on the Pi5 as a ROS2 node.
 
 Robot model this script assumes:
-  - Position (x, y) is tracked at the LEFT wheel's contact point.
+  - Position (x, y) is tracked at the FRONT-LEFT wheel's contact point --
+    which is also treated as one CORNER (not the center) of the robot's
+    square ROBOT_SIZE_CM x ROBOT_SIZE_CM footprint for A* clearance
+    purposes (see ROBOT_FOOTPRINT_RADIUS_CM / inflate_obstacles()).
   - Straight-line distance is measured from the LEFT wheel encoder
     (wheel_encoder data[0] -- see IMPORTANT note below).
   - Turning is done by a PIVOT about the left wheel: left wheel stays
@@ -11,11 +14,14 @@ Robot model this script assumes:
   - Movement is planned on a grid of GRID_SPACING_CM cells using A*
     (8-directional: N/S/E/W plus the 4 diagonals), so the robot CAN
     drive diagonally and will route around any cells marked as
-    obstacles in the GUI. The planned path is compressed into a
-    sequence of straight-line legs (each a single rotate + drive),
-    one per run of consecutive same-direction grid steps -- not one
-    tiny hop per cell. If no path exists (goal fully blocked), the
-    goal is rejected and logged.
+    obstacles in the GUI. Obstacles are inflated by the robot's
+    footprint radius before each A* search (see set_goal()), so the
+    plan already accounts for the real 60x60cm body clearing everything,
+    not just the single tracked reference point. The planned path is
+    compressed into a sequence of straight-line legs (each a single
+    rotate + drive), one per run of consecutive same-direction grid
+    steps -- not one tiny hop per cell. If no path exists (goal fully
+    blocked, even before inflation), the goal is rejected and logged.
 
 IMPORTANT -- firmware encoder wiring:
   wheel_encoder data[0] must be the LEFT wheel's encoder for the
@@ -163,6 +169,31 @@ STEP_SIZE_CM = GRID_SPACING_CM
 # walled off) fails fast instead of scanning an unbounded plane.
 PLANNING_HALF_EXTENT_CELLS = GRID_HALF_EXTENT_CM // GRID_SPACING_CM
 SQRT2 = math.sqrt(2.0)
+
+# Robot footprint, for A* obstacle clearance: (x, y) is tracked at the
+# FRONT-LEFT wheel, which is one CORNER of the robot's square body, not
+# its center. Because that reference corner's position relative to the
+# footprint's other three corners rotates with heading (and A* here plans
+# over a static cell graph without per-cell heading awareness), obstacles
+# are inflated by the worst-case distance from that corner to the
+# footprint's farthest (diagonally opposite) corner -- the full diagonal,
+# NOT half the side length -- so the real box clears every obstacle
+# regardless of which of the 8 discrete headings the robot ends up facing
+# while passing through a given area. Inflation is applied fresh at
+# set_goal() time (see inflate_obstacles()); the raw self.obstacles set
+# used for GUI display/toggling is never itself modified.
+ROBOT_SIZE_CM = 60.0
+ROBOT_FOOTPRINT_RADIUS_CM = ROBOT_SIZE_CM * SQRT2
+ROBOT_INFLATION_CELLS = math.ceil(ROBOT_FOOTPRINT_RADIUS_CM / GRID_SPACING_CM)
+
+# How far (cm) a confirmed obstacle's blocked footprint extends AWAY from
+# the robot, starting at its measured near surface -- NOT centered on the
+# single measured point. distance_cm is the obstacle's nearest edge (from
+# the detection box's bottom edge), so blocking a box centered on that
+# point would incorrectly treat clear floor between the robot and the
+# obstacle as blocked. Instead the box's near edge sits at distance_cm and
+# extends this far past it.
+OBSTACLE_BOX_DEPTH_CM = 2 * GRID_SPACING_CM
 
 # USB webcam streamed to the GUI as MJPEG over /video_feed. Device index
 # matches OpenCV/V4L2 numbering (0 = /dev/video0). If you have more than
@@ -332,6 +363,24 @@ def path_to_legs(cell_path, cell_size_cm):
         legs.append(('move', di / norm, dj / norm, steps * step_cm))
         i = j
     return legs
+
+
+def inflate_obstacles(obstacles, radius_cells):
+    """Expand a set of blocked (i, j) cells outward by radius_cells in a
+    circular stamp. Planning-time-only -- returns a NEW set, never mutates
+    the original -- so A* can treat the robot as a single point while
+    still guaranteeing its real ROBOT_SIZE_CM x ROBOT_SIZE_CM footprint
+    clears every obstacle (see ROBOT_INFLATION_CELLS derivation above)."""
+    if radius_cells <= 0:
+        return set(obstacles)
+    inflated = set()
+    r2 = radius_cells * radius_cells
+    for (bi, bj) in obstacles:
+        for di in range(-radius_cells, radius_cells + 1):
+            for dj in range(-radius_cells, radius_cells + 1):
+                if di * di + dj * dj <= r2:
+                    inflated.add((bi + di, bj + dj))
+    return inflated
 
 
 class CameraStreamer:
@@ -1106,11 +1155,17 @@ class GridNavNode(Node):
             legs = []
             planned_path = []
             if start_cell != goal_cell:
-                cell_path = astar_search(start_cell, goal_cell, self.obstacles)
+                # Inflate obstacles by the robot's footprint radius before
+                # searching -- A* itself still treats the robot as a
+                # single point, but against a map that already accounts
+                # for the real ROBOT_SIZE_CM box's clearance needs.
+                inflated_obstacles = inflate_obstacles(self.obstacles, ROBOT_INFLATION_CELLS)
+                cell_path = astar_search(start_cell, goal_cell, inflated_obstacles)
                 if cell_path is None:
                     self.goal = (gx, gy)
                     self.get_logger().warn(
-                        f'No path to ({gx:.1f}, {gy:.1f}) cm -- blocked by obstacles or out of range.'
+                        f'No path to ({gx:.1f}, {gy:.1f}) cm -- blocked by obstacles (incl. robot '
+                        f'clearance margin) or out of range.'
                     )
                     return
                 legs = path_to_legs(cell_path, GRID_SPACING_CM)
@@ -1336,15 +1391,23 @@ class GridNavNode(Node):
 
     def detection_cells(self, detection):
         """Compute the world grid cells a camera detection's box would
-        cover (left edge to right edge, at its estimated distance) WITHOUT
-        pinning anything -- used both by pin_obstacle_box_from_detection
-        and by ObstacleWatcher to check whether a detection is already
-        fully accounted for in the obstacle map before bothering with a
-        hold. Returns [] if position/heading/distance aren't available."""
-        distance_cm = detection.get('distance_cm')
+        cover WITHOUT pinning anything -- used both by
+        pin_obstacle_box_from_detection and by ObstacleWatcher to check
+        whether a detection is already fully accounted for in the
+        obstacle map before bothering with a hold. Returns [] if
+        position/heading/distance aren't available.
+
+        distance_cm is the obstacle's NEAREST surface (from the detection
+        box's bottom edge) -- not its center. The blocked box therefore
+        starts at that near surface and extends OBSTACLE_BOX_DEPTH_CM
+        further away, rather than being centered on the single measured
+        point (which would incorrectly block clear floor between the
+        robot and the obstacle's actual near edge)."""
+        near_distance_cm = detection.get('distance_cm')
         center_bearing = detection.get('bearing_deg')
-        if distance_cm is None or center_bearing is None:
+        if near_distance_cm is None or center_bearing is None:
             return []
+        far_distance_cm = near_distance_cm + OBSTACLE_BOX_DEPTH_CM
         bearings = [b for b in (detection.get('left_bearing_deg'),
                                  center_bearing,
                                  detection.get('right_bearing_deg')) if b is not None]
@@ -1357,9 +1420,12 @@ class GridNavNode(Node):
             corner_cells = []
             for bearing_deg in bearings:
                 world_bearing_rad = math.radians(heading_deg + bearing_deg)
-                obstacle_x = self.x + distance_cm * math.cos(world_bearing_rad)
-                obstacle_y = self.y + distance_cm * math.sin(world_bearing_rad)
-                corner_cells.append(self._to_cell(obstacle_x, obstacle_y))
+                cos_b = math.cos(world_bearing_rad)
+                sin_b = math.sin(world_bearing_rad)
+                for d in (near_distance_cm, far_distance_cm):
+                    obstacle_x = self.x + d * cos_b
+                    obstacle_y = self.y + d * sin_b
+                    corner_cells.append(self._to_cell(obstacle_x, obstacle_y))
 
         i_vals = [c[0] for c in corner_cells]
         j_vals = [c[1] for c in corner_cells]
@@ -1594,6 +1660,8 @@ HTML_PAGE = """<!doctype html>
 const HALF_EXTENT = __HALF_EXTENT__;
 const SPACING = __SPACING__;
 const CANVAS_PX = __CANVAS_PX__;
+const ROBOT_SIZE = __ROBOT_SIZE__;
+const OBSTACLE_BOX_DEPTH = __OBSTACLE_BOX_DEPTH__;
 const SCALE = CANVAS_PX / (2 * HALF_EXTENT); // px per cm
 
 const canvas = document.getElementById('canvas');
@@ -1718,23 +1786,38 @@ function draw(state) {
   }
 
   // live camera-detected obstacles (this instant's raw detections, not yet
-  // even part of a hold) -- projected from the camera's distance+bearing
-  // onto the world map using the robot's current position/heading, then
-  // snapped to the same SPACING grid cell as everything else so it reads
-  // as a proper 50cm box instead of a single point. Expected to flicker
-  // frame to frame -- it's the raw/unconfirmed signal, not the persisted
-  // obstacle map (see the solid red boxes above for what's actually
-  // pinned).
+  // even part of a hold) -- mirrors the backend's detection_cells() logic
+  // exactly: near edge at the measured distance, extending
+  // OBSTACLE_BOX_DEPTH further away (not centered on the point), spanning
+  // left-edge to right-edge bearing. Expected to flicker frame to frame
+  // -- it's the raw/unconfirmed signal, not the persisted obstacle map
+  // (see the solid red boxes above for what's actually pinned).
   if (state.heading_deg !== null && state.heading_deg !== undefined) {
     for (const det of liveDetections) {
       if (det.distance_cm === null || det.distance_cm === undefined) continue;
       if (det.bearing_deg === null || det.bearing_deg === undefined) continue;
-      const worldBearingRad = (state.heading_deg + det.bearing_deg) * Math.PI / 180;
-      const ox = state.x + det.distance_cm * Math.cos(worldBearingRad);
-      const oy = state.y + det.distance_cm * Math.sin(worldBearingRad);
-      const ci = Math.round(ox / SPACING);
-      const cj = Math.round(oy / SPACING);
-      drawCellBox(ci, cj, 'rgba(255,165,0,0.35)', '#ffa500');
+      const bearings = [det.left_bearing_deg, det.bearing_deg, det.right_bearing_deg]
+            .filter(b => b !== null && b !== undefined);
+      const distances = [det.distance_cm, det.distance_cm + OBSTACLE_BOX_DEPTH];
+      const cellIs = [], cellJs = [];
+      for (const bearingDeg of bearings) {
+        const worldBearingRad = (state.heading_deg + bearingDeg) * Math.PI / 180;
+        const cosB = Math.cos(worldBearingRad), sinB = Math.sin(worldBearingRad);
+        for (const d of distances) {
+          const ox = state.x + d * cosB;
+          const oy = state.y + d * sinB;
+          cellIs.push(Math.round(ox / SPACING));
+          cellJs.push(Math.round(oy / SPACING));
+        }
+      }
+      if (!cellIs.length) continue;
+      const iMin = Math.min(...cellIs), iMax = Math.max(...cellIs);
+      const jMin = Math.min(...cellJs), jMax = Math.max(...cellJs);
+      for (let ci = iMin; ci <= iMax; ci++) {
+        for (let cj = jMin; cj <= jMax; cj++) {
+          drawCellBox(ci, cj, 'rgba(255,165,0,0.35)', '#ffa500');
+        }
+      }
     }
   }
 
@@ -1747,9 +1830,32 @@ function draw(state) {
     ctx.beginPath(); ctx.moveTo(gx - 6, gy + 6); ctx.lineTo(gx + 6, gy - 6); ctx.stroke();
   }
 
-  // robot arrow (heading: 0deg = +X, math convention; canvas Y is flipped)
+  // robot footprint box (ROBOT_SIZE x ROBOT_SIZE cm) -- state.x/y is the
+  // FRONT-LEFT wheel, one CORNER of the box (not its center), so in the
+  // robot's own local frame (+x = forward, +y = left) the box spans
+  // local x in [-ROBOT_SIZE, 0] (body is BEHIND the front edge) and
+  // local y in [-ROBOT_SIZE, 0] (body is to the RIGHT of the left edge).
+  // Rotated into world space by the current heading, since the box's
+  // orientation (not just position) changes as the robot turns.
   const headingDeg = state.heading_deg ?? 0;
   const rad = headingDeg * Math.PI / 180;
+  const cosH = Math.cos(rad), sinH = Math.sin(rad);
+  const localCorners = [[0, 0], [0, -ROBOT_SIZE], [-ROBOT_SIZE, -ROBOT_SIZE], [-ROBOT_SIZE, 0]];
+  const boxPx = localCorners.map(([lx, ly]) => toPx(
+    state.x + lx * cosH - ly * sinH,
+    state.y + lx * sinH + ly * cosH
+  ));
+  ctx.fillStyle = 'rgba(77,163,255,0.15)';
+  ctx.strokeStyle = '#4da3ff';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(boxPx[0][0], boxPx[0][1]);
+  for (let k = 1; k < boxPx.length; k++) ctx.lineTo(boxPx[k][0], boxPx[k][1]);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // robot arrow (heading: 0deg = +X, math convention; canvas Y is flipped)
   const [rx, ry] = toPx(state.x, state.y);
   const len = SPACING * 0.8 * SCALE;
   const tipX = rx + len * Math.cos(rad);
@@ -2038,7 +2144,9 @@ def render_page():
             .replace('__POLL_MS__', str(GUI_POLL_MS))
             .replace('__STEP_SIZE__', f'{STEP_SIZE_CM / 100:.1f}')
             .replace('__FORWARD_SPEED__', f'{FORWARD_SPEED:.2f}')
-            .replace('__ROTATE_SPEED__', f'{ROTATE_SPEED:.2f}'))
+            .replace('__ROTATE_SPEED__', f'{ROTATE_SPEED:.2f}')
+            .replace('__ROBOT_SIZE__', str(ROBOT_SIZE_CM))
+            .replace('__OBSTACLE_BOX_DEPTH__', str(OBSTACLE_BOX_DEPTH_CM)))
 
 
 def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
