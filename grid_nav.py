@@ -30,12 +30,15 @@ GUI:
   its path so far, and the current goal. A form + "Go" button let you
   send a new goal (in cm) at any time, including while the robot is
   mid-move. A status readout shows raw IMU yaw and the current target
-  heading in degrees, for debugging the IMU.
+  heading in degrees, for debugging the IMU. A live MJPEG feed from a
+  USB webcam (see CAMERA_DEVICE_INDEX) is also shown, if available.
 
   Open it from any browser on the same network:
       http://<pi5-ip-address>:8080
 
-Requires Flask (pip install flask) in addition to your ROS2 env.
+Requires Flask (pip install flask) and OpenCV (sudo apt install
+python3-opencv, or pip install opencv-python) in addition to your
+ROS2 env.
 
 Run (after sourcing your ROS2 setup):
     python3 grid_nav.py
@@ -44,7 +47,9 @@ Run (after sourcing your ROS2 setup):
 import heapq
 import math
 import threading
+import time
 
+import cv2
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Imu
@@ -153,6 +158,17 @@ STEP_SIZE_CM = GRID_SPACING_CM
 # walled off) fails fast instead of scanning an unbounded plane.
 PLANNING_HALF_EXTENT_CELLS = GRID_HALF_EXTENT_CM // GRID_SPACING_CM
 SQRT2 = math.sqrt(2.0)
+
+# USB webcam streamed to the GUI as MJPEG over /video_feed. Device index
+# matches OpenCV/V4L2 numbering (0 = /dev/video0). If you have more than
+# one video device (e.g. a webcam plus some other UVC device), check
+# `ls /dev/video*` and `v4l2-ctl --list-devices` on the Pi to find the
+# right index.
+CAMERA_DEVICE_INDEX = 0
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+CAMERA_FPS = 15
+CAMERA_JPEG_QUALITY = 80        # 0-100, higher = better quality/more bandwidth
 # -------------------------------------------------
 
 
@@ -268,6 +284,67 @@ def path_to_legs(cell_path, cell_size_cm):
         legs.append(('move', di / norm, dj / norm, steps * step_cm))
         i = j
     return legs
+
+
+class CameraStreamer:
+    """Grabs frames from a USB webcam in a background thread and keeps the
+    latest one JPEG-encoded and ready to serve. Decoupling capture from
+    the Flask request handler means multiple browser tabs (or just slow
+    HTTP writes) don't stall frame grabbing, and a client that hasn't
+    polled recently always gets the freshest frame instead of a queued
+    stale one."""
+
+    def __init__(self, device_index, width, height, fps, jpeg_quality):
+        self.device_index = device_index
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.jpeg_quality = jpeg_quality
+
+        self._cap = None
+        self._lock = threading.Lock()
+        self._latest_jpeg = None
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        """Returns True if the camera opened successfully."""
+        cap = cv2.VideoCapture(self.device_index)
+        if not cap.isOpened():
+            return False
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        cap.set(cv2.CAP_PROP_FPS, self.fps)
+        self._cap = cap
+        self._running = True
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
+        return True
+
+    def _capture_loop(self):
+        interval = 1.0 / self.fps
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
+        while self._running:
+            start = time.monotonic()
+            ok, frame = self._cap.read()
+            if ok:
+                ok2, buf = cv2.imencode('.jpg', frame, encode_params)
+                if ok2:
+                    with self._lock:
+                        self._latest_jpeg = buf.tobytes()
+            elapsed = time.monotonic() - start
+            time.sleep(max(0.0, interval - elapsed))
+
+    def get_jpeg(self):
+        with self._lock:
+            return self._latest_jpeg
+
+    def stop(self):
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        if self._cap is not None:
+            self._cap.release()
 
 
 class PID:
@@ -706,6 +783,9 @@ HTML_PAGE = """<!doctype html>
   h1 { font-size: 16px; font-weight: normal; color: #aaa; margin: 0 0 12px 0; }
   .layout { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
   .left { display: flex; flex-direction: column; gap: 12px; min-width: 260px; }
+  .camera { display: flex; flex-direction: column; gap: 6px; min-width: 320px; max-width: 480px; }
+  .camera img { width: 100%; background: #111; border: 1px solid #444; border-radius: 4px; display: block; }
+  .camera .k { font-size: 11px; color: #999; text-transform: uppercase; }
   .right { flex: 1; }
   #canvas { background: #111; border: 1px solid #444; display: block; max-width: 100%; height: auto; cursor: crosshair; }
   form { background: #262626; border: 1px solid #444; padding: 10px; border-radius: 6px; }
@@ -752,6 +832,11 @@ HTML_PAGE = """<!doctype html>
       <div class="stat-box wide"><div class="k">Heading (ref=0)</div><div class="v" id="s-heading">--</div></div>
       <div class="stat-box wide"><div class="k">Target Heading</div><div class="v" id="s-target">--</div></div>
     </div>
+  </div>
+  <div class="camera">
+    <div class="k">Camera</div>
+    <img id="cameraFeed" src="/video_feed" alt="camera feed"
+         onerror="this.replaceWith(Object.assign(document.createElement('div'), {textContent: 'Camera unavailable', style: 'color:#999; padding:12px; border:1px solid #444; border-radius:4px;'}))">
   </div>
   <div class="right">
     <canvas id="canvas" width="__CANVAS_PX__" height="__CANVAS_PX__"></canvas>
@@ -1011,15 +1096,32 @@ def render_page():
             .replace('__ROTATE_SPEED__', f'{ROTATE_SPEED:.2f}'))
 
 
-def create_app(node: GridNavNode) -> Flask:
+def create_app(node: GridNavNode, camera: 'CameraStreamer | None') -> Flask:
     app = Flask(__name__)
-    # Werkzeug's request logging is noisy at GUI_HZ polling rates.
+    # Werkzeug's request logging is noisy at GUI_HZ polling rates (and would
+    # be far worse for the continuous /video_feed stream).
     import logging
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
     @app.route('/')
     def index():
         return Response(render_page(), mimetype='text/html')
+
+    @app.route('/video_feed')
+    def video_feed():
+        if camera is None:
+            return Response('Camera not available', status=503)
+
+        def gen():
+            interval = 1.0 / CAMERA_FPS
+            while True:
+                jpeg = camera.get_jpeg()
+                if jpeg is not None:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + jpeg + b'\r\n')
+                time.sleep(interval)
+
+        return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
     @app.route('/api/state')
     def api_state():
@@ -1092,13 +1194,26 @@ def main(args=None):
     spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     spin_thread.start()
 
-    app = create_app(node)
+    camera = CameraStreamer(CAMERA_DEVICE_INDEX, CAMERA_WIDTH, CAMERA_HEIGHT,
+                             CAMERA_FPS, CAMERA_JPEG_QUALITY)
+    if camera.start():
+        node.get_logger().info(f'Camera streaming from device index {CAMERA_DEVICE_INDEX}')
+    else:
+        node.get_logger().warn(
+            f'Could not open camera at device index {CAMERA_DEVICE_INDEX} -- '
+            f'/video_feed will report unavailable. Check `ls /dev/video*`.'
+        )
+        camera = None
+
+    app = create_app(node, camera)
     node.get_logger().info(f'Web GUI at http://<this-device-ip>:{WEB_PORT}')
     try:
         app.run(host='0.0.0.0', port=WEB_PORT, threaded=True, use_reloader=False)
     except KeyboardInterrupt:
         pass
     finally:
+        if camera is not None:
+            camera.stop()
         node.stop_robot()
         node.destroy_node()
         rclpy.shutdown()
