@@ -8,9 +8,14 @@ Robot model this script assumes:
   - Turning is done by a PIVOT about the left wheel: left wheel stays
     stopped, only the right wheel drives, so the tracked (x, y) point
     does not move during a turn -- only heading changes.
-  - The robot never drives diagonally. To reach goal (gx, gy) it
-    resolves the X-axis distance first (turn to face +X/-X, drive),
-    then the Y-axis distance (turn to face +Y/-Y, drive).
+  - Movement is planned on a grid of GRID_SPACING_CM cells using A*
+    (8-directional: N/S/E/W plus the 4 diagonals), so the robot CAN
+    drive diagonally and will route around any cells marked as
+    obstacles in the GUI. The planned path is compressed into a
+    sequence of straight-line legs (each a single rotate + drive),
+    one per run of consecutive same-direction grid steps -- not one
+    tiny hop per cell. If no path exists (goal fully blocked), the
+    goal is rejected and logged.
 
 IMPORTANT -- firmware encoder wiring:
   wheel_encoder data[0] must be the LEFT wheel's encoder for the
@@ -36,6 +41,7 @@ Run (after sourcing your ROS2 setup):
     python3 grid_nav.py
 """
 
+import heapq
 import math
 import threading
 
@@ -92,7 +98,6 @@ PIVOT_ANGULAR_SIGN = -1
 Y_AXIS_SIGN = 1
 
 HEADING_TOLERANCE_DEG = 3.0    # stop pivoting once within this of target
-POSITION_EPSILON_CM = 1.0      # skip an axis leg smaller than this
 
 # Rotate-phase PID: scales pivot speed down as heading error shrinks
 # (instead of a constant speed followed by a hard stop at tolerance).
@@ -142,6 +147,12 @@ GRID_HALF_EXTENT_CM = 500       # initial view: +/- this many cm (10m x 10m tota
 # measuring one grid box at a time instead of a whole multi-box leg in one
 # go. Defaults to matching the visual grid spacing.
 STEP_SIZE_CM = GRID_SPACING_CM
+
+# A* plans over the same GRID_SPACING_CM cells shown on the GUI grid.
+# Search is bounded to the visible grid so an unreachable goal (e.g. fully
+# walled off) fails fast instead of scanning an unbounded plane.
+PLANNING_HALF_EXTENT_CELLS = GRID_HALF_EXTENT_CM // GRID_SPACING_CM
+SQRT2 = math.sqrt(2.0)
 # -------------------------------------------------
 
 
@@ -162,6 +173,101 @@ def angle_diff(target, current):
 
 def normalize_angle(a):
     return angle_diff(a, 0.0)
+
+
+# 8-connected neighbor offsets: (di, dj, step_cost). Orthogonal steps cost 1
+# cell, diagonal steps cost sqrt(2) cells (true Euclidean distance between
+# diagonally-adjacent cell centers).
+_ASTAR_NEIGHBORS = [
+    (1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
+    (1, 1, SQRT2), (1, -1, SQRT2), (-1, 1, SQRT2), (-1, -1, SQRT2),
+]
+
+
+def _octile_heuristic(a, b):
+    # Admissible heuristic for 8-directional movement with unit/sqrt(2)
+    # costs. Plain Manhattan distance (|dx|+|dy|) overestimates the true
+    # cost once diagonal moves are allowed (a diagonal step covers 2 cells
+    # of Manhattan distance for sqrt(2) ~= 1.414 cost, not 2), which would
+    # make A* not guaranteed to return the shortest path. This "octile"
+    # distance is the exact cost of the optimal path on an obstacle-free
+    # grid, so it's both admissible and consistent here.
+    dx = abs(a[0] - b[0])
+    dy = abs(a[1] - b[1])
+    return (dx + dy) + (SQRT2 - 2.0) * min(dx, dy)
+
+
+def astar_search(start_cell, goal_cell, obstacles):
+    """8-directional A* over grid cells. obstacles is a set of (i, j)
+    blocked cells. Returns a list of cells from start_cell to goal_cell
+    (inclusive), or None if no path exists."""
+    if start_cell == goal_cell:
+        return [start_cell]
+
+    limit = PLANNING_HALF_EXTENT_CELLS
+
+    def in_bounds(c):
+        return -limit <= c[0] <= limit and -limit <= c[1] <= limit
+
+    open_heap = [(0.0, start_cell)]
+    g_cost = {start_cell: 0.0}
+    came_from = {}
+    closed = set()
+
+    while open_heap:
+        _, current = heapq.heappop(open_heap)
+        if current in closed:
+            continue
+        if current == goal_cell:
+            path = [current]
+            while current in came_from:
+                current = came_from[current]
+                path.append(current)
+            path.reverse()
+            return path
+        closed.add(current)
+
+        for di, dj, step_cost in _ASTAR_NEIGHBORS:
+            neighbor = (current[0] + di, current[1] + dj)
+            if neighbor in closed or not in_bounds(neighbor) or neighbor in obstacles:
+                continue
+            if di != 0 and dj != 0:
+                # Don't let a diagonal step cut through the corner formed by
+                # two blocked orthogonal cells -- standard grid-A* rule so
+                # the path never squeezes between two "walls" that aren't
+                # actually passable.
+                if (current[0] + di, current[1]) in obstacles and (current[0], current[1] + dj) in obstacles:
+                    continue
+            tentative = g_cost[current] + step_cost
+            if tentative < g_cost.get(neighbor, float('inf')):
+                g_cost[neighbor] = tentative
+                came_from[neighbor] = current
+                heapq.heappush(open_heap, (tentative + _octile_heuristic(neighbor, goal_cell), neighbor))
+
+    return None
+
+
+def path_to_legs(cell_path, cell_size_cm):
+    """Compress a list of adjacent grid cells into ('move', ux, uy,
+    distance_cm) legs -- one per run of consecutive same-direction steps,
+    so a long straight or diagonal stretch becomes a single rotate+drive
+    leg instead of one tiny hop per cell."""
+    legs = []
+    i = 1
+    n = len(cell_path)
+    while i < n:
+        di = cell_path[i][0] - cell_path[i - 1][0]
+        dj = cell_path[i][1] - cell_path[i - 1][1]
+        steps = 1
+        j = i + 1
+        while j < n and (cell_path[j][0] - cell_path[j - 1][0], cell_path[j][1] - cell_path[j - 1][1]) == (di, dj):
+            steps += 1
+            j += 1
+        step_cm = cell_size_cm * (SQRT2 if (di != 0 and dj != 0) else 1.0)
+        norm = math.hypot(di, dj)
+        legs.append(('move', di / norm, dj / norm, steps * step_cm))
+        i = j
+    return legs
 
 
 class PID:
@@ -224,18 +330,28 @@ class GridNavNode(Node):
 
         # Navigation state: 'IDLE' | 'RUNNING'
         self.state = 'IDLE'
-        self.legs = []               # list of ('x'|'y', delta_cm)
+        self.legs = []               # list of ('move', ux, uy, distance_cm) | ('heading', end_dir_deg)
         self.leg_idx = 0
         self.phase = None            # 'ROTATE' | 'DRIVE'
         self.leg_target_heading = 0.0
         self.leg_target_distance_cm = 0.0
         self.leg_baseline_pulses = 0
-        self.leg_progress_cm = 0.0   # signed live progress along the current leg's axis
+        self.leg_progress_cm = 0.0   # unsigned live distance traveled this leg (cm)
                                       # (not yet committed to x/y -- see control_loop DRIVE)
+        self.leg_start_x = 0.0       # x/y at the start of the current 'move' leg, plus the
+        self.leg_start_y = 0.0       # unit direction vector -- together with leg_progress_cm
+        self.leg_unit_dx = 0.0       # these give the live in-progress display position
+        self.leg_unit_dy = 0.0
         self.leg_boxes_crossed = 0   # how many GRID_SPACING_CM boxes crossed so far this leg,
                                       # for pushing live trail points as each box is reached
         self.goal = None             # (gx, gy) for display
         self.end_dir_deg = None      # requested final heading, degrees (or None)
+
+        # Obstacle map for A* planning: set of blocked (i, j) grid cells,
+        # cell (i, j) centered at (i * GRID_SPACING_CM, j * GRID_SPACING_CM).
+        # Edited live from the GUI (click a cell to toggle it).
+        self.obstacles = set()
+        self.planned_path = []       # [(x_cm, y_cm), ...] cell centers of the last A* route, for GUI overlay
 
         # Step mode: pause fully after each STEP_SIZE_CM of DRIVE travel
         # and wait for continue_step() before resuming, so you can measure
@@ -279,15 +395,40 @@ class GridNavNode(Node):
 
     # ---------------- Goal handling ----------------
 
+    @staticmethod
+    def _to_cell(x_cm, y_cm):
+        return (round(x_cm / GRID_SPACING_CM), round(y_cm / GRID_SPACING_CM))
+
+    def toggle_obstacle(self, i, j):
+        with self._lock:
+            cell = (i, j)
+            if cell in self.obstacles:
+                self.obstacles.discard(cell)
+            else:
+                self.obstacles.add(cell)
+
+    def clear_obstacles(self):
+        with self._lock:
+            self.obstacles.clear()
+
     def set_goal(self, gx, gy, end_dir_deg=None, step_mode=False):
         with self._lock:
-            dx = gx - self.x
-            dy = gy - self.y
+            start_cell = self._to_cell(self.x, self.y)
+            goal_cell = self._to_cell(gx, gy)
+
             legs = []
-            if abs(dx) >= POSITION_EPSILON_CM:
-                legs.append(('x', dx))
-            if abs(dy) >= POSITION_EPSILON_CM:
-                legs.append(('y', dy))
+            planned_path = []
+            if start_cell != goal_cell:
+                cell_path = astar_search(start_cell, goal_cell, self.obstacles)
+                if cell_path is None:
+                    self.goal = (gx, gy)
+                    self.get_logger().warn(
+                        f'No path to ({gx:.1f}, {gy:.1f}) cm -- blocked by obstacles or out of range.'
+                    )
+                    return
+                legs = path_to_legs(cell_path, GRID_SPACING_CM)
+                planned_path = [(c[0] * GRID_SPACING_CM, c[1] * GRID_SPACING_CM) for c in cell_path]
+
             if end_dir_deg is not None:
                 # Rotate-only leg: no drive phase, just turn to face this
                 # heading (degrees, relative to heading_ref where 0 = +X)
@@ -298,6 +439,7 @@ class GridNavNode(Node):
             self.end_dir_deg = end_dir_deg
             self.legs = legs
             self.leg_idx = 0
+            self.planned_path = planned_path
             self.step_mode = step_mode
             self.awaiting_continue = False
 
@@ -324,7 +466,7 @@ class GridNavNode(Node):
 
     def _start_leg_locked(self):
         """Caller must hold self._lock."""
-        axis, delta = self.legs[self.leg_idx]
+        leg = self.legs[self.leg_idx]
         if self.heading_ref is None:
             # No IMU data yet -- can't compute a target heading. Bail to
             # IDLE; control_loop will simply do nothing until IMU arrives
@@ -333,16 +475,24 @@ class GridNavNode(Node):
             self.get_logger().warn('No IMU data yet -- cannot start leg. Try the goal again shortly.')
             return
 
-        if axis == 'x':
-            target = self.heading_ref if delta > 0 else self.heading_ref + math.pi
-        elif axis == 'y':
-            quarter_turn = Y_AXIS_SIGN * (math.pi / 2.0)
-            target = self.heading_ref + quarter_turn if delta > 0 else self.heading_ref - quarter_turn
-        else:  # 'heading' -- delta is an absolute end direction in degrees
-            target = self.heading_ref + math.radians(delta)
+        if leg[0] == 'move':
+            _, ux, uy, distance_cm = leg
+            # heading_ref + 0deg == "+X" (ux=1,uy=0); Y_AXIS_SIGN flips which
+            # physical turn direction counts as "+Y" -- same convention as
+            # before, just generalized to any of the 8 grid directions via
+            # atan2 instead of only handling the 4 cardinal cases.
+            target = self.heading_ref + math.atan2(Y_AXIS_SIGN * uy, ux)
+            self.leg_target_heading = normalize_angle(target)
+            self.leg_target_distance_cm = distance_cm
+            self.leg_start_x = self.x
+            self.leg_start_y = self.y
+            self.leg_unit_dx = ux
+            self.leg_unit_dy = uy
+        else:  # 'heading' -- leg[1] is an absolute end direction in degrees
+            target = self.heading_ref + math.radians(leg[1])
+            self.leg_target_heading = normalize_angle(target)
+            self.leg_target_distance_cm = 0.0
 
-        self.leg_target_heading = normalize_angle(target)
-        self.leg_target_distance_cm = abs(delta) if axis in ('x', 'y') else 0.0
         self.leg_progress_cm = 0.0
         self.leg_boxes_crossed = 0
         self.phase = 'ROTATE'
@@ -378,8 +528,7 @@ class GridNavNode(Node):
             if self.phase == 'ROTATE':
                 error = angle_diff(self.leg_target_heading, self.current_yaw)
                 if abs(math.degrees(error)) <= HEADING_TOLERANCE_DEG:
-                    axis, _ = self.legs[self.leg_idx]
-                    if axis == 'heading':
+                    if self.legs[self.leg_idx][0] == 'heading':
                         # Rotate-only leg (final end direction) -- no DRIVE
                         # phase, no position change. Leg is done as soon as
                         # heading is reached.
@@ -420,12 +569,14 @@ class GridNavNode(Node):
             # phase == 'DRIVE'
             traveled_pulses = self.last_pulses - self.leg_baseline_pulses
             traveled_cm = abs(traveled_pulses) / PULSES_PER_CM
-            axis, delta = self.legs[self.leg_idx]
-            # Live progress along this leg's axis, updated every tick (not
-            # yet committed to x/y) -- lets the GUI show real-time position
-            # and distance-so-far while driving, like heading_hold.py's
-            # periodic distance print, instead of only jumping at leg end.
-            self.leg_progress_cm = math.copysign(traveled_cm, delta)
+            # Live progress along this leg's direction, updated every tick
+            # (not yet committed to x/y) -- lets the GUI show real-time
+            # position and distance-so-far while driving, like
+            # heading_hold.py's periodic distance print, instead of only
+            # jumping at leg end. Unsigned: direction is carried by
+            # leg_unit_dx/dy (the robot only ever drives forward, having
+            # already turned to face the right way in ROTATE).
+            self.leg_progress_cm = traveled_cm
 
             # Push a live trail point each time a full grid box is crossed
             # (not just when the whole leg finishes), so the GUI path/trail
@@ -434,16 +585,13 @@ class GridNavNode(Node):
             boxes_crossed = int(traveled_cm // GRID_SPACING_CM)
             if boxes_crossed > self.leg_boxes_crossed:
                 self.leg_boxes_crossed = boxes_crossed
-                box_x = self.x + (self.leg_progress_cm if axis == 'x' else 0.0)
-                box_y = self.y + (self.leg_progress_cm if axis == 'y' else 0.0)
+                box_x = self.leg_start_x + self.leg_unit_dx * traveled_cm
+                box_y = self.leg_start_y + self.leg_unit_dy * traveled_cm
                 self.path.append((box_x, box_y))
 
             if traveled_cm >= self.leg_target_distance_cm:
-                signed_cm = self.leg_progress_cm
-                if axis == 'x':
-                    self.x += signed_cm
-                else:
-                    self.y += signed_cm
+                self.x = self.leg_start_x + self.leg_unit_dx * traveled_cm
+                self.y = self.leg_start_y + self.leg_unit_dy * traveled_cm
                 self.path.append((self.x, self.y))
                 self.leg_progress_cm = 0.0
 
@@ -496,8 +644,9 @@ class GridNavNode(Node):
             self.goal = None
             self.legs = []
             self.leg_idx = 0
+            self.planned_path = []
         self.stop_robot()
-        self.get_logger().info('Position reset to (0, 0).')
+        self.get_logger().info('Position reset to (0, 0). Obstacles left as-is.')
 
     # ---------------- Snapshot for the GUI thread ----------------
 
@@ -513,21 +662,21 @@ class GridNavNode(Node):
                 target_deg = math.degrees(angle_diff(self.leg_target_heading, self.heading_ref))
 
             # Live display position: committed x/y plus in-progress DRIVE
-            # movement along the current leg's axis, so the GUI marker and
-            # position readout move in real time instead of jumping only
-            # when a leg completes.
+            # movement along the current leg's direction, so the GUI marker
+            # and position readout move in real time instead of jumping
+            # only when a leg completes.
             display_x, display_y = self.x, self.y
-            if self.state == 'RUNNING' and self.phase == 'DRIVE' and self.legs:
-                axis, _ = self.legs[self.leg_idx]
-                if axis == 'x':
-                    display_x = self.x + self.leg_progress_cm
-                elif axis == 'y':
-                    display_y = self.y + self.leg_progress_cm
+            if self.state == 'RUNNING' and self.phase == 'DRIVE' and self.legs \
+                    and self.legs[self.leg_idx][0] == 'move':
+                display_x = self.leg_start_x + self.leg_unit_dx * self.leg_progress_cm
+                display_y = self.leg_start_y + self.leg_unit_dy * self.leg_progress_cm
 
             return {
                 'x': display_x,
                 'y': display_y,
                 'path': list(self.path),
+                'planned_path': list(self.planned_path),
+                'obstacles': [list(c) for c in self.obstacles],
                 'goal': self.goal,
                 'state': self.state,
                 'phase': self.phase,
@@ -558,7 +707,7 @@ HTML_PAGE = """<!doctype html>
   .layout { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
   .left { display: flex; flex-direction: column; gap: 12px; min-width: 260px; }
   .right { flex: 1; }
-  #canvas { background: #111; border: 1px solid #444; display: block; max-width: 100%; height: auto; }
+  #canvas { background: #111; border: 1px solid #444; display: block; max-width: 100%; height: auto; cursor: crosshair; }
   form { background: #262626; border: 1px solid #444; padding: 10px; border-radius: 6px; }
   form .row { margin-bottom: 8px; }
   input { width: 90px; font-size: 14px; padding: 4px; }
@@ -584,6 +733,8 @@ HTML_PAGE = """<!doctype html>
     </form>
     <button id="resetBtn" style="background:#5a2a2a;">Reset Position to (0,0)</button>
     <button id="continueBtn" style="background:#2a5a2a; display:none;">Continue to Next Box</button>
+    <button id="clearObstaclesBtn" style="background:#5a4a1a;">Clear Obstacles</button>
+    <div style="font-size:11px; color:#999;">Click a grid cell to toggle it as an obstacle (A* routes around it, diagonals allowed).</div>
     <form id="speedForm">
       <div class="row"><label>Drive Speed (0-1)</label><input id="speedFwd" type="number" value="__FORWARD_SPEED__" step="0.01" min="0.01" max="1"></div>
       <div class="row"><label>Rotate Speed (0-1)</label><input id="speedRot" type="number" value="__ROTATE_SPEED__" step="0.01" min="0.01" max="1"></div>
@@ -662,6 +813,38 @@ function draw(state) {
   ctx.fillStyle = '#ccc';
   ctx.fillText('X (m)', CANVAS_PX - 40, oy - 6);
   ctx.fillText('Y (m)', ox + 6, 12);
+
+  // obstacles (blocked A* cells)
+  if (state.obstacles) {
+    ctx.fillStyle = 'rgba(255,60,60,0.35)';
+    ctx.strokeStyle = '#ff3c3c';
+    ctx.lineWidth = 1;
+    for (const cell of state.obstacles) {
+      const cx = cell[0] * SPACING;
+      const cy = cell[1] * SPACING;
+      const [px, py] = toPx(cx - SPACING / 2, cy + SPACING / 2);
+      const size = SPACING * SCALE;
+      ctx.fillRect(px, py, size, size);
+      ctx.strokeRect(px, py, size, size);
+    }
+  }
+
+  // planned A* route (cell-to-cell, includes diagonals) -- dashed, distinct
+  // from the solid blue trail of where the robot has actually been.
+  if (state.planned_path && state.planned_path.length > 1) {
+    ctx.strokeStyle = '#7CFC00';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    let [psx, psy] = toPx(state.planned_path[0][0], state.planned_path[0][1]);
+    ctx.moveTo(psx, psy);
+    for (const p of state.planned_path.slice(1)) {
+      let [ppx, ppy] = toPx(p[0], p[1]);
+      ctx.lineTo(ppx, ppy);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
 
   // path
   if (path.length > 1) {
@@ -786,6 +969,25 @@ document.getElementById('resetBtn').addEventListener('click', async () => {
   await fetch('/api/reset_position', {method: 'POST'});
 });
 
+document.getElementById('clearObstaclesBtn').addEventListener('click', async () => {
+  await fetch('/api/clear_obstacles', {method: 'POST'});
+});
+
+canvas.addEventListener('click', async (ev) => {
+  const rect = canvas.getBoundingClientRect();
+  const px = (ev.clientX - rect.left) * (CANVAS_PX / rect.width);
+  const py = (ev.clientY - rect.top) * (CANVAS_PX / rect.height);
+  const xcm = (px - CANVAS_PX / 2) / SCALE;
+  const ycm = -(py - CANVAS_PX / 2) / SCALE;
+  const i = Math.round(xcm / SPACING);
+  const j = Math.round(ycm / SPACING);
+  await fetch('/api/toggle_obstacle', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({i: i, j: j})
+  });
+});
+
 setInterval(poll, __POLL_MS__);
 poll();
 </script>
@@ -851,6 +1053,22 @@ def create_app(node: GridNavNode) -> Flask:
         except (TypeError, ValueError):
             return jsonify({'ok': False, 'error': 'invalid speed value'}), 400
         node.set_speed(forward=forward, rotate=rotate)
+        return jsonify({'ok': True})
+
+    @app.route('/api/toggle_obstacle', methods=['POST'])
+    def api_toggle_obstacle():
+        data = request.get_json(force=True)
+        try:
+            i = int(data['i'])
+            j = int(data['j'])
+        except (KeyError, TypeError, ValueError):
+            return jsonify({'ok': False, 'error': 'invalid cell'}), 400
+        node.toggle_obstacle(i, j)
+        return jsonify({'ok': True})
+
+    @app.route('/api/clear_obstacles', methods=['POST'])
+    def api_clear_obstacles():
+        node.clear_obstacles()
         return jsonify({'ok': True})
 
     @app.route('/api/reset_position', methods=['POST'])
