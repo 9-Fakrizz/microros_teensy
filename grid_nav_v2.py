@@ -40,9 +40,9 @@ GUI:
   USB webcam (see CAMERA_DEVICE_INDEX) is also shown, if available, with
   a backup-camera-style distance HUD (see CameraRangefinder) and live
   obstacle detection boxes (see ObstacleDetector) drawn over it -- big,
-  blocky/angular objects are flagged as obstacles; small and/or round
-  objects (tennis balls -- what this robot collects, not avoids) are
-  filtered out by size and shape.
+  blocky/angular objects farther than DETECTION_MIN_DISTANCE_CM are
+  flagged as obstacles; small and/or round objects (tennis balls -- what
+  this robot collects, not avoids) are filtered out by size and shape.
 
   Open it from any browser on the same network:
       http://<pi5-ip-address>:8080
@@ -69,7 +69,7 @@ from std_msgs.msg import Int32MultiArray
 
 from flask import Flask, jsonify, request, Response
 
-SCRIPT_VERSION = "v2.0 - web GUI"
+SCRIPT_VERSION = "v2.1 - web GUI"
 
 # ---------------- Configuration ----------------
 IMU_TOPIC = "/imu_data"
@@ -214,74 +214,20 @@ CAMERA_JPEG_QUALITY = 80        # 0-100, higher = better quality/more bandwidth
 GUIDE_DISTANCES_CM = [50, 100, 150, 200, 250, 300]
 
 # Lightweight obstacle detector (ObstacleDetector) -- no trained model
-# file, no HOG. VERTICAL-LINE pattern matching: testing with
-# black_value_max=0 (black-line rejection effectively off) showed that a
-# pillar or a human leg produces a strong, mostly-unbroken vertical Canny
-# edge running from the TOP of the frame straight down to wherever it
-# touches the floor -- unlike floor clutter/texture, which doesn't form
-# a long continuous vertical line. So instead of generic "any big blob"
-# contour detection, ObstacleDetector specifically looks for these tall,
-# thin, top-anchored vertical edge segments, and estimates each one's
-# distance from where its LOWEST point (floor-contact point) falls on
-# CameraRangefinder's distance-per-row mapping.
+# file, no HOG (dropped -- it was the expensive part). Just segmentation +
+# contour shape analysis, kept cheap with two aggressive filters: only
+# process pixels beyond DETECTION_MIN_DISTANCE_CM (crops out the near
+# field, which also cuts the processed pixel area roughly in half), and
+# only keep contours wide enough to be a real obstacle
+# (DETECTION_MIN_WIDTH_FRACTION of the frame width) -- small stuff,
+# including tennis balls (this robot collects those, doesn't avoid them),
+# is ignored by size alone rather than relying only on roundness.
 DETECTION_FPS = 5.0                     # detection is heavier than streaming; runs at its own slower rate
-
-# Ignore black/white straight line markings (floor tape, tile grout
-# seams, thresholds) via HSV color segmentation, applied to the EDGE MAP
-# before the vertical-line search runs: any Canny edge pixel that falls
-# on a "black" (V below black_value_max) or "white" (S below
-# white_sat_max AND V above white_value_min) region of the frame is
-# erased first. All three are GUI/API-adjustable -- tune them live
-# against the debug feed, since the right cutoff depends on actual
-# ambient lighting. (NOTE: setting black_value_max too high can eat a
-# real leg/pillar's own edge if it's dark -- that's what testing at 0
-# revealed the vertical-line pattern in the first place.)
-DETECTION_BLACK_VALUE_MAX = 90      # 0-255 HSV V; below this = "black"
-DETECTION_WHITE_SAT_MAX = 40        # 0-255 HSV S; below this (AND V above WHITE_VALUE_MIN) = "white"
-DETECTION_WHITE_VALUE_MIN = 200     # 0-255 HSV V; above this (AND S below WHITE_SAT_MAX) = "white"
-
-# VERTICAL-LINE shape filter, in the downscaled frame's own pixel space
-# (fractions of its height/width, so they scale with DETECTION_DOWNSCALE
-# automatically). A connected edge component only counts as a candidate
-# pillar/leg if BOTH of:
-#   - it starts within the top VERTICAL_TOP_MARGIN_FRACTION of the frame
-#     (the "topmost" anchor the pattern is named for)
-#   - it's no wider than VERTICAL_MAX_WIDTH_FRACTION of the frame
-#     (thin -- a leg or pillar edge, not a wide box)
-# There is deliberately NO separate min-height requirement -- that used
-# to be an arbitrary fixed fraction, but the real, physically-grounded
-# condition is simpler and already covered by the SAFETY DISTANCE FILTER
-# below: a top-anchored line is only accepted at all if its FOOT (lowest
-# point) maps to a distance inside [OBJECT_MIN_DISTANCE_CM,
-# OBJECT_MAX_DISTANCE_CM], which by itself forces it to be at least tall
-# enough to reach that band -- one condition instead of two redundant
-# ones tuned separately.
-# A small vertical morphological CLOSE (VERTICAL_CLOSE_KSIZE tall, in
-# downscaled pixels) bridges small gaps in an otherwise-continuous
-# vertical edge first, so minor noise/blur breaks don't split one real
-# line into several short fragments.
-# Internal only, not GUI-exposed.
-DETECTION_VERTICAL_TOP_MARGIN_FRACTION = 0.05
-DETECTION_VERTICAL_MAX_WIDTH_FRACTION = 0.06
-DETECTION_VERTICAL_CLOSE_KSIZE = 15
-
-# SAFETY DISTANCE FILTER -- THE core obstacle condition: a vertical
-# line's FOOT (its lowest point, full-frame pixel row) is converted to
-# a real-world floor distance via CameraRangefinder.distance_for_row().
-# A candidate line is only accepted as a real obstacle if that foot
-# distance falls within this band -- outside it (nearer than the min or
-# farther than the max), the estimate is considered unreliable and the
-# whole detection is dropped rather than risking a false pin. Distinct
-# from the old frame-crop band (removed) -- this filters individual
-# detections by their OWN measured distance, not
-# by cropping the source frame.
-DETECTION_OBJECT_MIN_DISTANCE_CM = 50.0
-DETECTION_OBJECT_MAX_DISTANCE_CM = 100.0
-
-# Performance: this downscale factor cuts the pixel count the Canny
-# pipeline has to churn through -- keeps CPU/bandwidth low even with the
-# /debug_feed stream running. Not exposed as GUI-adjustable.
-DETECTION_DOWNSCALE = 0.5   # (0, 1.0]; e.g. 0.5 = quarter the pixels (half width x half height) before segmentation
+DETECTION_MIN_CONTOUR_AREA = 1500       # px^2 at CAMERA_WIDTH x CAMERA_HEIGHT -- filters out small noise contours
+DETECTION_CIRCULARITY_THRESHOLD = 0.78  # 4*pi*area/perimeter^2; 1.0 = perfect circle. Above this = "round enough to be a ball", skipped
+DETECTION_MIN_DISTANCE_CM = 50.0        # ignore/crop out everything closer than this
+DETECTION_MAX_DISTANCE_CM = 300.0       # ignore/crop out everything farther than this
+DETECTION_MIN_WIDTH_FRACTION = 0.5      # bounding-box width must exceed this fraction of the frame width to count
 
 # Locked-in default calibration so the HUD/obstacle detector work
 # immediately at startup without re-calibrating through the GUI every
@@ -669,138 +615,104 @@ class CameraRangefinder:
 
 
 class ObstacleDetector:
-    """No trained model file, no HOG. VERTICAL-LINE pattern matching:
-    processes the FULL frame (the distance-band crop was tried and
-    cancelled -- see notebook_debug.txt), downscaled by `downscale`,
-    computes plain Canny edges, erases black/white LINE markings (tape,
-    tile grout seams) from the edge map via HSV color segmentation --
-    any edge pixel on a "black" (V below black_value_max) or "white" (S
-    below white_sat_max AND V above white_value_min) region is erased
-    first -- then looks specifically for tall, thin, TOP-ANCHORED
-    vertical edge segments (a small vertical morphological close bridges
-    minor gaps first). A pillar or a human leg produces exactly this
-    pattern: a mostly-unbroken vertical edge running from the top of the
-    frame down to wherever it touches the floor, unlike floor
-    clutter/texture. See DETECTION_VERTICAL_* constants for the shape
-    filter and notebook_debug.txt for how this was discovered (testing
-    with black_value_max=0).
+    """Lightweight obstacle detection -- no trained model file, no HOG
+    (dropped: it was the expensive part and CPU usage was too high for a
+    5Hz+ background thread on the Pi). Just segmentation + contour shape
+    analysis, kept cheap with two aggressive filters:
 
-    Each surviving vertical line's LOWEST point (its floor-contact row)
-    is converted to a real-world distance via
-    CameraRangefinder.distance_for_row(). SAFETY FILTER: only lines whose
-    floor-contact distance falls within
-    [DETECTION_OBJECT_MIN_DISTANCE_CM, DETECTION_OBJECT_MAX_DISTANCE_CM]
-    are trusted -- outside that band the estimate is considered
-    unreliable and the whole detection is dropped, not pinned.
+      1. Only the DETECTION_MIN_DISTANCE_CM-DETECTION_MAX_DISTANCE_CM band
+         is even processed -- the frame is cropped to just the rows
+         between those two guide lines before segmentation runs, which
+         both shrinks the pixel area to process and guarantees anything
+         found already overlaps the band.
+      2. Of what's left, only contours wide enough to matter are kept --
+         bounding-box width > min_width_fraction of the frame width.
+      3. Round contours (circularity above circularity_threshold) are
+         still skipped even if they pass the size filter, as a second
+         line of defense against a large round object being flagged --
+         this robot collects tennis balls, doesn't avoid them.
+      4. Contours smaller than min_contour_area are dropped outright as
+         noise before either of the above checks even run.
 
-    The frame served over the live debug stream (/debug_feed, multipart
-    PNG -- not JPEG, see notebook_debug.txt: JPEG's lossy block
-    compression was found to bleed rejected regions back into visibility
-    on decode) is the vertical-closed edge map (post line-erasure), so
-    you should see the vertical edge lines this detector is actually
-    tracking, with no black/white line edges. All three HSV line
-    thresholds are GUI/API-adjustable -- tune them against the live
-    debug feed.
+    None of these are a trained model's confidence score -- there isn't
+    one here -- but min_width_fraction, circularity_threshold, and
+    min_contour_area together are the closest equivalent: the "how
+    strict/important" knobs that decide whether something counts as a
+    real obstacle. All three are live-adjustable from the GUI.
 
-    Runs in its own background thread at DETECTION_FPS, reading the
-    latest raw frame from a CameraStreamer.
+    Runs in its own background thread at DETECTION_FPS, reading the latest
+    raw frame from a CameraStreamer and estimating each detected box's
+    distance via CameraRangefinder, using the box's bottom edge as its
+    floor-contact point (standard monocular ground-plane range trick --
+    assumes the object rests on the floor, so it breaks down for things
+    like an overhanging table edge or a ball currently in the air).
     """
 
     def __init__(self, camera: 'CameraStreamer', rangefinder: CameraRangefinder,
                  fps=DETECTION_FPS,
-                 black_value_max=DETECTION_BLACK_VALUE_MAX,
-                 white_sat_max=DETECTION_WHITE_SAT_MAX,
-                 white_value_min=DETECTION_WHITE_VALUE_MIN,
-                 downscale=DETECTION_DOWNSCALE):
+                 min_contour_area=DETECTION_MIN_CONTOUR_AREA,
+                 circularity_threshold=DETECTION_CIRCULARITY_THRESHOLD,
+                 min_distance_cm=DETECTION_MIN_DISTANCE_CM,
+                 max_distance_cm=DETECTION_MAX_DISTANCE_CM,
+                 min_width_fraction=DETECTION_MIN_WIDTH_FRACTION):
         self.camera = camera
         self.rangefinder = rangefinder
         self.fps = fps
+        self.min_distance_cm = min_distance_cm
+        self.max_distance_cm = max_distance_cm
 
         self._settings_lock = threading.Lock()
-        self._black_value_max = black_value_max
-        self._white_sat_max = white_sat_max
-        self._white_value_min = white_value_min
-        self._downscale = downscale
+        self._min_width_fraction = min_width_fraction
+        self._circularity_threshold = circularity_threshold
+        self._min_contour_area = min_contour_area
 
         self._lock = threading.Lock()
         self._detections = []
-        self._line_coverage_pct = None    # % of ROI pixels classified as a black/white line
-        self._object_coverage_pct = None  # % of ROI (contour) area classified as obstacle
-        self._debug_png = None            # latest processed (line-masked) edge map, PNG-encoded
         self._running = False
         self._thread = None
 
-    def set_black_value_max(self, value):
-        """Live-adjustable -- 0-255 HSV V (brightness) cutoff. A pixel
-        is rejected as "black" if its V is BELOW this."""
-        value = int(value)
-        if not (0 <= value <= 255):
+    def set_min_width_fraction(self, fraction):
+        """Live-adjustable from the GUI -- how wide (as a fraction of frame
+        width) a contour must be to count as an obstacle. Lower = more
+        sensitive (flags smaller things), higher = only flags big/wide
+        obstacles."""
+        if not (0.0 < fraction <= 1.0):
             return False
         with self._settings_lock:
-            self._black_value_max = value
+            self._min_width_fraction = fraction
         return True
 
-    def get_black_value_max(self):
+    def get_min_width_fraction(self):
         with self._settings_lock:
-            return self._black_value_max
+            return self._min_width_fraction
 
-    def set_white_sat_max(self, saturation):
-        """Live-adjustable -- 0-255 HSV S (saturation) cutoff, paired with
-        white_value_min. A pixel is rejected as "white" if its S
-        is BELOW this AND its V is above white_value_min."""
-        saturation = int(saturation)
-        if not (0 <= saturation <= 255):
+    def set_circularity_threshold(self, threshold):
+        """Live-adjustable -- how round (0-1, 1=perfect circle) a contour
+        can be before it's assumed to be a ball and skipped. Lower = more
+        aggressive at excluding round-ish shapes; higher = only excludes
+        near-perfect circles."""
+        if not (0.0 < threshold <= 1.0):
             return False
         with self._settings_lock:
-            self._white_sat_max = saturation
+            self._circularity_threshold = threshold
         return True
 
-    def get_white_sat_max(self):
+    def get_circularity_threshold(self):
         with self._settings_lock:
-            return self._white_sat_max
+            return self._circularity_threshold
 
-    def set_white_value_min(self, value):
-        """Live-adjustable -- 0-255 HSV V (brightness) cutoff, paired with
-        white_sat_max. See set_white_sat_max()."""
-        value = int(value)
-        if not (0 <= value <= 255):
+    def set_min_contour_area(self, area_px2):
+        """Live-adjustable -- minimum contour area (px^2) before it's even
+        considered; smaller is treated as noise and dropped immediately."""
+        if area_px2 <= 0:
             return False
         with self._settings_lock:
-            self._white_value_min = value
+            self._min_contour_area = area_px2
         return True
 
-    def get_white_value_min(self):
+    def get_min_contour_area(self):
         with self._settings_lock:
-            return self._white_value_min
-
-    def get_line_coverage(self):
-        """Latest frame's % of ROI pixels classified as a black/white
-        line -- or None before the first detection cycle has run. Purely
-        a tuning aid right now (watch it drop to ~0 over a clean floor
-        patch as the HSV cutoffs are dialed in)."""
-        with self._lock:
-            return self._line_coverage_pct
-
-    def get_object_coverage(self):
-        """Latest frame's % of ROI pixels classified as obstacle (post
-        floor+line rejection, filled) -- or None before the first
-        detection cycle has run."""
-        with self._lock:
-            return self._object_coverage_pct
-
-    def set_downscale(self, factor):
-        """Internal-only performance knob -- fraction (0, 1.0] the ROI is
-        resized by before the HSV mask. Smaller = cheaper but less
-        precise (thin lines more likely to get missed)."""
-        if not (0.0 < factor <= 1.0):
-            return False
-        with self._settings_lock:
-            self._downscale = factor
-        return True
-
-    def get_downscale(self):
-        with self._settings_lock:
-            return self._downscale
+            return self._min_contour_area
 
     def start(self):
         self._running = True
@@ -818,111 +730,61 @@ class ObstacleDetector:
             start = time.monotonic()
             frame = self.camera.get_frame()
             if frame is not None:
-                detections, line_coverage_pct, object_coverage_pct, debug_png = self._detect(frame)
+                detections = self._detect(frame)
                 with self._lock:
                     self._detections = detections
-                    self._line_coverage_pct = line_coverage_pct
-                    self._object_coverage_pct = object_coverage_pct
-                    self._debug_png = debug_png
             elapsed = time.monotonic() - start
             time.sleep(max(0.0, interval - elapsed))
 
     def _detect(self, frame):
         frame_height_px, frame_width_px = frame.shape[:2]
 
-        # Crop CANCELLED -- process the full frame instead of the
-        # min_distance_cm-max_distance_cm band. roi_top stays 0 so the
-        # rest of the pipeline (which still adds roi_top back to get
-        # full-frame Y coordinates) needs no other changes.
-        roi_top = 0
-        roi = frame
+        # Crop to ONLY the min_distance_cm-max_distance_cm band before doing
+        # any real work: rows below the near line (closer than
+        # min_distance_cm) and rows above the far line (farther than
+        # max_distance_cm) are both cut, which shrinks the processed pixel
+        # area (cheaper) and means any contour findContours can even see is
+        # already guaranteed to overlap the band.
+        roi_bottom = self.rangefinder.row_for_distance(self.min_distance_cm, frame_height_px)
+        roi_top = self.rangefinder.row_for_distance(self.max_distance_cm, frame_height_px)
+        roi_bottom = frame_height_px if roi_bottom is None else int(roi_bottom)
+        roi_top = 0 if roi_top is None else int(roi_top)
+        roi_top = max(0, min(roi_top, frame_height_px))
+        roi_bottom = max(roi_top + 1, min(roi_bottom, frame_height_px))
+        roi = frame[roi_top:roi_bottom, :]
 
-        # Downscale before the HSV mask/Canny -- cheap, and the debug
-        # frame is served at this resolution too (no need to upscale it
-        # back).
-        scale = self.get_downscale()
-        small = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale != 1.0 else roi
-        inv_scale = 1.0 / scale
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.dilate(cv2.Canny(blurred, 50, 150), None, iterations=1)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Black/white LINE color segmentation -- still computed (as
-        # line_coverage_pct, a tuning/debug stat), but NO LONGER applied
-        # to erase edges before the vertical-line search. Confirmed with
-        # a real cv2 test: a dark leg/pillar (which is exactly what
-        # black_value_max is tuned to reject as floor tape) got wiped
-        # from the edge map entirely before the vertical search ever
-        # ran -- this is precisely the bug testing at black_value_max=0
-        # exposed. Floor tape doesn't need a color-based veto here
-        # anyway: a real painted line is short and wide, while the
-        # vertical shape filter below (top-anchored, tall, thin) already
-        # rejects that shape on its own, so color-based erasure was only
-        # ever hurting real vertical obstacles.
-        hsv_small = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-        sat = hsv_small[..., 1]
-        val = hsv_small[..., 2]
-        black_value_max = self.get_black_value_max()
-        white_sat_max = self.get_white_sat_max()
-        white_value_min = self.get_white_value_min()
-        line_mask = (val < black_value_max) | ((sat < white_sat_max) & (val > white_value_min))
-        line_pixel_count = int(line_mask.sum())
-        total_pixel_count = line_mask.shape[0] * line_mask.shape[1]
-        line_coverage_pct = (line_pixel_count / total_pixel_count) * 100.0 if total_pixel_count > 0 else 0.0
-
-        # Plain Canny edges -- full, unfiltered by color. The
-        # vertical-line SHAPE filter below is what separates real
-        # pillars/legs from floor clutter, not a color veto.
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        # A lighter blur + lower Canny thresholds than a first pass here
-        # -- GaussianBlur(5,5) + Canny(50,150) smoothed real obstacle
-        # edges (moderate-contrast, e.g. a ~40-gray-level step) below
-        # the low threshold entirely on the already-downscaled frame,
-        # confirmed with a real cv2 test (0 edges found for an obstacle
-        # that should produce hundreds). (3,3) + Canny(30,90) still
-        # rejects sensor noise while actually detecting real edges.
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-        edges = cv2.Canny(blurred, 30, 90)
-
-        # VERTICAL-LINE pattern match: a small vertical morphological
-        # CLOSE bridges minor gaps in an otherwise-continuous vertical
-        # edge first (a real leg/pillar edge can have small breaks from
-        # noise/blur that would otherwise split it into several short
-        # fragments).
-        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, DETECTION_VERTICAL_CLOSE_KSIZE))
-        vertical_edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, vertical_kernel)
-
-        contours, _ = cv2.findContours(vertical_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        small_height_px, small_width_px = vertical_edges.shape[:2]
-        top_margin_px = DETECTION_VERTICAL_TOP_MARGIN_FRACTION * small_height_px
-        max_width_px = DETECTION_VERTICAL_MAX_WIDTH_FRACTION * small_width_px
-        min_distance_cm = DETECTION_OBJECT_MIN_DISTANCE_CM
-        max_distance_cm = DETECTION_OBJECT_MAX_DISTANCE_CM
-
+        min_width_px = self.get_min_width_fraction() * frame_width_px
+        circularity_threshold = self.get_circularity_threshold()
+        min_contour_area = self.get_min_contour_area()
         detections = []
-        total_object_area = 0.0
         for c in contours:
-            x_roi, y_roi, w, h = cv2.boundingRect(c)
-            # Shape filter: starts near the TOP of the frame, thin
-            # enough to be a leg/pillar edge rather than a wide box. How
-            # TALL it needs to be isn't a separate arbitrary threshold --
-            # it falls out of the foot-distance condition below.
-            if y_roi > top_margin_px or w > max_width_px:
+            area = cv2.contourArea(c)
+            if area < min_contour_area:
                 continue
+            # x, y are relative to the ROI's own top-left -- the crop trims
+            # rows off BOTH top and bottom, so y must be shifted back by
+            # roi_top to get full-frame coordinates (x is unaffected, only
+            # rows were cropped).
+            x, y_roi, w, h = cv2.boundingRect(c)
+            if w < min_width_px:
+                continue  # not wide enough to be the "big obstacle" we care about
+            perimeter = cv2.arcLength(c, True)
+            if perimeter <= 0:
+                continue
+            circularity = 4.0 * math.pi * area / (perimeter * perimeter)
+            if circularity > circularity_threshold:
+                continue  # round -- likely a ball even at this size, skip
 
-            x_roi *= inv_scale
-            y_roi *= inv_scale
-            w *= inv_scale
-            h *= inv_scale
-            x, y = x_roi, y_roi + roi_top  # full-FRAME coordinates from here on
-
-            # The line's LOWEST point is its floor-contact point --
-            # convert to a real-world distance and apply the safety
-            # filter: outside [min_distance_cm, max_distance_cm], the
-            # estimate is untrusted and the whole detection is dropped.
+            y = y_roi + roi_top
             distance_cm = self.rangefinder.distance_for_row(y + h, frame_height_px)
-            if distance_cm is None or not (min_distance_cm <= distance_cm <= max_distance_cm):
-                continue
-
-            total_object_area += w * h
+            # Center bearing for display/legacy use, plus left/right edge
+            # bearings so the pinned obstacle can cover the box's actual
+            # lateral footprint, not just a single point.
             bearing_deg = self.rangefinder.bearing_deg_for_column(x + w / 2.0, frame_width_px, frame_height_px)
             left_bearing_deg = self.rangefinder.bearing_deg_for_column(x, frame_width_px, frame_height_px)
             right_bearing_deg = self.rangefinder.bearing_deg_for_column(x + w, frame_width_px, frame_height_px)
@@ -932,80 +794,48 @@ class ObstacleDetector:
                                 'left_bearing_deg': left_bearing_deg,
                                 'right_bearing_deg': right_bearing_deg})
 
-        frame_area = float(frame_height_px * frame_width_px)
-        object_coverage_pct = (total_object_area / frame_area) * 100.0 if frame_area > 0 else 0.0
-
-        # Debug frame for /debug_feed: the vertical-closed edge map (post
-        # line-erasure) -- the actual signal the vertical-line search
-        # runs on, so you should see continuous vertical lines for real
-        # pillars/legs but no black/white line edges. PNG (lossless),
-        # NOT JPEG -- see notebook_debug.txt: JPEG's block-based DCT
-        # compression bleeds erased regions back into visibility on
-        # decode. The frame here is tiny (downscaled) and served at
-        # DETECTION_FPS, not CAMERA_FPS, so PNG's extra size doesn't
-        # matter.
-        debug_png = None
-        ok, buf = cv2.imencode('.png', cv2.cvtColor(vertical_edges, cv2.COLOR_GRAY2BGR))
-        if ok:
-            debug_png = buf.tobytes()
-
-        return detections, line_coverage_pct, object_coverage_pct, debug_png
+        return detections
 
     def get_detections(self):
         with self._lock:
             return list(self._detections)
 
-    def get_debug_frame(self):
-        """Latest processed frame, PNG-encoded (lossless -- see _detect),
-        for the /debug_feed stream -- or None before the first detection
-        cycle. This is the vertical-closed Canny edge map with
-        black/white line edges already erased (see class docstring), so
-        you should see continuous vertical edge lines for real
-        pillars/legs but no line edges."""
-        with self._lock:
-            return self._debug_png
-
 
 class ObstacleWatcher:
-    """Safety supervisor bridging ObstacleDetector's obstacle-candidate
-    signal and GridNavNode's map-aware cell-confirmation flow.
+    """Safety supervisor bridging ObstacleDetector's vision output and
+    GridNavNode's motion planner -- glitch protection for obstacle
+    confirmation.
 
-    PAUSED right now: ObstacleDetector is being rebuilt from scratch
-    (currently only does step 1 -- black/white line rejection, see its
-    docstring) and doesn't produce an obstacle-candidate signal yet, so
-    _is_candidate() always returns False here -- no hold ever starts,
-    no cell ever gets pinned. The rest of this class (hold/confirm-count
-    timing, per-cell state machine, enabled toggle) is left intact and
-    wired up, ready for a real candidate signal once detection is built
-    back on top of the cleaned/line-free frame.
+    A single detection tick could easily be a glitch (motion blur,
+    lighting flicker, a passing shadow), so nothing gets pinned into the
+    A* obstacle map off one frame. Instead:
 
-    Logic each tick (once a real candidate signal exists again):
-      Identify the FRONT CELL (the world grid cell directly ahead of the
-      robot right now -- node.get_front_cell()) and check its map status
-      (node.get_cell_status()) BEFORE doing anything else:
-        - DONE + CLEAR  -> nothing to do, keep driving normally.
-        - DONE + OBSTACLE -> already known/pinned into the A* map
-          (avoidance already handled by planning), nothing to do here.
-        - NOT_DONE -> this is the only case that does any work:
-          evaluate _is_candidate(). A single candidate frame is NOT
-          enough (could be a glitch), so:
-            1. The first candidate frame while driving toward a
-               NOT_DONE front cell HOLDS the robot (stops, freezes the
-               current leg) for hold_duration_s seconds.
-            2. Every tick during the hold where _is_candidate() is still
-               true increments a hit counter.
-            3. When the hold window ends: if hit_count reached
-               confirm_count, the cell is confirmed OBSTACLE -- pinned
-               into node.obstacles (so A* avoids it) and the goal is
-               replanned. Otherwise the cell is confirmed CLEAR. Either
-               way the cell becomes DONE and is never re-processed.
+      1. The first tick that sees ANY obstacle while the robot is
+         actively driving immediately HOLDS it (stops, freezes the
+         current leg mid-flight) for hold_duration_s seconds.
+      2. Every detection tick during that hold increments a hit counter.
+      3. When the hold window ends: if the hit count reached
+         confirm_count, the obstacle is real -- pin its world cell(s)
+         into the node's A* obstacle map and re-submit the current goal
+         so it replans around them. If not, treat it as a glitch: clear
+         the hold and let the interrupted leg resume exactly where it
+         left off.
 
-    hold_duration_s and confirm_count are live-adjustable from the GUI
-    (unchanged from before), and the whole watcher can be toggled on/off
-    (enabled) -- when disabled, detection/streaming keep running for
-    display, but no holds are ever started (and any in-progress hold is
-    released immediately). Runs its own background thread polling the
-    detector at DETECTION_FPS.
+    A confirmed/pinned obstacle stays in the map permanently (it's just
+    added to node.obstacles) -- but critically, a NEW hold is only
+    started if at least one of the currently-seen detection's cells is
+    NOT already pinned. Without this check, the same real, already-mapped
+    obstacle would keep re-triggering a fresh 5-second stop every time it
+    re-enters the camera's view (e.g. while executing nearby legs of the
+    replanned route), which looked like "still glitching" even though the
+    obstacle itself was already correctly known.
+
+    Both hold_duration_s and confirm_count are live-adjustable from the
+    GUI, and the whole watcher can be toggled on/off (enabled) -- when
+    disabled, detection/streaming keep running for display, but no holds
+    are ever started (and any in-progress hold is released immediately).
+    Runs its own background thread polling the detector at DETECTION_FPS
+    (no point checking faster than new detections arrive).
     """
 
     def __init__(self, node: 'GridNavNode', detector: ObstacleDetector,
@@ -1021,7 +851,7 @@ class ObstacleWatcher:
         self._holding = False
         self._hold_start = 0.0
         self._hit_count = 0
-        self._hold_cell = None   # the front cell this hold is evaluating
+        self._accumulated_cells = set()
 
         self._running = False
         self._thread = None
@@ -1068,12 +898,6 @@ class ObstacleWatcher:
             self._tick()
             time.sleep(interval)
 
-    def _is_candidate(self):
-        # PAUSED -- see class docstring. ObstacleDetector doesn't produce
-        # an obstacle-candidate signal yet (currently line-rejection
-        # only), so no hold ever starts until this is wired back up.
-        return False
-
     def _tick(self):
         with self._lock:
             enabled = self.enabled
@@ -1081,53 +905,73 @@ class ObstacleWatcher:
         if not enabled:
             return
 
+        detections = self.detector.get_detections()
+        obstacle_seen = len(detections) > 0
+
         if not holding:
-            front_cell = self.node.get_front_cell()
-            if front_cell is None or not self.node.is_driving():
-                return
-            # DONE (either CLEAR or OBSTACLE) -- already resolved, nothing
-            # to do: CLEAR needs no action, OBSTACLE is already pinned and
-            # handled by A* planning.
-            if self.node.get_cell_status(front_cell) != 'NOT_DONE':
-                return
-            if self._is_candidate():
-                with self._lock:
-                    self._holding = True
-                    self._hold_start = time.monotonic()
-                    self._hit_count = 1
-                    self._hold_cell = front_cell
-                self.node.set_obstacle_hold(True)
+            if obstacle_seen and self.node.is_driving():
+                # Only start a new hold if something here isn't already
+                # pinned -- otherwise a known, already-mapped obstacle
+                # would keep re-triggering stops every time it re-enters
+                # the camera's view.
+                has_new_cell = any(
+                    not self.node.is_cell_pinned(cell)
+                    for det in detections
+                    for cell in self.node.detection_cells(det)
+                )
+                if has_new_cell:
+                    seed_cells = set()
+                    for det in detections:
+                        seed_cells.update(self.node.detection_cells(det))
+                    with self._lock:
+                        self._holding = True
+                        self._hold_start = time.monotonic()
+                        self._hit_count = 1
+                        self._accumulated_cells = seed_cells
+                    self.node.set_obstacle_hold(True)
             return
 
-        if self._is_candidate():
+        if obstacle_seen:
+            # Accumulate cells across the WHOLE hold, not just whatever the
+            # final tick happens to see -- a single missed tick right at
+            # the end (motion blur, a flicker) used to mean nothing got
+            # pinned even after enough earlier ticks confirmed it. Now the
+            # union of every tick's cells during the hold is what gets
+            # pinned, so one bad frame at the end can't erase the whole
+            # confirmation.
+            new_cells = set()
+            for det in detections:
+                new_cells.update(self.node.detection_cells(det))
             with self._lock:
                 self._hit_count += 1
+                self._accumulated_cells.update(new_cells)
 
         with self._lock:
             elapsed = time.monotonic() - self._hold_start
             hold_duration_s = self.hold_duration_s
             hit_count = self._hit_count
             confirm_count = self.confirm_count
-            hold_cell = self._hold_cell
+            accumulated_cells = set(self._accumulated_cells)
 
         if elapsed >= hold_duration_s:
-            if hit_count >= confirm_count:
-                self.node.set_cell_status(hold_cell, 'OBSTACLE')
-                if self.node.pin_cells([hold_cell]):
-                    self.node.replan_current_goal()
-            else:
-                self.node.set_cell_status(hold_cell, 'CLEAR')
+            if hit_count >= confirm_count and accumulated_cells:
+                self._confirm_and_replan(accumulated_cells)
             with self._lock:
                 self._holding = False
-                self._hold_cell = None
+                self._accumulated_cells = set()
             self.node.set_obstacle_hold(False)
 
+    def _confirm_and_replan(self, cells):
+        pinned = self.node.pin_cells(cells)
+        if pinned:
+            self.node.replan_current_goal()
+
     def get_candidate_cells(self):
-        """The single front cell currently being evaluated (mid-hold), as
-        a list for GUI compatibility -- lets the GUI show a stable
-        'being confirmed' box for the whole hold window."""
+        """Cells accumulated so far during an in-progress hold -- lets the
+        GUI show a stable 'being confirmed' box for the whole hold window
+        instead of a flickering per-tick marker."""
         with self._lock:
-            return [self._hold_cell] if self._hold_cell is not None else []
+            return list(self._accumulated_cells)
 
     def get_status(self):
         with self._lock:
@@ -1234,14 +1078,6 @@ class GridNavNode(Node):
         # separately purely so the GUI can draw them solid red/distinctly
         # from manually-toggled cells.
         self.pinned_cells = set()
-
-        # Map-aware cell validation (ObstacleWatcher's area-density
-        # confirmation flow): (i, j) -> 'CLEAR' | 'OBSTACLE'. A cell
-        # missing from this dict is implicitly NOT_DONE (never checked).
-        # Once a cell is DONE (either value present), it's never
-        # re-processed -- see get_front_cell()/get_cell_status().
-        self.cell_status = {}
-
         self.planned_path = []       # [(x_cm, y_cm), ...] cell centers of the last A* route, for GUI overlay
 
         # Step mode: pause fully after each STEP_SIZE_CM of DRIVE travel
@@ -1547,72 +1383,11 @@ class GridNavNode(Node):
         with self._lock:
             return self.state == 'RUNNING' and not self.awaiting_continue and not self.obstacle_hold
 
-    def get_front_cell(self):
-        """The single world grid cell directly ahead of the robot's
-        CURRENT position and heading, one GRID_SPACING_CM step forward.
-        Used by ObstacleWatcher's map-aware confirmation flow to decide
-        which cell a NOT_DONE observation should be attributed to.
-        Returns None if heading isn't known yet."""
-        with self._lock:
-            if self.heading_ref is None or self.current_yaw is None:
-                return None
-            heading_deg = math.degrees(angle_diff(self.current_yaw, self.heading_ref))
-            rad = math.radians(heading_deg)
-            front_x = self.x + GRID_SPACING_CM * math.cos(rad)
-            front_y = self.y + GRID_SPACING_CM * math.sin(rad)
-            return self._to_cell(front_x, front_y)
-
-    def get_cell_status(self, cell):
-        """'NOT_DONE' (never checked), 'CLEAR' (checked, no obstacle), or
-        'OBSTACLE' (checked, confirmed obstacle) -- see cell_status."""
-        with self._lock:
-            return self.cell_status.get(cell, 'NOT_DONE')
-
-    def set_cell_status(self, cell, status):
-        """Mark a cell DONE with the given result ('CLEAR' or
-        'OBSTACLE'). Once set, get_front_cell()/get_cell_status() callers
-        should not re-process this cell."""
-        with self._lock:
-            self.cell_status[cell] = status
-
     def set_obstacle_hold(self, hold: bool):
         with self._lock:
             self.obstacle_hold = hold
-            if hold:
-                self._commit_live_position_locked()
         if hold:
             self.stop_robot()
-
-    def _commit_live_position_locked(self):
-        """Caller must hold self._lock. self.x/self.y are normally only
-        updated when a 'move' leg fully COMPLETES (see control_loop's
-        DRIVE phase) -- while mid-leg they still hold the position from
-        when the leg STARTED, even though the robot has actually
-        traveled leg_progress_cm further by now (that live distance is
-        tracked separately, only surfaced to the GUI via get_snapshot()'s
-        display_x/display_y). Called when an obstacle hold begins so that
-        pin_obstacle_box_from_detection/replan_current_goal reason about
-        the robot's TRUE current position -- without this, a hold
-        triggered mid-drive would pin the obstacle and replan from a
-        stale, pre-leg position, potentially routing the "avoidance"
-        path right past the obstacle's actual real-world location."""
-        if self.state != 'RUNNING' or self.phase != 'DRIVE' or not self.legs:
-            return
-        if self.legs[self.leg_idx][0] != 'move':
-            return
-        self.x = self.leg_start_x + self.leg_unit_dx * self.leg_progress_cm
-        self.y = self.leg_start_y + self.leg_unit_dy * self.leg_progress_cm
-        # Shrink the remaining distance on this leg to match, so if this
-        # turns out to be a glitch (no replan) and the SAME leg just
-        # resumes, it still ends at the original target point instead of
-        # overshooting by however much was already covered before the
-        # hold.
-        self.leg_target_distance_cm -= self.leg_progress_cm
-        self.leg_start_x = self.x
-        self.leg_start_y = self.y
-        self.leg_progress_cm = 0.0
-        self.leg_boxes_crossed = 0
-        self.leg_baseline_pulses = self.last_pulses
 
     def detection_cells(self, detection):
         """Compute the world grid cells a camera detection's box would
@@ -1869,16 +1644,12 @@ HTML_PAGE = """<!doctype html>
     </form>
     <div class="stat-box wide"><div class="k">Tilt / Crosshair Distance</div><div class="v" id="s-cam">not calibrated</div></div>
     <form id="detectSizeForm">
-      <div class="row"><label>Black V Max (0-255)</label><input id="detectBlackVMax" type="number" value="90" step="1" min="0" max="255"></div>
-      <div class="row"><label>White S Max (0-255)</label><input id="detectWhiteSMax" type="number" value="40" step="1" min="0" max="255"></div>
-      <div class="row"><label>White V Min (0-255)</label><input id="detectWhiteVMin" type="number" value="200" step="1" min="0" max="255"></div>
+      <div class="row"><label>Min Obstacle Width (% of frame)</label><input id="detectSizePct" type="number" value="50" step="1" min="1" max="100"></div>
+      <div class="row"><label>Roundness Threshold (0-1, higher = stricter ball filter)</label><input id="detectCircularity" type="number" value="0.78" step="0.01" min="0.01" max="1"></div>
+      <div class="row"><label>Min Contour Area (px²)</label><input id="detectMinArea" type="number" value="1500" step="50" min="1"></div>
       <button type="submit">Set Detection Params</button>
     </form>
-    <div class="stat-box wide"><div class="k">Line / Object Coverage (%)</div><div class="v" id="s-detect-size">--</div></div>
-    <div class="stat-box wide"><div class="k">Front Cell Status</div><div class="v" id="s-front-cell">--</div></div>
-    <div class="k">Detection Debug (edge map, line edges erased)</div>
-    <img id="debugFeed" src="/debug_feed" alt="detection debug feed"
-         onerror="this.replaceWith(Object.assign(document.createElement('div'), {textContent: 'Debug feed unavailable', style: 'color:#999; padding:12px; border:1px solid #444; border-radius:4px;'}))">
+    <div class="stat-box wide"><div class="k">Detection Params</div><div class="v" id="s-detect-size">--</div></div>
   </div>
   <div class="right">
     <canvas id="canvas" width="__CANVAS_PX__" height="__CANVAS_PX__"></canvas>
@@ -2289,10 +2060,9 @@ async function pollDetections() {
 
       container.appendChild(box);
     }
-    if (ds.line_coverage_pct !== null && ds.line_coverage_pct !== undefined) {
-      const obj = (ds.object_coverage_pct === null || ds.object_coverage_pct === undefined)
-            ? '?' : ds.object_coverage_pct.toFixed(1);
-      set('s-detect-size', `${ds.line_coverage_pct.toFixed(1)}% / ${obj}%`);
+    if (ds.min_width_fraction !== null && ds.min_width_fraction !== undefined) {
+      set('s-detect-size', `width>${(ds.min_width_fraction * 100).toFixed(0)}%, `
+            + `round<${ds.circularity_threshold.toFixed(2)}, area>${ds.min_contour_area.toFixed(0)}px²`);
     } else {
       set('s-detect-size', 'n/a (no camera)');
     }
@@ -2303,16 +2073,16 @@ async function pollDetections() {
 
 document.getElementById('detectSizeForm').addEventListener('submit', async (ev) => {
   ev.preventDefault();
-  const blackVMax = parseFloat(document.getElementById('detectBlackVMax').value);
-  const whiteSMax = parseFloat(document.getElementById('detectWhiteSMax').value);
-  const whiteVMin = parseFloat(document.getElementById('detectWhiteVMin').value);
+  const pct = parseFloat(document.getElementById('detectSizePct').value);
+  const circularity = parseFloat(document.getElementById('detectCircularity').value);
+  const minArea = parseFloat(document.getElementById('detectMinArea').value);
   await fetch('/api/detection_settings', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
-      black_value_max: blackVMax,
-      white_sat_max: whiteSMax,
-      white_value_min: whiteVMin
+      min_width_fraction: pct / 100,
+      circularity_threshold: circularity,
+      min_contour_area: minArea
     })
   });
 });
@@ -2330,11 +2100,6 @@ async function pollObstacleWatch() {
       set('s-obwatch', `HOLDING -- ${ow.hit_count}/${ow.confirm_count} confirmations, ${ow.remaining_s.toFixed(1)}s left`);
     } else {
       set('s-obwatch', `clear (hold=${ow.hold_duration_s}s, confirm=${ow.confirm_count})`);
-    }
-    if (ow.front_cell) {
-      set('s-front-cell', `(${ow.front_cell[0]}, ${ow.front_cell[1]}) -- ${ow.front_cell_status}`);
-    } else {
-      set('s-front-cell', 'n/a');
     }
   } catch (e) {
     set('s-obwatch', 'connection lost');
@@ -2414,22 +2179,6 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
 
         return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-    @app.route('/debug_feed')
-    def debug_feed():
-        if detector is None:
-            return Response('Detector not available', status=503)
-
-        def gen():
-            interval = 1.0 / DETECTION_FPS
-            while True:
-                png = detector.get_debug_frame()
-                if png is not None:
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/png\r\n\r\n' + png + b'\r\n')
-                time.sleep(interval)
-
-        return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
     @app.route('/api/camera_calibrate', methods=['POST'])
     def api_camera_calibrate():
         data = request.get_json(force=True)
@@ -2457,8 +2206,9 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
             'frame_width': CAMERA_WIDTH,
             'frame_height': CAMERA_HEIGHT,
             'detections': detector.get_detections() if detector is not None else [],
-            'line_coverage_pct': detector.get_line_coverage() if detector is not None else None,
-            'object_coverage_pct': detector.get_object_coverage() if detector is not None else None,
+            'min_width_fraction': detector.get_min_width_fraction() if detector is not None else None,
+            'circularity_threshold': detector.get_circularity_threshold() if detector is not None else None,
+            'min_contour_area': detector.get_min_contour_area() if detector is not None else None,
         })
 
     @app.route('/api/detection_settings', methods=['POST'])
@@ -2467,19 +2217,19 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
             return jsonify({'ok': False, 'error': 'no detector running (camera unavailable)'}), 400
         data = request.get_json(force=True)
         ok = True
-        if 'black_value_max' in data:
+        if 'min_width_fraction' in data:
             try:
-                ok = detector.set_black_value_max(float(data['black_value_max'])) and ok
+                ok = detector.set_min_width_fraction(float(data['min_width_fraction'])) and ok
             except (TypeError, ValueError):
                 ok = False
-        if 'white_sat_max' in data:
+        if 'circularity_threshold' in data:
             try:
-                ok = detector.set_white_sat_max(float(data['white_sat_max'])) and ok
+                ok = detector.set_circularity_threshold(float(data['circularity_threshold'])) and ok
             except (TypeError, ValueError):
                 ok = False
-        if 'white_value_min' in data:
+        if 'min_contour_area' in data:
             try:
-                ok = detector.set_white_value_min(float(data['white_value_min'])) and ok
+                ok = detector.set_min_contour_area(float(data['min_contour_area'])) and ok
             except (TypeError, ValueError):
                 ok = False
         if not ok:
@@ -2493,9 +2243,6 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
         status = watcher.get_status()
         status['active'] = True
         status['candidate_cells'] = [list(c) for c in watcher.get_candidate_cells()]
-        front_cell = node.get_front_cell()
-        status['front_cell'] = list(front_cell) if front_cell is not None else None
-        status['front_cell_status'] = node.get_cell_status(front_cell) if front_cell is not None else None
         return jsonify(status)
 
     @app.route('/api/obstacle_watch_settings', methods=['POST'])
