@@ -223,6 +223,14 @@ GUIDE_DISTANCES_CM = [50, 100, 150, 200, 250, 300]
 # CameraRangefinder's distance-per-row mapping.
 DETECTION_FPS = 5.0                     # detection is heavier than streaming; runs at its own slower rate
 
+# GaussianBlur applied to the grayscale frame before Canny -- smooths
+# sensor noise that would otherwise register as spurious edges. Kernel
+# size (odd, e.g. 3/5/7/9 -- larger = smoother/more noise rejection but
+# also more real-edge softening, which can lose a thin/low-contrast
+# leg/pillar edge entirely; see notebook_debug.txt for a confirmed case
+# of exactly that with too aggressive a blur). GUI/API-adjustable.
+DETECTION_BLUR_KSIZE = 3
+
 # Ignore black/white straight line markings (floor tape, tile grout
 # seams, thresholds) via HSV color segmentation, applied to the EDGE MAP
 # before the vertical-line search runs: any Canny edge pixel that falls
@@ -684,8 +692,11 @@ class ObstacleDetector:
 
     1. Compute plain Canny edges on the full frame (the distance-band
        crop was tried and cancelled -- see notebook_debug.txt),
-       downscaled by `downscale`. A small vertical morphological CLOSE
-       bridges minor gaps first, so a real leg/pillar's otherwise-
+       downscaled by `downscale`, GaussianBlur'd first (blur_ksize,
+       GUI/API-adjustable -- larger = more sensor-noise rejection but
+       also more real-edge softening, which can lose a thin/low-
+       contrast leg/pillar edge entirely). A small vertical morphological
+       CLOSE bridges minor gaps first, so a real leg/pillar's otherwise-
        continuous edge isn't split into several short fragments by
        noise/blur breaks -- "strong/continuous edge lines."
     2. Find each edge line that starts near the TOP of the frame (within
@@ -737,6 +748,7 @@ class ObstacleDetector:
                  black_value_max=DETECTION_BLACK_VALUE_MAX,
                  white_sat_max=DETECTION_WHITE_SAT_MAX,
                  white_value_min=DETECTION_WHITE_VALUE_MIN,
+                 blur_ksize=DETECTION_BLUR_KSIZE,
                  downscale=DETECTION_DOWNSCALE):
         self.camera = camera
         self.rangefinder = rangefinder
@@ -746,6 +758,7 @@ class ObstacleDetector:
         self._black_value_max = black_value_max
         self._white_sat_max = white_sat_max
         self._white_value_min = white_value_min
+        self._blur_ksize = blur_ksize
         self._downscale = downscale
 
         self._lock = threading.Lock()
@@ -798,6 +811,25 @@ class ObstacleDetector:
     def get_white_value_min(self):
         with self._settings_lock:
             return self._white_value_min
+
+    def set_blur_ksize(self, ksize):
+        """Live-adjustable -- GaussianBlur kernel size applied before
+        Canny (odd positive integer, e.g. 3/5/7/9). An even value is
+        rounded up to the next odd one (OpenCV requires odd kernel
+        dimensions). Larger = smoother/more noise rejection but also
+        more real-edge softening."""
+        ksize = int(ksize)
+        if ksize <= 0:
+            return False
+        if ksize % 2 == 0:
+            ksize += 1
+        with self._settings_lock:
+            self._blur_ksize = ksize
+        return True
+
+    def get_blur_ksize(self):
+        with self._settings_lock:
+            return self._blur_ksize
 
     def get_line_coverage(self):
         """Latest frame's % of ROI pixels classified as a black/white
@@ -897,14 +929,16 @@ class ObstacleDetector:
         # vertical-line SHAPE filter below is what separates real
         # pillars/legs from floor clutter, not a color veto.
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        # A lighter blur + lower Canny thresholds than a first pass here
-        # -- GaussianBlur(5,5) + Canny(50,150) smoothed real obstacle
-        # edges (moderate-contrast, e.g. a ~40-gray-level step) below
-        # the low threshold entirely on the already-downscaled frame,
-        # confirmed with a real cv2 test (0 edges found for an obstacle
-        # that should produce hundreds). (3,3) + Canny(30,90) still
-        # rejects sensor noise while actually detecting real edges.
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+        # A lighter default blur + lower Canny thresholds than a first
+        # pass here -- GaussianBlur(5,5) + Canny(50,150) smoothed real
+        # obstacle edges (moderate-contrast, e.g. a ~40-gray-level step)
+        # below the low threshold entirely on the already-downscaled
+        # frame, confirmed with a real cv2 test (0 edges found for an
+        # obstacle that should produce hundreds). (3,3) + Canny(30,90)
+        # still rejects sensor noise while actually detecting real
+        # edges. blur_ksize is live-adjustable -- see set_blur_ksize().
+        blur_ksize = self.get_blur_ksize()
+        blurred = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
         edges = cv2.Canny(blurred, 30, 90)
 
         # VERTICAL-LINE pattern match: a small vertical morphological
@@ -1924,6 +1958,7 @@ HTML_PAGE = """<!doctype html>
       <div class="row"><label>Black V Max (0-255)</label><input id="detectBlackVMax" type="number" value="90" step="1" min="0" max="255"></div>
       <div class="row"><label>White S Max (0-255)</label><input id="detectWhiteSMax" type="number" value="40" step="1" min="0" max="255"></div>
       <div class="row"><label>White V Min (0-255)</label><input id="detectWhiteVMin" type="number" value="200" step="1" min="0" max="255"></div>
+      <div class="row"><label>Blur Kernel Size (odd, e.g. 3/5/7)</label><input id="detectBlurKsize" type="number" value="3" step="2" min="1" max="21"></div>
       <button type="submit">Set Detection Params</button>
     </form>
     <div class="stat-box wide"><div class="k">Line / Object Coverage (%)</div><div class="v" id="s-detect-size">--</div></div>
@@ -2322,13 +2357,15 @@ document.getElementById('detectSizeForm').addEventListener('submit', async (ev) 
   const blackVMax = parseFloat(document.getElementById('detectBlackVMax').value);
   const whiteSMax = parseFloat(document.getElementById('detectWhiteSMax').value);
   const whiteVMin = parseFloat(document.getElementById('detectWhiteVMin').value);
+  const blurKsize = parseInt(document.getElementById('detectBlurKsize').value, 10);
   await fetch('/api/detection_settings', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       black_value_max: blackVMax,
       white_sat_max: whiteSMax,
-      white_value_min: whiteVMin
+      white_value_min: whiteVMin,
+      blur_ksize: blurKsize
     })
   });
 });
@@ -2495,6 +2532,11 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
         if 'white_value_min' in data:
             try:
                 ok = detector.set_white_value_min(float(data['white_value_min'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if 'blur_ksize' in data:
+            try:
+                ok = detector.set_blur_ksize(int(data['blur_ksize'])) and ok
             except (TypeError, ValueError):
                 ok = False
         if not ok:
