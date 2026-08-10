@@ -39,10 +39,17 @@ GUI:
   heading in degrees, for debugging the IMU. A live MJPEG feed from a
   USB webcam (see CAMERA_DEVICE_INDEX) is also shown, if available, with
   a backup-camera-style distance HUD (see CameraRangefinder) and live
-  obstacle detection boxes (see ObstacleDetector) drawn over it -- big,
-  blocky/angular objects are flagged as obstacles; small and/or round
-  objects (tennis balls -- what this robot collects, not avoids) are
-  filtered out by size and shape.
+  obstacle detection boxes (see ObstacleDetector) drawn over it -- a
+  top-anchored vertical edge (a leg or pillar) whose floor-contact point
+  falls between the 50cm and 100cm VFOV lines is flagged as a detection.
+  NOTE: detection is NOT currently wired into avoidance -- ObstacleWatcher
+  (the safety supervisor that would hold the robot and pin a confirmed
+  detection into the A* obstacle map) is deliberately PAUSED right now
+  (see its docstring) while detection itself is still being tuned. The
+  GUI's "Obstacle Avoidance Enabled" toggle and detection boxes are live,
+  but nothing gets pinned/avoided automatically yet -- obstacles still
+  need to be added manually (click a grid cell) for A* to route around
+  them.
 
   Open it from any browser on the same network:
       http://<pi5-ip-address>:8080
@@ -240,15 +247,16 @@ DETECTION_BLACK_VALUE_MAX = 90      # 0-255 HSV V; below this = "black"
 DETECTION_WHITE_SAT_MAX = 40        # 0-255 HSV S; below this (AND V above WHITE_VALUE_MIN) = "white"
 DETECTION_WHITE_VALUE_MIN = 200     # 0-255 HSV V; above this (AND S below WHITE_SAT_MAX) = "white"
 
-# VERTICAL-LINE obstacle condition -- exactly two parts, per spec:
+# VERTICAL-LINE obstacle condition:
 #   1. The edge must extend from near the top of the frame downward --
 #      it starts within the top VERTICAL_TOP_MARGIN_FRACTION of the
 #      downscaled frame's own height (fraction, so it scales with
 #      DETECTION_DOWNSCALE automatically).
-#   2. Its bottom endpoint (foot) must fall between the 50cm and 100cm
-#      VFOV lines -- see SAFETY DISTANCE FILTER below, which reuses the
+#   2. Its bottom endpoint (foot) must not be farther than the 100cm
+#      VFOV line -- see SAFETY DISTANCE FILTER below, which reuses the
 #      existing calibrated CameraRangefinder Y-to-distance mapping
-#      unchanged.
+#      unchanged. Nearer than the 50cm line is fine too -- it just gets
+#      clamped to 50cm rather than rejected (see below).
 # A small vertical morphological CLOSE (VERTICAL_CLOSE_KSIZE tall, in
 # downscaled pixels) bridges small gaps first, so a real leg/pillar's
 # otherwise-continuous edge isn't split into several short fragments by
@@ -259,15 +267,21 @@ DETECTION_VERTICAL_CLOSE_KSIZE = 15
 # SAFETY DISTANCE FILTER -- THE core obstacle condition: a vertical
 # line's FOOT (its lowest point, full-frame pixel row) is converted to
 # a real-world floor distance via CameraRangefinder.distance_for_row().
-# A candidate line is only accepted as a real obstacle if that foot
-# distance falls within this band -- outside it (nearer than the min or
-# farther than the max), the estimate is considered unreliable and the
-# whole detection is dropped rather than risking a false pin. Distinct
-# from the old frame-crop band (removed) -- this filters individual
-# detections by their OWN measured distance, not
-# by cropping the source frame.
-DETECTION_OBJECT_MIN_DISTANCE_CM = 50.0
-DETECTION_OBJECT_MAX_DISTANCE_CM = 100.0
+#   - Farther than DETECTION_OBJECT_MAX_DISTANCE_CM (behind the 100cm
+#     line): the estimate is considered unreliable and the whole
+#     detection is dropped -- not clamped, not reported.
+#   - Nearer than DETECTION_OBJECT_MIN_DISTANCE_CM: NOT rejected. When an
+#     obstacle is very close, its primary vertical edge tends to merge
+#     with noise near the bottom of the frame, making the exact
+#     close-range distance unreliable -- but "there's something very
+#     close" is still real signal, so instead of dropping it the
+#     reported distance is CLAMPED to DETECTION_OBJECT_MIN_DISTANCE_CM,
+#     the closest fixed value this detector will ever report.
+# Distinct from the old frame-crop band (removed) -- this filters
+# individual detections by their OWN measured distance, not by cropping
+# the source frame.
+DETECTION_OBJECT_MIN_DISTANCE_CM = 50.0    # closest reported distance -- nearer detections are clamped to this, not dropped
+DETECTION_OBJECT_MAX_DISTANCE_CM = 100.0   # farther than this (behind the 100cm line) is dropped as unreliable
 
 # Performance: this downscale factor cuts the pixel count the Canny
 # pipeline has to churn through -- keeps CPU/bandwidth low even with the
@@ -678,12 +692,18 @@ class ObstacleDetector:
        up the real-world distance it represents via
        CameraRangefinder.distance_for_row() -- the existing calibrated
        Y-to-distance mapping, not touched here.
-    4. Obstacle condition: accept only if that foot distance falls
-       within [DETECTION_OBJECT_MIN_DISTANCE_CM,
-       DETECTION_OBJECT_MAX_DISTANCE_CM] (the 50cm-100cm VFOV lines) --
-       outside that band the detection is dropped as unreliable, not
-       pinned. E.g. a leg's edge runs from the top of the frame down to
-       around the 50cm line -> detected as an obstacle at ~50cm.
+    4. Obstacle condition: accept unless that foot distance is farther
+       than DETECTION_OBJECT_MAX_DISTANCE_CM (behind the 100cm VFOV
+       line) -- then the detection is dropped as unreliable, not
+       reported. Nearer than DETECTION_OBJECT_MIN_DISTANCE_CM (the 50cm
+       line) is accepted, not dropped -- close range is where the
+       primary edge tends to merge with noise at the very bottom of the
+       frame, so rather than trust that noisy exact pixel row, the
+       reported distance is CLAMPED to DETECTION_OBJECT_MIN_DISTANCE_CM,
+       the closest fixed value ever reported. E.g. a leg's edge running
+       from the top of the frame down past the 50cm line is still
+       detected, just reported as "~50cm" rather than whatever
+       (unreliable) closer number the raw pixel row implied.
 
     Black/white LINE color segmentation (floor tape, tile grout seams)
     is still computed as line_coverage_pct, a tuning/debug stat, but is
@@ -696,10 +716,13 @@ class ObstacleDetector:
     The frame served over the live debug stream (/debug_feed, multipart
     PNG -- not JPEG, see notebook_debug.txt: JPEG's lossy block
     compression was found to bleed rejected regions back into visibility
-    on decode) is the vertical-closed edge map, so you should see the
-    vertical edge lines this detector is actually tracking. All three
-    HSV line thresholds are GUI/API-adjustable -- tune them against the
-    live debug feed.
+    on decode) is the vertical-closed edge map with a GREEN box drawn
+    around each ACCEPTED candidate (foot at or nearer than the 100cm
+    line, including near-clamped ones) -- candidates rejected for being
+    behind the 100cm line get no box at all, so what's boxed on the
+    debug feed always matches what's actually detected. All three HSV
+    line thresholds are GUI/API-adjustable -- tune them against the live
+    debug feed.
 
     Runs in its own background thread at DETECTION_FPS, reading the
     latest raw frame from a CameraStreamer.
@@ -890,6 +913,15 @@ class ObstacleDetector:
 
         contours, _ = cv2.findContours(vertical_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+        # Debug frame: the vertical-closed edge map, in color so a green
+        # box can be drawn around each ACCEPTED candidate (foot at or
+        # nearer than the 100cm line, including clamped near-range ones,
+        # see below) -- rejected candidates (behind the 100cm line) get
+        # no box at all. Drawn in this same downscaled pixel space the
+        # edges/contours are already in, so no extra scaling is needed
+        # here.
+        debug_img = cv2.cvtColor(vertical_edges, cv2.COLOR_GRAY2BGR)
+
         small_height_px = vertical_edges.shape[0]
         top_margin_px = DETECTION_VERTICAL_TOP_MARGIN_FRACTION * small_height_px
         min_distance_cm = DETECTION_OBJECT_MIN_DISTANCE_CM
@@ -903,31 +935,46 @@ class ObstacleDetector:
             #   1. The edge must extend from near the top of the frame
             #      downward (y_roi within the top margin).
             #   2. Its bottom endpoint (the foot -- checked below via
-            #      distance_for_row) must fall between the 50cm and
-            #      100cm VFOV lines.
+            #      distance_for_row) must not be behind the 100cm line.
             if y_roi > top_margin_px:
                 continue
 
-            x_roi *= inv_scale
-            y_roi *= inv_scale
-            w *= inv_scale
-            h *= inv_scale
-            x, y = x_roi, y_roi + roi_top  # full-FRAME coordinates from here on
+            x_full = x_roi * inv_scale
+            y_full = y_roi * inv_scale
+            w_full = w * inv_scale
+            h_full = h * inv_scale
+            x, y = x_full, y_full + roi_top  # full-FRAME coordinates from here on
 
             # The line's LOWEST point is its floor-contact point --
-            # convert to a real-world distance and apply the safety
-            # filter: outside [min_distance_cm, max_distance_cm], the
-            # estimate is untrusted and the whole detection is dropped.
-            distance_cm = self.rangefinder.distance_for_row(y + h, frame_height_px)
-            if distance_cm is None or not (min_distance_cm <= distance_cm <= max_distance_cm):
+            # convert to a real-world distance. Behind max_distance_cm
+            # (the 100cm line) the estimate is untrusted and the whole
+            # detection is dropped. Nearer than min_distance_cm (the
+            # 50cm line) is NOT dropped -- up close the primary edge
+            # tends to merge with noise right at the bottom of the
+            # frame, so instead of trusting that noisy exact row, the
+            # reported distance is CLAMPED to min_distance_cm, the
+            # closest fixed value this detector ever reports.
+            distance_cm = self.rangefinder.distance_for_row(y + h_full, frame_height_px)
+            accepted = distance_cm is not None and distance_cm <= max_distance_cm
+            if accepted and distance_cm < min_distance_cm:
+                distance_cm = min_distance_cm
+
+            if not accepted:
+                # Rejected for being behind the 100cm line -- no box
+                # drawn on the debug frame for these, only accepted
+                # (incl. near-clamped) candidates get one.
                 continue
 
-            total_object_area += w * h
-            bearing_deg = self.rangefinder.bearing_deg_for_column(x + w / 2.0, frame_width_px, frame_height_px)
+            # Box drawn in the debug image's own (downscaled) pixel
+            # space -- green, since only accepted candidates reach here.
+            cv2.rectangle(debug_img, (x_roi, y_roi), (x_roi + w, y_roi + h), (0, 255, 0), 2)
+
+            total_object_area += w_full * h_full
+            bearing_deg = self.rangefinder.bearing_deg_for_column(x + w_full / 2.0, frame_width_px, frame_height_px)
             left_bearing_deg = self.rangefinder.bearing_deg_for_column(x, frame_width_px, frame_height_px)
-            right_bearing_deg = self.rangefinder.bearing_deg_for_column(x + w, frame_width_px, frame_height_px)
+            right_bearing_deg = self.rangefinder.bearing_deg_for_column(x + w_full, frame_width_px, frame_height_px)
             detections.append({'label': 'obstacle', 'x': int(x), 'y': int(y),
-                                'w': int(w), 'h': int(h), 'distance_cm': distance_cm,
+                                'w': int(w_full), 'h': int(h_full), 'distance_cm': distance_cm,
                                 'bearing_deg': bearing_deg,
                                 'left_bearing_deg': left_bearing_deg,
                                 'right_bearing_deg': right_bearing_deg})
@@ -936,16 +983,17 @@ class ObstacleDetector:
         object_coverage_pct = (total_object_area / frame_area) * 100.0 if frame_area > 0 else 0.0
 
         # Debug frame for /debug_feed: the vertical-closed edge map (post
-        # line-erasure) -- the actual signal the vertical-line search
-        # runs on, so you should see continuous vertical lines for real
-        # pillars/legs but no black/white line edges. PNG (lossless),
-        # NOT JPEG -- see notebook_debug.txt: JPEG's block-based DCT
-        # compression bleeds erased regions back into visibility on
-        # decode. The frame here is tiny (downscaled) and served at
-        # DETECTION_FPS, not CAMERA_FPS, so PNG's extra size doesn't
-        # matter.
+        # line-erasure) with a green box drawn around each ACCEPTED
+        # candidate -- so you should see continuous vertical lines for
+        # real pillars/legs (boxed if within 100cm), but no black/white
+        # line edges and no box for anything rejected as too far.
+        # PNG (lossless), NOT JPEG -- see notebook_debug.txt: JPEG's
+        # block-based DCT compression bleeds erased regions back into
+        # visibility on decode. The frame here is tiny (downscaled) and
+        # served at DETECTION_FPS, not CAMERA_FPS, so PNG's extra size
+        # doesn't matter.
         debug_png = None
-        ok, buf = cv2.imencode('.png', cv2.cvtColor(vertical_edges, cv2.COLOR_GRAY2BGR))
+        ok, buf = cv2.imencode('.png', debug_img)
         if ok:
             debug_png = buf.tobytes()
 
@@ -959,9 +1007,10 @@ class ObstacleDetector:
         """Latest processed frame, PNG-encoded (lossless -- see _detect),
         for the /debug_feed stream -- or None before the first detection
         cycle. This is the vertical-closed Canny edge map with
-        black/white line edges already erased (see class docstring), so
-        you should see continuous vertical edge lines for real
-        pillars/legs but no line edges."""
+        black/white line edges already erased, PLUS a green box drawn
+        around each ACCEPTED candidate line (foot within 100cm) --
+        candidates rejected as too far get no box (see class
+        docstring)."""
         with self._lock:
             return self._debug_png
 
@@ -1068,10 +1117,16 @@ class ObstacleWatcher:
             self._tick()
             time.sleep(interval)
 
+    # PAUSED -- see class docstring. ObstacleDetector's vertical-edge
+    # detection isn't wired into a candidate signal yet, so no hold ever
+    # starts until this is flipped and _is_candidate() below does real
+    # work. Surfaced via get_status()['paused'] so the GUI can show this
+    # honestly instead of a normal-looking "clear"/enabled status that
+    # implies avoidance is active when it structurally cannot fire.
+    PAUSED = True
+
     def _is_candidate(self):
-        # PAUSED -- see class docstring. ObstacleDetector doesn't produce
-        # an obstacle-candidate signal yet (currently line-rejection
-        # only), so no hold ever starts until this is wired back up.
+        # No real candidate signal wired up yet -- see PAUSED above.
         return False
 
     def _tick(self):
@@ -1140,6 +1195,7 @@ class ObstacleWatcher:
         remaining_s = max(0.0, hold_duration_s - (time.monotonic() - hold_start)) if holding else 0.0
         return {
             'enabled': enabled,
+            'paused': self.PAUSED,
             'holding': holding,
             'hit_count': hit_count,
             'confirm_count': confirm_count,
@@ -1541,6 +1597,27 @@ class GridNavNode(Node):
 
     # ---------------- Obstacle confirmation hooks (used by ObstacleWatcher) ----------------
 
+    def _live_position_locked(self):
+        """Caller must hold self._lock. self.x/self.y are only updated
+        when a 'move' leg fully COMPLETES (see control_loop's DRIVE
+        phase) -- while mid-leg they still hold the position from when
+        the leg STARTED. This returns the true current position,
+        committed x/y plus in-progress DRIVE movement along the current
+        leg's direction. Used by get_snapshot() (so the GUI marker moves
+        in real time instead of jumping only at leg completion) and by
+        get_front_cell() (so a multi-cell leg's "cell ahead" advances as
+        the robot actually drives through it, not just once at leg
+        start -- see notebook_debug.txt for the bug this fixed: a leg
+        spanning several grid cells was only ever getting its FIRST cell
+        checked by ObstacleWatcher, since get_front_cell() used to read
+        the stale leg-start self.x/self.y directly)."""
+        x, y = self.x, self.y
+        if self.state == 'RUNNING' and self.phase == 'DRIVE' and self.legs \
+                and self.legs[self.leg_idx][0] == 'move':
+            x = self.leg_start_x + self.leg_unit_dx * self.leg_progress_cm
+            y = self.leg_start_y + self.leg_unit_dy * self.leg_progress_cm
+        return x, y
+
     def is_driving(self):
         """True if control_loop is actively working a leg right now --
         i.e. there's real motion an obstacle hold would actually interrupt."""
@@ -1549,17 +1626,19 @@ class GridNavNode(Node):
 
     def get_front_cell(self):
         """The single world grid cell directly ahead of the robot's
-        CURRENT position and heading, one GRID_SPACING_CM step forward.
-        Used by ObstacleWatcher's map-aware confirmation flow to decide
-        which cell a NOT_DONE observation should be attributed to.
-        Returns None if heading isn't known yet."""
+        CURRENT (live, not stale leg-start) position and heading, one
+        GRID_SPACING_CM step forward. Used by ObstacleWatcher's
+        map-aware confirmation flow to decide which cell a NOT_DONE
+        observation should be attributed to. Returns None if heading
+        isn't known yet."""
         with self._lock:
             if self.heading_ref is None or self.current_yaw is None:
                 return None
             heading_deg = math.degrees(angle_diff(self.current_yaw, self.heading_ref))
             rad = math.radians(heading_deg)
-            front_x = self.x + GRID_SPACING_CM * math.cos(rad)
-            front_y = self.y + GRID_SPACING_CM * math.sin(rad)
+            live_x, live_y = self._live_position_locked()
+            front_x = live_x + GRID_SPACING_CM * math.cos(rad)
+            front_y = live_y + GRID_SPACING_CM * math.sin(rad)
             return self._to_cell(front_x, front_y)
 
     def get_cell_status(self, cell):
@@ -1588,20 +1667,19 @@ class GridNavNode(Node):
         updated when a 'move' leg fully COMPLETES (see control_loop's
         DRIVE phase) -- while mid-leg they still hold the position from
         when the leg STARTED, even though the robot has actually
-        traveled leg_progress_cm further by now (that live distance is
-        tracked separately, only surfaced to the GUI via get_snapshot()'s
-        display_x/display_y). Called when an obstacle hold begins so that
-        pin_obstacle_box_from_detection/replan_current_goal reason about
-        the robot's TRUE current position -- without this, a hold
-        triggered mid-drive would pin the obstacle and replan from a
-        stale, pre-leg position, potentially routing the "avoidance"
-        path right past the obstacle's actual real-world location."""
+        traveled leg_progress_cm further by now (see
+        _live_position_locked(), which computes but doesn't mutate this).
+        Called when an obstacle hold begins so that pin_cells()/
+        replan_current_goal() reason about the robot's TRUE current
+        position -- without this, a hold triggered mid-drive would pin
+        the obstacle and replan from a stale, pre-leg position,
+        potentially routing the "avoidance" path right past the
+        obstacle's actual real-world location."""
         if self.state != 'RUNNING' or self.phase != 'DRIVE' or not self.legs:
             return
         if self.legs[self.leg_idx][0] != 'move':
             return
-        self.x = self.leg_start_x + self.leg_unit_dx * self.leg_progress_cm
-        self.y = self.leg_start_y + self.leg_unit_dy * self.leg_progress_cm
+        self.x, self.y = self._live_position_locked()
         # Shrink the remaining distance on this leg to match, so if this
         # turns out to be a glitch (no replan) and the SAME leg just
         # resumes, it still ends at the original target point instead of
@@ -1613,53 +1691,6 @@ class GridNavNode(Node):
         self.leg_progress_cm = 0.0
         self.leg_boxes_crossed = 0
         self.leg_baseline_pulses = self.last_pulses
-
-    def detection_cells(self, detection):
-        """Compute the world grid cells a camera detection's box would
-        cover WITHOUT pinning anything -- used both by
-        pin_obstacle_box_from_detection and by ObstacleWatcher to check
-        whether a detection is already fully accounted for in the
-        obstacle map before bothering with a hold. Returns [] if
-        position/heading/distance aren't available.
-
-        distance_cm is the obstacle's NEAREST surface (from the detection
-        box's bottom edge) -- not its center. The blocked box therefore
-        starts at that near surface and extends OBSTACLE_BOX_DEPTH_CM
-        further away, rather than being centered on the single measured
-        point (which would incorrectly block clear floor between the
-        robot and the obstacle's actual near edge)."""
-        near_distance_cm = detection.get('distance_cm')
-        center_bearing = detection.get('bearing_deg')
-        if near_distance_cm is None or center_bearing is None:
-            return []
-        far_distance_cm = near_distance_cm + OBSTACLE_BOX_DEPTH_CM
-        bearings = [b for b in (detection.get('left_bearing_deg'),
-                                 center_bearing,
-                                 detection.get('right_bearing_deg')) if b is not None]
-
-        with self._lock:
-            if self.heading_ref is None or self.current_yaw is None:
-                return []
-            heading_deg = math.degrees(angle_diff(self.current_yaw, self.heading_ref))
-
-            corner_cells = []
-            for bearing_deg in bearings:
-                world_bearing_rad = math.radians(heading_deg + bearing_deg)
-                cos_b = math.cos(world_bearing_rad)
-                sin_b = math.sin(world_bearing_rad)
-                for d in (near_distance_cm, far_distance_cm):
-                    obstacle_x = self.x + d * cos_b
-                    obstacle_y = self.y + d * sin_b
-                    corner_cells.append(self._to_cell(obstacle_x, obstacle_y))
-
-        i_vals = [c[0] for c in corner_cells]
-        j_vals = [c[1] for c in corner_cells]
-        return [(i, j) for i in range(min(i_vals), max(i_vals) + 1)
-                for j in range(min(j_vals), max(j_vals) + 1)]
-
-    def is_cell_pinned(self, cell):
-        with self._lock:
-            return cell in self.obstacles
 
     def pin_cells(self, cells):
         """Permanently add an arbitrary collection of (i, j) grid cells to
@@ -1675,13 +1706,6 @@ class GridNavNode(Node):
             self.pinned_cells.update(cells)
         self.get_logger().warn(f'Obstacle confirmed -- pinned {len(cells)} grid cell(s): {sorted(cells)}')
         return cells
-
-    def pin_obstacle_box_from_detection(self, detection):
-        """Convert a single camera detection into a BOX of world grid
-        cells (its left edge to its right edge, at its estimated
-        distance) and pin them. Returns the list of pinned cells (may be
-        empty)."""
-        return self.pin_cells(self.detection_cells(detection))
 
     def replan_current_goal(self):
         """Re-submit the current goal so set_goal()'s A* search picks up
@@ -1727,15 +1751,7 @@ class GridNavNode(Node):
             if self.state == 'RUNNING':
                 target_deg = math.degrees(angle_diff(self.leg_target_heading, self.heading_ref))
 
-            # Live display position: committed x/y plus in-progress DRIVE
-            # movement along the current leg's direction, so the GUI marker
-            # and position readout move in real time instead of jumping
-            # only when a leg completes.
-            display_x, display_y = self.x, self.y
-            if self.state == 'RUNNING' and self.phase == 'DRIVE' and self.legs \
-                    and self.legs[self.leg_idx][0] == 'move':
-                display_x = self.leg_start_x + self.leg_unit_dx * self.leg_progress_cm
-                display_y = self.leg_start_y + self.leg_unit_dy * self.leg_progress_cm
+            display_x, display_y = self._live_position_locked()
 
             return {
                 'x': display_x,
@@ -2015,12 +2031,13 @@ function draw(state) {
   }
 
   // live camera-detected obstacles (this instant's raw detections, not yet
-  // even part of a hold) -- mirrors the backend's detection_cells() logic
-  // exactly: near edge at the measured distance, extending
-  // OBSTACLE_BOX_DEPTH further away (not centered on the point), spanning
-  // left-edge to right-edge bearing. Expected to flicker frame to frame
-  // -- it's the raw/unconfirmed signal, not the persisted obstacle map
-  // (see the solid red boxes above for what's actually pinned).
+  // even part of a hold, and not currently pinned into the obstacle map --
+  // ObstacleWatcher is paused, see its docstring) -- box projection: near
+  // edge at the measured distance, extending OBSTACLE_BOX_DEPTH further
+  // away (not centered on the point), spanning left-edge to right-edge
+  // bearing. Expected to flicker frame to frame -- it's the raw/
+  // unconfirmed signal, not the persisted obstacle map (see the solid red
+  // boxes above for what's actually pinned).
   if (state.heading_deg !== null && state.heading_deg !== undefined) {
     for (const det of liveDetections) {
       if (det.distance_cm === null || det.distance_cm === undefined) continue;
@@ -2324,6 +2341,8 @@ async function pollObstacleWatch() {
     candidateCells = ow.candidate_cells || [];
     if (!ow.active) {
       set('s-obwatch', 'n/a (no camera)');
+    } else if (ow.paused) {
+      set('s-obwatch', 'PAUSED -- detection not wired to avoidance yet (add obstacles manually)');
     } else if (!ow.enabled) {
       set('s-obwatch', 'DISABLED');
     } else if (ow.holding) {
