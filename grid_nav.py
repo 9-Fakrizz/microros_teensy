@@ -240,29 +240,20 @@ DETECTION_BLACK_VALUE_MAX = 90      # 0-255 HSV V; below this = "black"
 DETECTION_WHITE_SAT_MAX = 40        # 0-255 HSV S; below this (AND V above WHITE_VALUE_MIN) = "white"
 DETECTION_WHITE_VALUE_MIN = 200     # 0-255 HSV V; above this (AND S below WHITE_SAT_MAX) = "white"
 
-# VERTICAL-LINE shape filter, in the downscaled frame's own pixel space
-# (fractions of its height/width, so they scale with DETECTION_DOWNSCALE
-# automatically). A connected edge component only counts as a candidate
-# pillar/leg if BOTH of:
-#   - it starts within the top VERTICAL_TOP_MARGIN_FRACTION of the frame
-#     (the "topmost" anchor the pattern is named for)
-#   - it's no wider than VERTICAL_MAX_WIDTH_FRACTION of the frame
-#     (thin -- a leg or pillar edge, not a wide box)
-# There is deliberately NO separate min-height requirement -- that used
-# to be an arbitrary fixed fraction, but the real, physically-grounded
-# condition is simpler and already covered by the SAFETY DISTANCE FILTER
-# below: a top-anchored line is only accepted at all if its FOOT (lowest
-# point) maps to a distance inside [OBJECT_MIN_DISTANCE_CM,
-# OBJECT_MAX_DISTANCE_CM], which by itself forces it to be at least tall
-# enough to reach that band -- one condition instead of two redundant
-# ones tuned separately.
+# VERTICAL-LINE obstacle condition -- exactly two parts, per spec:
+#   1. The edge must extend from near the top of the frame downward --
+#      it starts within the top VERTICAL_TOP_MARGIN_FRACTION of the
+#      downscaled frame's own height (fraction, so it scales with
+#      DETECTION_DOWNSCALE automatically).
+#   2. Its bottom endpoint (foot) must fall between the 50cm and 100cm
+#      VFOV lines -- see SAFETY DISTANCE FILTER below, which reuses the
+#      existing calibrated CameraRangefinder Y-to-distance mapping
+#      unchanged.
 # A small vertical morphological CLOSE (VERTICAL_CLOSE_KSIZE tall, in
-# downscaled pixels) bridges small gaps in an otherwise-continuous
-# vertical edge first, so minor noise/blur breaks don't split one real
-# line into several short fragments.
-# Internal only, not GUI-exposed.
+# downscaled pixels) bridges small gaps first, so a real leg/pillar's
+# otherwise-continuous edge isn't split into several short fragments by
+# minor noise/blur breaks. Internal only, not GUI-exposed.
 DETECTION_VERTICAL_TOP_MARGIN_FRACTION = 0.05
-DETECTION_VERTICAL_MAX_WIDTH_FRACTION = 0.06
 DETECTION_VERTICAL_CLOSE_KSIZE = 15
 
 # SAFETY DISTANCE FILTER -- THE core obstacle condition: a vertical
@@ -669,38 +660,46 @@ class CameraRangefinder:
 
 
 class ObstacleDetector:
-    """No trained model file, no HOG. VERTICAL-LINE pattern matching:
-    processes the FULL frame (the distance-band crop was tried and
-    cancelled -- see notebook_debug.txt), downscaled by `downscale`,
-    computes plain Canny edges, erases black/white LINE markings (tape,
-    tile grout seams) from the edge map via HSV color segmentation --
-    any edge pixel on a "black" (V below black_value_max) or "white" (S
-    below white_sat_max AND V above white_value_min) region is erased
-    first -- then looks specifically for tall, thin, TOP-ANCHORED
-    vertical edge segments (a small vertical morphological close bridges
-    minor gaps first). A pillar or a human leg produces exactly this
-    pattern: a mostly-unbroken vertical edge running from the top of the
-    frame down to wherever it touches the floor, unlike floor
-    clutter/texture. See DETECTION_VERTICAL_* constants for the shape
-    filter and notebook_debug.txt for how this was discovered (testing
-    with black_value_max=0).
+    """No trained model file, no HOG. VERTICAL-EDGE obstacle detection
+    built on the existing calibrated VFOV distance mapping
+    (CameraRangefinder.distance_for_row() -- unchanged, reused as-is):
 
-    Each surviving vertical line's LOWEST point (its floor-contact row)
-    is converted to a real-world distance via
-    CameraRangefinder.distance_for_row(). SAFETY FILTER: only lines whose
-    floor-contact distance falls within
-    [DETECTION_OBJECT_MIN_DISTANCE_CM, DETECTION_OBJECT_MAX_DISTANCE_CM]
-    are trusted -- outside that band the estimate is considered
-    unreliable and the whole detection is dropped, not pinned.
+    1. Compute plain Canny edges on the full frame (the distance-band
+       crop was tried and cancelled -- see notebook_debug.txt),
+       downscaled by `downscale`. A small vertical morphological CLOSE
+       bridges minor gaps first, so a real leg/pillar's otherwise-
+       continuous edge isn't split into several short fragments by
+       noise/blur breaks -- "strong/continuous edge lines."
+    2. Find each edge line that starts near the TOP of the frame (within
+       DETECTION_VERTICAL_TOP_MARGIN_FRACTION) and extends downward --
+       a pillar or a human leg produces exactly this pattern, unlike
+       floor clutter/texture.
+    3. For each such line, take its LOWEST point (the "foot") and look
+       up the real-world distance it represents via
+       CameraRangefinder.distance_for_row() -- the existing calibrated
+       Y-to-distance mapping, not touched here.
+    4. Obstacle condition: accept only if that foot distance falls
+       within [DETECTION_OBJECT_MIN_DISTANCE_CM,
+       DETECTION_OBJECT_MAX_DISTANCE_CM] (the 50cm-100cm VFOV lines) --
+       outside that band the detection is dropped as unreliable, not
+       pinned. E.g. a leg's edge runs from the top of the frame down to
+       around the 50cm line -> detected as an obstacle at ~50cm.
+
+    Black/white LINE color segmentation (floor tape, tile grout seams)
+    is still computed as line_coverage_pct, a tuning/debug stat, but is
+    NOT applied to erase edges -- a dark leg/pillar is exactly the kind
+    of thing black_value_max would otherwise wipe out before the
+    vertical search ever ran (confirmed with a real cv2 test; see
+    notebook_debug.txt). The top-anchor condition above already rejects
+    ordinary (short, wide) floor markings on shape alone.
 
     The frame served over the live debug stream (/debug_feed, multipart
     PNG -- not JPEG, see notebook_debug.txt: JPEG's lossy block
     compression was found to bleed rejected regions back into visibility
-    on decode) is the vertical-closed edge map (post line-erasure), so
-    you should see the vertical edge lines this detector is actually
-    tracking, with no black/white line edges. All three HSV line
-    thresholds are GUI/API-adjustable -- tune them against the live
-    debug feed.
+    on decode) is the vertical-closed edge map, so you should see the
+    vertical edge lines this detector is actually tracking. All three
+    HSV line thresholds are GUI/API-adjustable -- tune them against the
+    live debug feed.
 
     Runs in its own background thread at DETECTION_FPS, reading the
     latest raw frame from a CameraStreamer.
@@ -891,9 +890,8 @@ class ObstacleDetector:
 
         contours, _ = cv2.findContours(vertical_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        small_height_px, small_width_px = vertical_edges.shape[:2]
+        small_height_px = vertical_edges.shape[0]
         top_margin_px = DETECTION_VERTICAL_TOP_MARGIN_FRACTION * small_height_px
-        max_width_px = DETECTION_VERTICAL_MAX_WIDTH_FRACTION * small_width_px
         min_distance_cm = DETECTION_OBJECT_MIN_DISTANCE_CM
         max_distance_cm = DETECTION_OBJECT_MAX_DISTANCE_CM
 
@@ -901,11 +899,13 @@ class ObstacleDetector:
         total_object_area = 0.0
         for c in contours:
             x_roi, y_roi, w, h = cv2.boundingRect(c)
-            # Shape filter: starts near the TOP of the frame, thin
-            # enough to be a leg/pillar edge rather than a wide box. How
-            # TALL it needs to be isn't a separate arbitrary threshold --
-            # it falls out of the foot-distance condition below.
-            if y_roi > top_margin_px or w > max_width_px:
+            # Obstacle condition, exactly two parts:
+            #   1. The edge must extend from near the top of the frame
+            #      downward (y_roi within the top margin).
+            #   2. Its bottom endpoint (the foot -- checked below via
+            #      distance_for_row) must fall between the 50cm and
+            #      100cm VFOV lines.
+            if y_roi > top_margin_px:
                 continue
 
             x_roi *= inv_scale
