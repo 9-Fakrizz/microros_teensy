@@ -491,6 +491,81 @@ def inflate_obstacles(obstacles, radius_cells):
     return inflated
 
 
+# ---------------- Preset GUI "mode" coverage paths ----------------
+# Mode A/B/C buttons in the GUI each drive a FIXED sequence of (x, y) cm
+# waypoints via GridNavNode.run_path() -- no live coverage planning,
+# just a canned route derived from the court geometry above (COURT_*),
+# so it automatically follows the court if those constants ever change.
+MODE_ROW_STEP_CM = 200   # 2m step between boustrophedon rows (modes A/B)
+
+
+def _boustrophedon_waypoints(x_left, x_right, y_start, y_end, row_step_cm):
+    """Generate the TURN-POINT waypoints of a U-pattern (boustrophedon /
+    lawnmower) coverage sweep: full-width passes between x_left and
+    x_right, stepping row_step_cm from y_start toward y_end (inclusive),
+    reversing direction (left<->right) each row. y_start may be greater
+    or less than y_end -- the step direction follows automatically.
+    Does NOT include a return-to-origin point; callers append that."""
+    direction = 1.0 if y_end >= y_start else -1.0
+    step = direction * abs(row_step_cm)
+    rows = []
+    y = y_start
+    # +1e-6 slack so a y_end that lands exactly on a row (as it does for
+    # both Mode A and Mode B against the court's own half-line) is
+    # included despite float accumulation.
+    while (direction > 0 and y <= y_end + 1e-6) or (direction < 0 and y >= y_end - 1e-6):
+        rows.append(y)
+        y += step
+
+    waypoints = []
+    current_x = x_left
+    for idx, row_y in enumerate(rows):
+        if idx == 0:
+            waypoints.append((x_left, row_y))
+            waypoints.append((x_right, row_y))
+            current_x = x_right
+        else:
+            waypoints.append((current_x, row_y))  # step to this row, same side as last
+            current_x = x_left if current_x == x_right else x_right
+            waypoints.append((current_x, row_y))  # sweep across
+    return waypoints
+
+
+def get_mode_a_waypoints():
+    """Mode A: U-pattern coverage of the court's TOP half (far end, at
+    max Y, down to the net/half-court line), starting at the court's own
+    top-left corner, 2m rows, finishing back at the origin (0, 0)."""
+    x_left = COURT_ORIGIN_X_CM
+    x_right = COURT_ORIGIN_X_CM + COURT_WIDTH_CM
+    y_top = COURT_ORIGIN_Y_CM + COURT_LENGTH_CM
+    y_half = COURT_ORIGIN_Y_CM + COURT_LENGTH_CM / 2.0
+    waypoints = _boustrophedon_waypoints(x_left, x_right, y_top, y_half, MODE_ROW_STEP_CM)
+    waypoints.append((0.0, 0.0))
+    return waypoints
+
+
+def get_mode_b_waypoints():
+    """Mode B: same U-pattern as Mode A, mirrored onto the court's
+    BOTTOM half (near end, at the court's own bottom-left corner, up to
+    the net/half-court line), finishing back at the origin (0, 0)."""
+    x_left = COURT_ORIGIN_X_CM
+    x_right = COURT_ORIGIN_X_CM + COURT_WIDTH_CM
+    y_bottom = COURT_ORIGIN_Y_CM
+    y_half = COURT_ORIGIN_Y_CM + COURT_LENGTH_CM / 2.0
+    waypoints = _boustrophedon_waypoints(x_left, x_right, y_bottom, y_half, MODE_ROW_STEP_CM)
+    waypoints.append((0.0, 0.0))
+    return waypoints
+
+
+def get_mode_c_waypoints():
+    """Mode C: one loop around the OUTER margin box (the court plus its
+    COURT_MARGIN_CELLS border on every side) -- (0,0) -> far corner along
+    Y -> far corner along both -> far corner along X -> back to (0,0)."""
+    outer_x = COURT_ORIGIN_X_CM * 2 + COURT_WIDTH_CM
+    outer_y = COURT_ORIGIN_Y_CM * 2 + COURT_LENGTH_CM
+    return [(0.0, 0.0), (0.0, outer_y), (outer_x, outer_y), (outer_x, 0.0), (0.0, 0.0)]
+
+
 class CameraStreamer:
     """Grabs frames from a USB webcam in a background thread and keeps the
     latest one JPEG-encoded and ready to serve. Decoupling capture from
@@ -1357,6 +1432,13 @@ class GridNavNode(Node):
         self.goal = None             # (gx, gy) for display
         self.end_dir_deg = None      # requested final heading, degrees (or None)
 
+        # Remaining (x, y) cm waypoints after the CURRENT self.goal, for a
+        # preset multi-waypoint path (see run_path() / Mode A/B/C) --
+        # popped and driven to automatically, one at a time, each time
+        # the current goal is reached (_goal_reached_locked()). Empty
+        # for an ordinary single-goal "Go".
+        self.waypoint_queue = []
+
         # Obstacle map for A* planning: set of blocked (i, j) grid cells,
         # cell (i, j) centered at (i * GRID_SPACING_CM, j * GRID_SPACING_CM).
         # Edited live from the GUI (click a cell to toggle it).
@@ -1438,81 +1520,125 @@ class GridNavNode(Node):
             self.pinned_cells.clear()
 
     def set_goal(self, gx, gy, end_dir_deg=None, step_mode=False):
+        """Public entry point (manual "Go" / /api/goal) -- cancels any
+        in-progress preset path (see run_path()) before driving to this
+        goal, since a manually-entered goal should override whatever
+        automatic path was running."""
         with self._lock:
-            start_cell = self._to_cell(self.x, self.y)
-            goal_cell = self._to_cell(gx, gy)
+            self.waypoint_queue = []
+            self._set_goal_locked(gx, gy, end_dir_deg, step_mode)
 
-            legs = []
-            planned_path = []
-            if start_cell != goal_cell:
-                # Inflate obstacles by the robot's footprint radius before
-                # searching -- A* itself still treats the robot as a
-                # single point, but against a map that already accounts
-                # for the real ROBOT_SIZE_CM box's clearance needs.
-                inflated_obstacles = inflate_obstacles(self.obstacles, ROBOT_INFLATION_CELLS)
-                # Never let INFLATION ALONE (as opposed to a real pinned
-                # obstacle cell) block the start cell's own neighborhood.
-                # A confirmed obstacle is routinely pinned immediately
-                # next to the robot's current cell (see ObstacleWatcher --
-                # its 3x3 block starts at depth 1); inflating that by
-                # ROBOT_INFLATION_CELLS can produce a halo that completely
-                # encircles the robot's OWN start cell, making A* report
-                # "no path" even though stepping sideways around the real
-                # obstacle is clearly possible. Genuine obstacle cells
-                # (actually in self.obstacles, not just inflated) still
-                # block near the start -- only the extra inflation halo is
-                # cleared here.
-                near_start = {(start_cell[0] + di, start_cell[1] + dj)
-                              for di in range(-ROBOT_INFLATION_CELLS, ROBOT_INFLATION_CELLS + 1)
-                              for dj in range(-ROBOT_INFLATION_CELLS, ROBOT_INFLATION_CELLS + 1)}
-                inflated_obstacles -= (near_start - self.obstacles)
-                cell_path = astar_search(start_cell, goal_cell, inflated_obstacles)
-                if cell_path is None:
-                    # STOP -- do not silently leave the OLD legs/phase in
-                    # place. Without this, a failed replan (e.g. right
-                    # after pinning a freshly-confirmed obstacle) left the
-                    # robot blindly resuming its previous, now-invalid
-                    # leg -- driving straight into the very obstacle that
-                    # was just pinned.
-                    self.goal = (gx, gy)
-                    self.state = 'IDLE'
-                    self.legs = []
-                    self.leg_idx = 0
-                    self.phase = None
-                    self.planned_path = []
-                    self.get_logger().warn(
-                        f'No path to ({gx:.1f}, {gy:.1f}) cm -- blocked by obstacles (incl. robot '
-                        f'clearance margin) or out of range. Stopped -- send a new goal once clear.'
-                    )
-                    return
-                legs = path_to_legs(cell_path, GRID_SPACING_CM)
-                planned_path = [(c[0] * GRID_SPACING_CM, c[1] * GRID_SPACING_CM) for c in cell_path]
+    def run_path(self, waypoints):
+        """Queue a fixed sequence of (x, y) cm waypoints -- e.g. one of
+        the GUI's preset Mode A/B/C coverage paths (see
+        get_mode_a_waypoints() etc.). Drives to the first waypoint now;
+        each time a goal is reached, control_loop automatically advances
+        to the next one (_goal_reached_locked()) until the queue is
+        empty. An obstacle-triggered replan (replan_current_goal())
+        re-routes to the CURRENT waypoint only, leaving the rest of the
+        queue untouched."""
+        waypoints = [(float(x), float(y)) for x, y in waypoints]
+        if not waypoints:
+            return
+        with self._lock:
+            self.waypoint_queue = waypoints[1:]
+            self._set_goal_locked(waypoints[0][0], waypoints[0][1])
+        self.get_logger().info(f'Running preset path -- {len(waypoints)} waypoint(s)')
 
-            if end_dir_deg is not None:
-                # Rotate-only leg: no drive phase, just turn to face this
-                # heading (degrees, relative to heading_ref where 0 = +X)
-                # once position legs are done.
-                legs.append(('heading', end_dir_deg))
+    def _goal_reached_locked(self):
+        """Caller must hold self._lock. Call once the current goal's
+        legs are all complete. Advances to the next queued waypoint (see
+        run_path()) if any is pending, otherwise goes IDLE."""
+        if self.waypoint_queue:
+            nx, ny = self.waypoint_queue.pop(0)
+            self._set_goal_locked(nx, ny)
+        else:
+            self.state = 'IDLE'
 
-            self.goal = (gx, gy)
-            self.end_dir_deg = end_dir_deg
-            self.legs = legs
-            self.leg_idx = 0
-            self.planned_path = planned_path
-            self.step_mode = step_mode
-            self.awaiting_continue = False
+    def _set_goal_locked(self, gx, gy, end_dir_deg=None, step_mode=False):
+        """Caller must hold self._lock. Does the actual A*-plan-and-start
+        work -- does NOT touch waypoint_queue itself, so callers chaining
+        through a preset path (run_path()/_goal_reached_locked()) or
+        replanning the CURRENT waypoint around an obstacle
+        (replan_current_goal()) leave the rest of the queue alone; only
+        the public set_goal() (a fresh manual goal) clears it first."""
+        start_cell = self._to_cell(self.x, self.y)
+        goal_cell = self._to_cell(gx, gy)
 
-            if not legs:
+        legs = []
+        planned_path = []
+        if start_cell != goal_cell:
+            # Inflate obstacles by the robot's footprint radius before
+            # searching -- A* itself still treats the robot as a
+            # single point, but against a map that already accounts
+            # for the real ROBOT_SIZE_CM box's clearance needs.
+            inflated_obstacles = inflate_obstacles(self.obstacles, ROBOT_INFLATION_CELLS)
+            # Never let INFLATION ALONE (as opposed to a real pinned
+            # obstacle cell) block the start cell's own neighborhood.
+            # A confirmed obstacle is routinely pinned immediately
+            # next to the robot's current cell (see ObstacleWatcher --
+            # its 3x3 block starts at depth 1); inflating that by
+            # ROBOT_INFLATION_CELLS can produce a halo that completely
+            # encircles the robot's OWN start cell, making A* report
+            # "no path" even though stepping sideways around the real
+            # obstacle is clearly possible. Genuine obstacle cells
+            # (actually in self.obstacles, not just inflated) still
+            # block near the start -- only the extra inflation halo is
+            # cleared here.
+            near_start = {(start_cell[0] + di, start_cell[1] + dj)
+                          for di in range(-ROBOT_INFLATION_CELLS, ROBOT_INFLATION_CELLS + 1)
+                          for dj in range(-ROBOT_INFLATION_CELLS, ROBOT_INFLATION_CELLS + 1)}
+            inflated_obstacles -= (near_start - self.obstacles)
+            cell_path = astar_search(start_cell, goal_cell, inflated_obstacles)
+            if cell_path is None:
+                # STOP -- do not silently leave the OLD legs/phase in
+                # place. Without this, a failed replan (e.g. right
+                # after pinning a freshly-confirmed obstacle) left the
+                # robot blindly resuming its previous, now-invalid
+                # leg -- driving straight into the very obstacle that
+                # was just pinned. Also abandons any pending preset-path
+                # waypoints -- a route that can't even reach its current
+                # waypoint shouldn't blindly attempt the next ones either.
+                self.goal = (gx, gy)
                 self.state = 'IDLE'
-                self.get_logger().info('Goal is at (or within tolerance of) current position.')
+                self.legs = []
+                self.leg_idx = 0
+                self.phase = None
+                self.planned_path = []
+                self.waypoint_queue = []
+                self.get_logger().warn(
+                    f'No path to ({gx:.1f}, {gy:.1f}) cm -- blocked by obstacles (incl. robot '
+                    f'clearance margin) or out of range. Stopped -- send a new goal once clear.'
+                )
                 return
+            legs = path_to_legs(cell_path, GRID_SPACING_CM)
+            planned_path = [(c[0] * GRID_SPACING_CM, c[1] * GRID_SPACING_CM) for c in cell_path]
 
-            self.state = 'RUNNING'
-            self._start_leg_locked()
-            self.get_logger().info(
-                f'New goal: ({gx:.1f}, {gy:.1f}) cm -- {len(legs)} leg(s)'
-                f'{" [step mode]" if step_mode else ""}'
-            )
+        if end_dir_deg is not None:
+            # Rotate-only leg: no drive phase, just turn to face this
+            # heading (degrees, relative to heading_ref where 0 = +X)
+            # once position legs are done.
+            legs.append(('heading', end_dir_deg))
+
+        self.goal = (gx, gy)
+        self.end_dir_deg = end_dir_deg
+        self.legs = legs
+        self.leg_idx = 0
+        self.planned_path = planned_path
+        self.step_mode = step_mode
+        self.awaiting_continue = False
+
+        if not legs:
+            self._goal_reached_locked()
+            self.get_logger().info('Goal is at (or within tolerance of) current position.')
+            return
+
+        self.state = 'RUNNING'
+        self._start_leg_locked()
+        self.get_logger().info(
+            f'New goal: ({gx:.1f}, {gy:.1f}) cm -- {len(legs)} leg(s)'
+            f'{" [step mode]" if step_mode else ""}'
+        )
 
     def continue_step(self):
         """Resume DRIVE after a step-mode pause. No-op if not currently
@@ -1598,11 +1724,11 @@ class GridNavNode(Node):
                         self.leg_idx += 1
                         self.cmd_pub.publish(twist)
                         if self.leg_idx >= len(self.legs):
-                            self.state = 'IDLE'
                             self.get_logger().info(
                                 f'Goal reached: ({self.x:.1f}, {self.y:.1f}) cm, '
                                 f'facing {math.degrees(self.leg_target_heading - self.heading_ref):.1f} deg'
                             )
+                            self._goal_reached_locked()
                         else:
                             self._start_leg_locked()
                         return
@@ -1661,10 +1787,10 @@ class GridNavNode(Node):
                 self.leg_idx += 1
                 self.cmd_pub.publish(twist)  # all-zero between legs
                 if self.leg_idx >= len(self.legs):
-                    self.state = 'IDLE'
                     self.get_logger().info(
                         f'Goal reached: ({self.x:.1f}, {self.y:.1f}) cm'
                     )
+                    self._goal_reached_locked()
                 else:
                     self._start_leg_locked()
                 return
@@ -1816,16 +1942,19 @@ class GridNavNode(Node):
         return cells
 
     def replan_current_goal(self):
-        """Re-submit the current goal so set_goal()'s A* search picks up
-        newly pinned obstacle cells and routes around them."""
+        """Re-run A* toward the CURRENT goal/waypoint so it picks up
+        newly pinned obstacle cells and routes around them. Uses
+        _set_goal_locked() directly (not the public set_goal()) so any
+        pending preset-path waypoint_queue is left untouched -- this is
+        replanning the SAME waypoint, not starting a fresh one."""
         with self._lock:
             goal = self.goal
+            if goal is None:
+                return
             end_dir_deg = self.end_dir_deg
             step_mode = self.step_mode
-        if goal is None:
-            return
-        self.get_logger().warn(f'Replanning path to {goal} around newly pinned obstacle(s)')
-        self.set_goal(goal[0], goal[1], end_dir_deg, step_mode)
+            self.get_logger().warn(f'Replanning path to {goal} around newly pinned obstacle(s)')
+            self._set_goal_locked(goal[0], goal[1], end_dir_deg, step_mode)
 
     def reset_position(self):
         """Zero the tracked (x, y) without restarting the node. Goals are
@@ -1869,6 +1998,7 @@ class GridNavNode(Node):
                 'obstacles': [list(c) for c in self.obstacles],
                 'pinned_cells': [list(c) for c in self.pinned_cells],
                 'goal': self.goal,
+                'waypoint_queue': [list(w) for w in self.waypoint_queue],
                 'state': self.state,
                 'phase': self.phase,
                 'yaw_deg': yaw_deg,
@@ -1946,6 +2076,12 @@ HTML_PAGE = """<!doctype html>
       <div class="row"><label style="display:inline"><input id="goalStep" type="checkbox" style="width:auto"> Step mode (pause every __STEP_SIZE__m box)</label></div>
       <button type="submit">Go</button>
     </form>
+    <div style="font-size:11px; color:#999;">Preset coverage paths (court -- see map):</div>
+    <div style="display:flex; gap:4px;">
+      <button id="modeABtn" style="background:#1a3a5a; flex:1;">Mode A</button>
+      <button id="modeBBtn" style="background:#1a3a5a; flex:1;">Mode B</button>
+      <button id="modeCBtn" style="background:#1a3a5a; flex:1;">Mode C</button>
+    </div>
     <button id="resetBtn" style="background:#5a2a2a;">Reset Position to (0,0)</button>
     <button id="continueBtn" style="background:#2a5a2a; display:none;">Continue to Next Box</button>
     <button id="clearObstaclesBtn" style="background:#5a4a1a;">Clear Obstacles</button>
@@ -1961,6 +2097,7 @@ HTML_PAGE = """<!doctype html>
       <div class="stat-box"><div class="k">Phase</div><div class="v" id="s-phase">--</div></div>
       <div class="stat-box"><div class="k">Leg</div><div class="v" id="s-leg">--</div></div>
       <div class="stat-box wide"><div class="k">Leg Progress</div><div class="v" id="s-progress">--</div></div>
+      <div class="stat-box wide"><div class="k">Preset Path Waypoints Left</div><div class="v" id="s-waypoints">--</div></div>
       <div class="stat-box"><div class="k">End Dir</div><div class="v" id="s-enddir">--</div></div>
       <div class="stat-box wide"><div class="k">Speed (drive / rotate)</div><div class="v" id="s-speed">--</div></div>
       <div class="stat-box wide"><div class="k">IMU Yaw (raw)</div><div class="v" id="s-yaw">--</div></div>
@@ -2185,6 +2322,31 @@ function draw(state) {
     drawCellBox(cell[0], cell[1], 'rgba(255,220,0,0.45)', '#ffdc00');
   }
 
+  // remaining preset-path waypoints (Mode A/B/C -- see run_path()) --
+  // small purple dots connected by a dashed line, so the whole queued
+  // route is visible at a glance, distinct from the CURRENT leg's solid
+  // green A* planned_path above.
+  if (state.waypoint_queue && state.waypoint_queue.length > 0) {
+    const pts = [state.goal, ...state.waypoint_queue].filter(p => p);
+    ctx.strokeStyle = 'rgba(200,120,255,0.6)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([3, 4]);
+    ctx.beginPath();
+    let [wsx, wsy] = toPx(pts[0][0], pts[0][1]);
+    ctx.moveTo(wsx, wsy);
+    for (const p of pts.slice(1)) {
+      let [wpx, wpy] = toPx(p[0], p[1]);
+      ctx.lineTo(wpx, wpy);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#c878ff';
+    for (const p of pts) {
+      let [wpx, wpy] = toPx(p[0], p[1]);
+      ctx.beginPath(); ctx.arc(wpx, wpy, 3, 0, 2 * Math.PI); ctx.fill();
+    }
+  }
+
   // goal marker
   if (state.goal) {
     let [gx, gy] = toPx(state.goal[0], state.goal[1]);
@@ -2265,6 +2427,8 @@ function updateStatus(state) {
         ? '-' : `${(state.leg_progress_cm / 100).toFixed(1)} / ${(state.leg_target_distance_cm / 100).toFixed(1)} m`);
   set('s-enddir', state.end_dir_deg === null || state.end_dir_deg === undefined
         ? 'n/a' : `${state.end_dir_deg.toFixed(0)}deg`);
+  const waypointsLeft = (state.waypoint_queue || []).length;
+  set('s-waypoints', waypointsLeft > 0 ? `${waypointsLeft} (running preset path)` : 'none');
   set('s-speed', `${state.forward_speed.toFixed(2)} / ${state.rotate_speed.toFixed(2)}`);
   set('s-yaw', fmt(state.yaw_deg));
   set('s-heading', fmt(state.heading_deg));
@@ -2316,6 +2480,17 @@ document.getElementById('speedForm').addEventListener('submit', async (ev) => {
 document.getElementById('resetBtn').addEventListener('click', async () => {
   await fetch('/api/reset_position', {method: 'POST'});
 });
+
+async function runMode(mode) {
+  await fetch('/api/run_mode', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({mode: mode})
+  });
+}
+document.getElementById('modeABtn').addEventListener('click', () => runMode('A'));
+document.getElementById('modeBBtn').addEventListener('click', () => runMode('B'));
+document.getElementById('modeCBtn').addEventListener('click', () => runMode('C'));
 
 document.getElementById('clearObstaclesBtn').addEventListener('click', async () => {
   await fetch('/api/clear_obstacles', {method: 'POST'});
@@ -2682,6 +2857,20 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
             end_dir = None
         step_mode = bool(data.get('step', False))
         node.set_goal(gx, gy, end_dir, step_mode)
+        return jsonify({'ok': True})
+
+    @app.route('/api/run_mode', methods=['POST'])
+    def api_run_mode():
+        data = request.get_json(force=True)
+        mode = data.get('mode')
+        waypoints_by_mode = {
+            'A': get_mode_a_waypoints,
+            'B': get_mode_b_waypoints,
+            'C': get_mode_c_waypoints,
+        }
+        if mode not in waypoints_by_mode:
+            return jsonify({'ok': False, 'error': f'unknown mode {mode!r} (expected A/B/C)'}), 400
+        node.run_path(waypoints_by_mode[mode]())
         return jsonify({'ok': True})
 
     @app.route('/api/set_speed', methods=['POST'])
