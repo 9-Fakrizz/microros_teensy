@@ -41,15 +41,14 @@ GUI:
   a backup-camera-style distance HUD (see CameraRangefinder) and live
   obstacle detection boxes (see ObstacleDetector) drawn over it -- a
   top-anchored vertical edge (a leg or pillar) whose floor-contact point
-  falls between the 50cm and 100cm VFOV lines is flagged as a detection.
-  NOTE: detection is NOT currently wired into avoidance -- ObstacleWatcher
-  (the safety supervisor that would hold the robot and pin a confirmed
-  detection into the A* obstacle map) is deliberately PAUSED right now
-  (see its docstring) while detection itself is still being tuned. The
-  GUI's "Obstacle Avoidance Enabled" toggle and detection boxes are live,
-  but nothing gets pinned/avoided automatically yet -- obstacles still
-  need to be added manually (click a grid cell) for A* to route around
-  them.
+  is at or nearer than the 100cm VFOV line is flagged as a detection
+  (anything nearer than 50cm is still flagged, just reported as a flat
+  ~50cm since close range is unreliable pixel-for-pixel). ObstacleWatcher
+  (see its docstring) turns that live signal into the A* obstacle map:
+  once the same front cell sees a detection for enough consecutive
+  frames (GUI-adjustable "sensitivity," 1 = pin on the very first
+  detected frame), it's pinned immediately and the goal is replanned --
+  no stop-and-recheck delay, no geometry/size check.
 
   Open it from any browser on the same network:
       http://<pi5-ip-address>:8080
@@ -193,15 +192,6 @@ ROBOT_SIZE_CM = 60.0
 ROBOT_FOOTPRINT_RADIUS_CM = ROBOT_SIZE_CM * SQRT2
 ROBOT_INFLATION_CELLS = math.ceil(ROBOT_FOOTPRINT_RADIUS_CM / GRID_SPACING_CM)
 
-# How far (cm) a confirmed obstacle's blocked footprint extends AWAY from
-# the robot, starting at its measured near surface -- NOT centered on the
-# single measured point. distance_cm is the obstacle's nearest edge (from
-# the detection box's bottom edge), so blocking a box centered on that
-# point would incorrectly treat clear floor between the robot and the
-# obstacle as blocked. Instead the box's near edge sits at distance_cm and
-# extends this far past it.
-OBSTACLE_BOX_DEPTH_CM = 2 * GRID_SPACING_CM
-
 # USB webcam streamed to the GUI as MJPEG over /video_feed. Device index
 # matches OpenCV/V4L2 numbering (0 = /dev/video0). If you have more than
 # one video device (e.g. a webcam plus some other UVC device), check
@@ -257,10 +247,14 @@ DETECTION_WHITE_VALUE_MIN = 200     # 0-255 HSV V; above this (AND S below WHITE
 #      existing calibrated CameraRangefinder Y-to-distance mapping
 #      unchanged. Nearer than the 50cm line is fine too -- it just gets
 #      clamped to 50cm rather than rejected (see below).
+# (Two candidate SHAPE filters -- a cv2.fitLine-based angle-tolerance
+# check, then a height-vs-width "must be taller than wide" check -- were
+# both tried and removed; neither held up on real footage. No shape
+# filter beyond the top-anchor check right now; see notebook_debug.txt.)
 # A small vertical morphological CLOSE (VERTICAL_CLOSE_KSIZE tall, in
 # downscaled pixels) bridges small gaps first, so a real leg/pillar's
 # otherwise-continuous edge isn't split into several short fragments by
-# minor noise/blur breaks. Internal only, not GUI-exposed.
+# minor noise/blur breaks. Both internal only, not GUI-exposed.
 DETECTION_VERTICAL_TOP_MARGIN_FRACTION = 0.05
 DETECTION_VERTICAL_CLOSE_KSIZE = 15
 
@@ -296,17 +290,27 @@ DETECTION_DOWNSCALE = 0.5   # (0, 1.0]; e.g. 0.5 = quarter the pixels (half widt
 CAMERA_DEFAULT_HEIGHT_CM = 26.0
 CAMERA_DEFAULT_TILT_DEG = 14.6
 
-# Obstacle-confirmation safety supervisor (ObstacleWatcher): a single
-# detection tick could be a glitch (lighting flicker, motion blur, a
-# passing shadow), so a detection alone doesn't get pinned into the A*
-# obstacle map immediately. Instead, the robot HOLDS (stops) for
-# OBSTACLE_HOLD_DURATION_S seconds and counts how many separate ticks
-# during that hold still see something in the 100-150cm band. Only if
-# that count reaches OBSTACLE_CONFIRM_COUNT does it get pinned + trigger
-# an A* replan; otherwise it's treated as a glitch and the interrupted
-# leg just resumes. Both are live-adjustable from the GUI.
-OBSTACLE_HOLD_DURATION_S = 5.0
-OBSTACLE_CONFIRM_COUNT = 5
+# Obstacle-confirmation supervisor (ObstacleWatcher): no size/geometry
+# check, no stop-and-recheck hold -- just a boolean "does the detector
+# see ANY accepted obstacle right now" signal, sampled once per
+# DETECTION_FPS tick against the front cell (node.get_front_cell()).
+# SENSITIVITY = how many CONSECUTIVE ticks with a detection are needed
+# before that cell gets pinned into the A* obstacle map (and the goal
+# replanned) -- 1 is maximally sensitive (pin on the very first detected
+# frame); higher values ride out a few glitchy/missed frames before
+# committing. A tick with no detection resets the streak to 0. Live-
+# adjustable from the GUI.
+OBSTACLE_SENSITIVITY_FRAMES = 3
+
+# How long (seconds) the robot holds a genuine, physical all-zero stop
+# once a cell is confirmed -- node.control_loop() gates cmd_vel on
+# node.stopped_for_obstacle for this whole window, so the robot actually
+# comes to rest instead of seamlessly redirecting straight from the old
+# leg into the new one. ObstacleDetector and ObstacleWatcher's own
+# polling loop both run on independent threads and are NOT paused by
+# this -- detection keeps updating live the entire time the robot is
+# stopped, before the new plan starts moving.
+OBSTACLE_STOP_DURATION_S = 1.0
 # -------------------------------------------------
 
 
@@ -720,8 +724,8 @@ class ObstacleDetector:
     around each ACCEPTED candidate (foot at or nearer than the 100cm
     line, including near-clamped ones) -- candidates rejected for being
     behind the 100cm line get no box at all, so what's boxed on the
-    debug feed always matches what's actually detected. All three HSV
-    line thresholds are GUI/API-adjustable -- tune them against the live
+    debug feed always matches what's actually detected. All three HSV line
+    thresholds are GUI/API-adjustable -- tune them against the live
     debug feed.
 
     Runs in its own background thread at DETECTION_FPS, reading the
@@ -931,11 +935,15 @@ class ObstacleDetector:
         total_object_area = 0.0
         for c in contours:
             x_roi, y_roi, w, h = cv2.boundingRect(c)
-            # Obstacle condition, exactly two parts:
+            # Obstacle condition:
             #   1. The edge must extend from near the top of the frame
             #      downward (y_roi within the top margin).
             #   2. Its bottom endpoint (the foot -- checked below via
             #      distance_for_row) must not be behind the 100cm line.
+            # (A height-vs-width "must be taller than wide" shape filter
+            # was tried here too -- didn't help in practice either;
+            # removed. No shape filter right now beyond the top-anchor
+            # check.)
             if y_roi > top_margin_px:
                 continue
 
@@ -1016,89 +1024,85 @@ class ObstacleDetector:
 
 
 class ObstacleWatcher:
-    """Safety supervisor bridging ObstacleDetector's obstacle-candidate
-    signal and GridNavNode's map-aware cell-confirmation flow.
+    """Bridges ObstacleDetector's live detections into GridNavNode's A*
+    obstacle map -- no size/geometry check, no stop-and-recheck delay
+    while BUILDING confidence (the robot keeps driving normally while a
+    detection streak accumulates); once confirmed, it STOPS immediately,
+    THEN pins, THEN replans, THEN goes -- see step 4.
 
-    PAUSED right now: ObstacleDetector is being rebuilt from scratch
-    (currently only does step 1 -- black/white line rejection, see its
-    docstring) and doesn't produce an obstacle-candidate signal yet, so
-    _is_candidate() always returns False here -- no hold ever starts,
-    no cell ever gets pinned. The rest of this class (hold/confirm-count
-    timing, per-cell state machine, enabled toggle) is left intact and
-    wired up, ready for a real candidate signal once detection is built
-    back on top of the cleaned/line-free frame.
+    Logic each tick (DETECTION_FPS):
+      1. front_cell = node.get_front_cell() -- the world grid cell
+         directly ahead of the robot's TRUE current (live, mid-leg)
+         position. If it's already pinned (node.is_cell_pinned()),
+         there's nothing to do -- A* already avoids it.
+      2. detected = _is_candidate() -- a plain boolean: does the
+         detector see ANY accepted obstacle at all right now
+         (len(detector.get_detections()) > 0)? Not which cell it's
+         geometrically in, not its size -- just "yes/no, something's
+         there."
+      3. A running consecutive-hit streak is kept per front_cell (reset
+         to 0 whenever front_cell changes, or whenever a tick sees no
+         detection). sensitivity_frames=1 means the very first detected
+         frame is enough; higher values ride out a few glitchy/missed
+         frames before committing.
+      4. Once the streak reaches sensitivity_frames, in order:
+           a. node.set_stopped_for_obstacle(True) -- a GENUINE physical
+              stop: control_loop gates every tick to all-zero cmd_vel
+              for OBSTACLE_STOP_DURATION_S seconds, so the robot actually
+              comes to rest (not just a one-shot zero command that the
+              next independent control_loop tick could immediately
+              overwrite with the old leg's motion).
+           b. Hold for OBSTACLE_STOP_DURATION_S. ObstacleDetector and
+              this watcher's own loop are on independent threads and
+              keep running/updating the whole time -- the stop doesn't
+              pause detection.
+           c. A whole 3x3 BLOCK of cells is pinned (node.pin_cells(),
+              node.get_front_block_cells() -- depth 1-3 grid steps
+              ahead, width -1/0/+1 to either side of front_cell, since a
+              real obstacle is rarely smaller than one 50cm grid cell).
+           d. node.replan_current_goal() runs A* fresh from the
+              robot's now-settled position. Path planning (A*) only
+              ever runs at two points -- the initial goal, and right
+              here on a confirmed obstacle -- never continuously/on a
+              timer.
+           e. node.set_stopped_for_obstacle(False) -- releases the stop;
+              the freshly-planned first leg starts on the very next
+              control_loop tick. This is "go."
 
-    Logic each tick (once a real candidate signal exists again):
-      Identify the FRONT CELL (the world grid cell directly ahead of the
-      robot right now -- node.get_front_cell()) and check its map status
-      (node.get_cell_status()) BEFORE doing anything else:
-        - DONE + CLEAR  -> nothing to do, keep driving normally.
-        - DONE + OBSTACLE -> already known/pinned into the A* map
-          (avoidance already handled by planning), nothing to do here.
-        - NOT_DONE -> this is the only case that does any work:
-          evaluate _is_candidate(). A single candidate frame is NOT
-          enough (could be a glitch), so:
-            1. The first candidate frame while driving toward a
-               NOT_DONE front cell HOLDS the robot (stops, freezes the
-               current leg) for hold_duration_s seconds.
-            2. Every tick during the hold where _is_candidate() is still
-               true increments a hit counter.
-            3. When the hold window ends: if hit_count reached
-               confirm_count, the cell is confirmed OBSTACLE -- pinned
-               into node.obstacles (so A* avoids it) and the goal is
-               replanned. Otherwise the cell is confirmed CLEAR. Either
-               way the cell becomes DONE and is never re-processed.
-
-    hold_duration_s and confirm_count are live-adjustable from the GUI
-    (unchanged from before), and the whole watcher can be toggled on/off
-    (enabled) -- when disabled, detection/streaming keep running for
-    display, but no holds are ever started (and any in-progress hold is
-    released immediately). Runs its own background thread polling the
-    detector at DETECTION_FPS.
+    sensitivity_frames is live-adjustable from the GUI, and the whole
+    watcher can be toggled on/off (enabled). Runs its own background
+    thread polling the detector at DETECTION_FPS.
     """
 
     def __init__(self, node: 'GridNavNode', detector: ObstacleDetector,
-                 hold_duration_s=OBSTACLE_HOLD_DURATION_S,
-                 confirm_count=OBSTACLE_CONFIRM_COUNT):
+                 sensitivity_frames=OBSTACLE_SENSITIVITY_FRAMES):
         self.node = node
         self.detector = detector
 
         self._lock = threading.Lock()
-        self.hold_duration_s = hold_duration_s
-        self.confirm_count = confirm_count
+        self.sensitivity_frames = sensitivity_frames
         self.enabled = True
-        self._holding = False
-        self._hold_start = 0.0
-        self._hit_count = 0
-        self._hold_cell = None   # the front cell this hold is evaluating
+        self._streak_cell = None
+        self._hit_streak = 0
 
         self._running = False
         self._thread = None
 
-    def set_hold_duration(self, seconds):
-        if seconds <= 0:
+    def set_sensitivity(self, frames):
+        frames = int(frames)
+        if frames <= 0:
             return False
         with self._lock:
-            self.hold_duration_s = seconds
-        return True
-
-    def set_confirm_count(self, count):
-        if count <= 0:
-            return False
-        with self._lock:
-            self.confirm_count = int(count)
+            self.sensitivity_frames = frames
         return True
 
     def set_enabled(self, enabled: bool):
-        """Master on/off toggle from the GUI. Turning it off immediately
-        releases any in-progress hold so the robot isn't left stuck."""
+        """Master on/off toggle from the GUI."""
         with self._lock:
             self.enabled = enabled
-            was_holding = self._holding
             if not enabled:
-                self._holding = False
-        if not enabled and was_holding:
-            self.node.set_obstacle_hold(False)
+                self._streak_cell = None
+                self._hit_streak = 0
         return True
 
     def start(self):
@@ -1117,90 +1121,91 @@ class ObstacleWatcher:
             self._tick()
             time.sleep(interval)
 
-    # PAUSED -- see class docstring. ObstacleDetector's vertical-edge
-    # detection isn't wired into a candidate signal yet, so no hold ever
-    # starts until this is flipped and _is_candidate() below does real
-    # work. Surfaced via get_status()['paused'] so the GUI can show this
-    # honestly instead of a normal-looking "clear"/enabled status that
-    # implies avoidance is active when it structurally cannot fire.
-    PAUSED = True
-
     def _is_candidate(self):
-        # No real candidate signal wired up yet -- see PAUSED above.
-        return False
+        """Plain boolean -- does the detector see ANY accepted obstacle
+        right now? No size/geometry/cell-overlap check."""
+        return len(self.detector.get_detections()) > 0
 
     def _tick(self):
         with self._lock:
             enabled = self.enabled
-            holding = self._holding
+            sensitivity_frames = self.sensitivity_frames
         if not enabled:
             return
 
-        if not holding:
-            front_cell = self.node.get_front_cell()
-            if front_cell is None or not self.node.is_driving():
-                return
-            # DONE (either CLEAR or OBSTACLE) -- already resolved, nothing
-            # to do: CLEAR needs no action, OBSTACLE is already pinned and
-            # handled by A* planning.
-            if self.node.get_cell_status(front_cell) != 'NOT_DONE':
-                return
-            if self._is_candidate():
-                with self._lock:
-                    self._holding = True
-                    self._hold_start = time.monotonic()
-                    self._hit_count = 1
-                    self._hold_cell = front_cell
-                self.node.set_obstacle_hold(True)
+        front_cell = self.node.get_front_cell()
+        if front_cell is None or not self.node.is_driving() or self.node.is_cell_pinned(front_cell):
+            with self._lock:
+                self._streak_cell = None
+                self._hit_streak = 0
             return
 
-        if self._is_candidate():
-            with self._lock:
-                self._hit_count += 1
-
+        detected = self._is_candidate()
         with self._lock:
-            elapsed = time.monotonic() - self._hold_start
-            hold_duration_s = self.hold_duration_s
-            hit_count = self._hit_count
-            confirm_count = self.confirm_count
-            hold_cell = self._hold_cell
+            if front_cell != self._streak_cell:
+                self._streak_cell = front_cell
+                self._hit_streak = 0
+            self._hit_streak = self._hit_streak + 1 if detected else 0
+            hit_streak = self._hit_streak
 
-        if elapsed >= hold_duration_s:
-            if hit_count >= confirm_count:
-                self.node.set_cell_status(hold_cell, 'OBSTACLE')
-                if self.node.pin_cells([hold_cell]):
-                    self.node.replan_current_goal()
-            else:
-                self.node.set_cell_status(hold_cell, 'CLEAR')
+        if detected and hit_streak >= sensitivity_frames:
+            # STOP -> pin -> replan -> go, in that order -- and STOP
+            # means a genuine, physical halt, not just a one-shot zero
+            # publish that the next independent control_loop tick could
+            # immediately overwrite. set_stopped_for_obstacle(True) gates
+            # EVERY control_loop tick to all-zero for the whole duration
+            # below, so the robot actually comes to rest.
+            self.node.set_stopped_for_obstacle(True)
+            # Hold the stop for a real, human-perceptible moment.
+            # ObstacleDetector and this very watcher loop are on
+            # independent threads and are NOT paused by the stop -- the
+            # obstacle picture keeps updating live the entire time the
+            # robot is stopped, before the new plan starts moving.
+            time.sleep(OBSTACLE_STOP_DURATION_S)
+            # Snap self.x/self.y to the TRUE current position before
+            # pinning/replanning -- without this, a pin triggered
+            # mid-drive would reason from a stale, pre-leg position (see
+            # notebook_debug.txt). The robot is stopped now, so this is
+            # also just the robot's current resting position.
+            self.node.commit_live_position()
+            # Pin a 3x3 block (depth 1-3, width -1/0/+1), not just the
+            # single front cell -- a real obstacle is rarely smaller
+            # than one 50cm grid cell, so treating the detection as a
+            # single point underestimates its footprint.
+            if self.node.pin_cells(self.node.get_front_block_cells()):
+                # replan_current_goal() -> set_goal() runs A* fresh from
+                # the just-committed live position -- this is the only
+                # time path planning runs beyond the initial goal: at
+                # start, and again right here when an obstacle is
+                # confirmed. Never on a timer/poll.
+                self.node.replan_current_goal()
+            # Release the stop -- the new plan's first leg (ROTATE phase,
+            # already set up by replan_current_goal() above) starts on
+            # the very next control_loop tick. This is "go."
+            self.node.set_stopped_for_obstacle(False)
             with self._lock:
-                self._holding = False
-                self._hold_cell = None
-            self.node.set_obstacle_hold(False)
+                self._streak_cell = None
+                self._hit_streak = 0
 
     def get_candidate_cells(self):
-        """The single front cell currently being evaluated (mid-hold), as
-        a list for GUI compatibility -- lets the GUI show a stable
-        'being confirmed' box for the whole hold window."""
+        """The full 3x3 block (see get_front_block_cells()) currently
+        accumulating a hit streak, if any -- lets the GUI show exactly
+        the same fixed-shape block that will get pinned, instead of a
+        single point or a variable-sized box computed from detection
+        geometry. One pattern: appears (3x3) or doesn't."""
         with self._lock:
-            return [self._hold_cell] if self._hold_cell is not None else []
+            streaking = self._streak_cell is not None and self._hit_streak > 0
+        return self.node.get_front_block_cells() if streaking else []
 
     def get_status(self):
         with self._lock:
-            holding = self._holding
-            hit_count = self._hit_count
-            hold_start = self._hold_start
-            hold_duration_s = self.hold_duration_s
-            confirm_count = self.confirm_count
             enabled = self.enabled
-        remaining_s = max(0.0, hold_duration_s - (time.monotonic() - hold_start)) if holding else 0.0
+            sensitivity_frames = self.sensitivity_frames
+            hit_streak = self._hit_streak
         return {
             'enabled': enabled,
-            'paused': self.PAUSED,
-            'holding': holding,
-            'hit_count': hit_count,
-            'confirm_count': confirm_count,
-            'hold_duration_s': hold_duration_s,
-            'remaining_s': remaining_s,
+            'sensitivity_frames': sensitivity_frames,
+            'hit_streak': hit_streak,
         }
 
 
@@ -1291,13 +1296,6 @@ class GridNavNode(Node):
         # from manually-toggled cells.
         self.pinned_cells = set()
 
-        # Map-aware cell validation (ObstacleWatcher's area-density
-        # confirmation flow): (i, j) -> 'CLEAR' | 'OBSTACLE'. A cell
-        # missing from this dict is implicitly NOT_DONE (never checked).
-        # Once a cell is DONE (either value present), it's never
-        # re-processed -- see get_front_cell()/get_cell_status().
-        self.cell_status = {}
-
         self.planned_path = []       # [(x_cm, y_cm), ...] cell centers of the last A* route, for GUI overlay
 
         # Step mode: pause fully after each STEP_SIZE_CM of DRIVE travel
@@ -1307,12 +1305,13 @@ class GridNavNode(Node):
         self.awaiting_continue = False
         self.step_baseline_pulses = 0
 
-        # Set True by ObstacleWatcher while confirming a camera-detected
-        # obstacle (stop-and-recheck window) -- control_loop holds all-zero
-        # cmd_vel and does nothing else while this is set, then resumes the
-        # SAME leg from where it left off once cleared (nothing about the
-        # leg's phase/baseline pulses is touched during a hold).
-        self.obstacle_hold = False
+        # Set True by ObstacleWatcher for a genuine, physical all-zero
+        # stop (OBSTACLE_STOP_DURATION_S) once a cell is confirmed --
+        # control_loop holds all-zero cmd_vel and does nothing else while
+        # this is set, so the robot actually comes to rest before the
+        # new (replanned) path starts moving, instead of seamlessly
+        # redirecting straight from the old leg into the new one.
+        self.stopped_for_obstacle = False
 
         self.path = [(0.0, 0.0)]     # visited points, for GUI trail
 
@@ -1380,12 +1379,39 @@ class GridNavNode(Node):
                 # single point, but against a map that already accounts
                 # for the real ROBOT_SIZE_CM box's clearance needs.
                 inflated_obstacles = inflate_obstacles(self.obstacles, ROBOT_INFLATION_CELLS)
+                # Never let INFLATION ALONE (as opposed to a real pinned
+                # obstacle cell) block the start cell's own neighborhood.
+                # A confirmed obstacle is routinely pinned immediately
+                # next to the robot's current cell (see ObstacleWatcher --
+                # its 3x3 block starts at depth 1); inflating that by
+                # ROBOT_INFLATION_CELLS can produce a halo that completely
+                # encircles the robot's OWN start cell, making A* report
+                # "no path" even though stepping sideways around the real
+                # obstacle is clearly possible. Genuine obstacle cells
+                # (actually in self.obstacles, not just inflated) still
+                # block near the start -- only the extra inflation halo is
+                # cleared here.
+                near_start = {(start_cell[0] + di, start_cell[1] + dj)
+                              for di in range(-ROBOT_INFLATION_CELLS, ROBOT_INFLATION_CELLS + 1)
+                              for dj in range(-ROBOT_INFLATION_CELLS, ROBOT_INFLATION_CELLS + 1)}
+                inflated_obstacles -= (near_start - self.obstacles)
                 cell_path = astar_search(start_cell, goal_cell, inflated_obstacles)
                 if cell_path is None:
+                    # STOP -- do not silently leave the OLD legs/phase in
+                    # place. Without this, a failed replan (e.g. right
+                    # after pinning a freshly-confirmed obstacle) left the
+                    # robot blindly resuming its previous, now-invalid
+                    # leg -- driving straight into the very obstacle that
+                    # was just pinned.
                     self.goal = (gx, gy)
+                    self.state = 'IDLE'
+                    self.legs = []
+                    self.leg_idx = 0
+                    self.phase = None
+                    self.planned_path = []
                     self.get_logger().warn(
                         f'No path to ({gx:.1f}, {gy:.1f}) cm -- blocked by obstacles (incl. robot '
-                        f'clearance margin) or out of range.'
+                        f'clearance margin) or out of range. Stopped -- send a new goal once clear.'
                     )
                     return
                 legs = path_to_legs(cell_path, GRID_SPACING_CM)
@@ -1479,8 +1505,8 @@ class GridNavNode(Node):
         twist = Twist()
 
         with self._lock:
-            if self.obstacle_hold:
-                self.cmd_pub.publish(twist)  # all-zero -- held for obstacle confirmation
+            if self.stopped_for_obstacle:
+                self.cmd_pub.publish(twist)  # all-zero -- held for a genuine obstacle stop
                 return
 
             if self.state != 'RUNNING' or self.current_yaw is None or self.last_pulses is None:
@@ -1620,17 +1646,16 @@ class GridNavNode(Node):
 
     def is_driving(self):
         """True if control_loop is actively working a leg right now --
-        i.e. there's real motion an obstacle hold would actually interrupt."""
+        i.e. there's real motion an obstacle pin would actually affect."""
         with self._lock:
-            return self.state == 'RUNNING' and not self.awaiting_continue and not self.obstacle_hold
+            return self.state == 'RUNNING' and not self.awaiting_continue
 
     def get_front_cell(self):
         """The single world grid cell directly ahead of the robot's
         CURRENT (live, not stale leg-start) position and heading, one
-        GRID_SPACING_CM step forward. Used by ObstacleWatcher's
-        map-aware confirmation flow to decide which cell a NOT_DONE
-        observation should be attributed to. Returns None if heading
-        isn't known yet."""
+        GRID_SPACING_CM step forward. Used by ObstacleWatcher to decide
+        which cell a live detection should be attributed to. Returns
+        None if heading isn't known yet."""
         with self._lock:
             if self.heading_ref is None or self.current_yaw is None:
                 return None
@@ -1641,56 +1666,68 @@ class GridNavNode(Node):
             front_y = live_y + GRID_SPACING_CM * math.sin(rad)
             return self._to_cell(front_x, front_y)
 
-    def get_cell_status(self, cell):
-        """'NOT_DONE' (never checked), 'CLEAR' (checked, no obstacle), or
-        'OBSTACLE' (checked, confirmed obstacle) -- see cell_status."""
+    def get_front_block_cells(self):
+        """3 (deep) x 3 (wide) block of world grid cells extending
+        forward from the robot's CURRENT (live) position and heading --
+        depth 1-3 GRID_SPACING_CM steps ahead, width -1/0/+1 steps to
+        either side in the robot's own left/right frame. Used to pin a
+        confirmed obstacle as a block rather than a single point, since
+        a real obstacle is rarely smaller than one 50cm grid cell. E.g.
+        heading +X from (0,0): depth steps land on cells (1,0)/(2,0)/
+        (3,0), and the +/-1 lateral steps add (1,1)/(2,1)/(3,1) and
+        (1,-1)/(2,-1)/(3,-1) -- 9 cells total. Returns [] if heading
+        isn't known yet."""
         with self._lock:
-            return self.cell_status.get(cell, 'NOT_DONE')
+            if self.heading_ref is None or self.current_yaw is None:
+                return []
+            heading_deg = math.degrees(angle_diff(self.current_yaw, self.heading_ref))
+            rad = math.radians(heading_deg)
+            fx, fy = math.cos(rad), math.sin(rad)     # forward unit vector
+            lx, ly = -math.sin(rad), math.cos(rad)    # left unit vector (90deg CCW from forward)
+            live_x, live_y = self._live_position_locked()
+            cells = []
+            for depth in (1, 2, 3):
+                for lateral in (-1, 0, 1):
+                    wx = live_x + depth * GRID_SPACING_CM * fx + lateral * GRID_SPACING_CM * lx
+                    wy = live_y + depth * GRID_SPACING_CM * fy + lateral * GRID_SPACING_CM * ly
+                    cells.append(self._to_cell(wx, wy))
+            return cells
 
-    def set_cell_status(self, cell, status):
-        """Mark a cell DONE with the given result ('CLEAR' or
-        'OBSTACLE'). Once set, get_front_cell()/get_cell_status() callers
-        should not re-process this cell."""
+    def is_cell_pinned(self, cell):
         with self._lock:
-            self.cell_status[cell] = status
+            return cell in self.obstacles
 
-    def set_obstacle_hold(self, hold: bool):
+    def set_stopped_for_obstacle(self, stopped: bool):
+        """Gate for a genuine, physical all-zero stop -- see
+        stopped_for_obstacle in __init__ and control_loop. Publishes an
+        immediate zero cmd_vel the moment this is set True (on top of
+        control_loop's own gating, so the very first tick after this
+        call is already zero rather than waiting for the next timer
+        tick)."""
         with self._lock:
-            self.obstacle_hold = hold
-            if hold:
-                self._commit_live_position_locked()
-        if hold:
+            self.stopped_for_obstacle = stopped
+        if stopped:
             self.stop_robot()
 
-    def _commit_live_position_locked(self):
-        """Caller must hold self._lock. self.x/self.y are normally only
-        updated when a 'move' leg fully COMPLETES (see control_loop's
-        DRIVE phase) -- while mid-leg they still hold the position from
-        when the leg STARTED, even though the robot has actually
-        traveled leg_progress_cm further by now (see
-        _live_position_locked(), which computes but doesn't mutate this).
-        Called when an obstacle hold begins so that pin_cells()/
-        replan_current_goal() reason about the robot's TRUE current
-        position -- without this, a hold triggered mid-drive would pin
-        the obstacle and replan from a stale, pre-leg position,
+    def commit_live_position(self):
+        """Snap self.x/self.y to the TRUE current (mid-leg) position --
+        self.x/self.y are normally only updated when a 'move' leg fully
+        COMPLETES (see control_loop's DRIVE phase), so while mid-leg
+        they still hold the position from when the leg STARTED even
+        though the robot has actually traveled leg_progress_cm further
+        by now (see _live_position_locked()). Call this before pinning/
+        replanning from a live detection so A* plans from where the
+        robot actually is, not a stale leg-start point -- without this,
+        a pin triggered mid-drive would replan from a stale position,
         potentially routing the "avoidance" path right past the
-        obstacle's actual real-world location."""
-        if self.state != 'RUNNING' or self.phase != 'DRIVE' or not self.legs:
-            return
-        if self.legs[self.leg_idx][0] != 'move':
-            return
-        self.x, self.y = self._live_position_locked()
-        # Shrink the remaining distance on this leg to match, so if this
-        # turns out to be a glitch (no replan) and the SAME leg just
-        # resumes, it still ends at the original target point instead of
-        # overshooting by however much was already covered before the
-        # hold.
-        self.leg_target_distance_cm -= self.leg_progress_cm
-        self.leg_start_x = self.x
-        self.leg_start_y = self.y
-        self.leg_progress_cm = 0.0
-        self.leg_boxes_crossed = 0
-        self.leg_baseline_pulses = self.last_pulses
+        obstacle's actual real-world location. No-op if not currently
+        mid-DRIVE on a 'move' leg (nothing stale to commit)."""
+        with self._lock:
+            if self.state != 'RUNNING' or self.phase != 'DRIVE' or not self.legs:
+                return
+            if self.legs[self.leg_idx][0] != 'move':
+                return
+            self.x, self.y = self._live_position_locked()
 
     def pin_cells(self, cells):
         """Permanently add an arbitrary collection of (i, j) grid cells to
@@ -1862,8 +1899,7 @@ HTML_PAGE = """<!doctype html>
     </div>
     <form id="obWatchForm">
       <div class="row"><label style="display:inline"><input id="obEnabled" type="checkbox" style="width:auto" checked> Obstacle Avoidance Enabled</label></div>
-      <div class="row"><label>Obstacle Hold Duration (sec)</label><input id="obHoldSec" type="number" value="5" step="0.5" min="0.5"></div>
-      <div class="row"><label>Confirm Count (hits during hold)</label><input id="obConfirmCount" type="number" value="5" step="1" min="1"></div>
+      <div class="row"><label>Sensitivity (consecutive frames to pin, 1=instant)</label><input id="obSensitivity" type="number" value="3" step="1" min="1"></div>
       <button type="submit">Set Obstacle Watch</button>
     </form>
   </div>
@@ -1906,19 +1942,17 @@ const HALF_EXTENT = __HALF_EXTENT__;
 const SPACING = __SPACING__;
 const CANVAS_PX = __CANVAS_PX__;
 const ROBOT_SIZE = __ROBOT_SIZE__;
-const OBSTACLE_BOX_DEPTH = __OBSTACLE_BOX_DEPTH__;
 const SCALE = CANVAS_PX / (2 * HALF_EXTENT); // px per cm
 
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 let path = [];
 let lastGoal = null;
-let liveDetections = [];  // latest camera detections (distance_cm/bearing_deg), updated by pollDetections()
-let candidateCells = [];  // cells accumulated so far during an in-progress obstacle hold, updated by pollObstacleWatch()
+let candidateCells = [];  // 3x3 block currently building a hit streak (not yet pinned), updated by pollObstacleWatch()
 
 // Draw a single SPACING x SPACING world-cm grid cell as a filled+stroked
-// box on the canvas -- shared by obstacles/pinned-cells/candidate-cells/
-// live-detection rendering so they all look like consistent grid boxes.
+// box on the canvas -- shared by obstacles/pinned-cells/candidate-cells
+// rendering so they all look like consistent grid boxes.
 function drawCellBox(i, j, fillStyle, strokeStyle) {
   const cx = i * SPACING;
   const cy = j * SPACING;
@@ -2022,49 +2056,15 @@ function draw(state) {
     ctx.stroke();
   }
 
-  // candidate cells -- accumulated across the WHOLE current hold window
-  // (not just the latest tick), so this box stays stable/visible for the
-  // full hold instead of flickering with every noisy per-frame detection.
-  // Drawn yellow: "being evaluated, not confirmed yet."
+  // candidate block -- the fixed 3x3 block (see
+  // GridNavNode.get_front_block_cells()) currently building a
+  // consecutive-frame hit streak (not yet pinned), if any. ONE pattern,
+  // not computed from detection geometry: it either appears (3x3, next
+  // to the robot) or it doesn't. Drawn yellow: "being watched, not
+  // pinned yet." Once pinned it becomes part of state.obstacles/
+  // pinned_cells (solid red, drawn above) instead.
   for (const cell of candidateCells) {
     drawCellBox(cell[0], cell[1], 'rgba(255,220,0,0.45)', '#ffdc00');
-  }
-
-  // live camera-detected obstacles (this instant's raw detections, not yet
-  // even part of a hold, and not currently pinned into the obstacle map --
-  // ObstacleWatcher is paused, see its docstring) -- box projection: near
-  // edge at the measured distance, extending OBSTACLE_BOX_DEPTH further
-  // away (not centered on the point), spanning left-edge to right-edge
-  // bearing. Expected to flicker frame to frame -- it's the raw/
-  // unconfirmed signal, not the persisted obstacle map (see the solid red
-  // boxes above for what's actually pinned).
-  if (state.heading_deg !== null && state.heading_deg !== undefined) {
-    for (const det of liveDetections) {
-      if (det.distance_cm === null || det.distance_cm === undefined) continue;
-      if (det.bearing_deg === null || det.bearing_deg === undefined) continue;
-      const bearings = [det.left_bearing_deg, det.bearing_deg, det.right_bearing_deg]
-            .filter(b => b !== null && b !== undefined);
-      const distances = [det.distance_cm, det.distance_cm + OBSTACLE_BOX_DEPTH];
-      const cellIs = [], cellJs = [];
-      for (const bearingDeg of bearings) {
-        const worldBearingRad = (state.heading_deg + bearingDeg) * Math.PI / 180;
-        const cosB = Math.cos(worldBearingRad), sinB = Math.sin(worldBearingRad);
-        for (const d of distances) {
-          const ox = state.x + d * cosB;
-          const oy = state.y + d * sinB;
-          cellIs.push(Math.round(ox / SPACING));
-          cellJs.push(Math.round(oy / SPACING));
-        }
-      }
-      if (!cellIs.length) continue;
-      const iMin = Math.min(...cellIs), iMax = Math.max(...cellIs);
-      const jMin = Math.min(...cellJs), jMax = Math.max(...cellJs);
-      for (let ci = iMin; ci <= iMax; ci++) {
-        for (let cj = jMin; cj <= jMax; cj++) {
-          drawCellBox(ci, cj, 'rgba(255,165,0,0.35)', '#ffa500');
-        }
-      }
-    }
   }
 
   // goal marker
@@ -2283,7 +2283,6 @@ async function pollDetections() {
   try {
     const res = await fetch('/api/detections');
     const ds = await res.json();
-    liveDetections = ds.detections;  // cached for draw() to project onto the grid map
     const container = document.getElementById('detectionBoxes');
     container.innerHTML = '';
     for (const det of ds.detections) {
@@ -2341,17 +2340,16 @@ async function pollObstacleWatch() {
     candidateCells = ow.candidate_cells || [];
     if (!ow.active) {
       set('s-obwatch', 'n/a (no camera)');
-    } else if (ow.paused) {
-      set('s-obwatch', 'PAUSED -- detection not wired to avoidance yet (add obstacles manually)');
     } else if (!ow.enabled) {
       set('s-obwatch', 'DISABLED');
-    } else if (ow.holding) {
-      set('s-obwatch', `HOLDING -- ${ow.hit_count}/${ow.confirm_count} confirmations, ${ow.remaining_s.toFixed(1)}s left`);
+    } else if (ow.hit_streak > 0) {
+      set('s-obwatch', `WATCHING -- ${ow.hit_streak}/${ow.sensitivity_frames} consecutive frames`);
     } else {
-      set('s-obwatch', `clear (hold=${ow.hold_duration_s}s, confirm=${ow.confirm_count})`);
+      set('s-obwatch', `clear (sensitivity=${ow.sensitivity_frames} frame(s))`);
     }
     if (ow.front_cell) {
-      set('s-front-cell', `(${ow.front_cell[0]}, ${ow.front_cell[1]}) -- ${ow.front_cell_status}`);
+      const pinnedText = ow.front_cell_pinned ? 'PINNED' : 'not pinned';
+      set('s-front-cell', `(${ow.front_cell[0]}, ${ow.front_cell[1]}) -- ${pinnedText}`);
     } else {
       set('s-front-cell', 'n/a');
     }
@@ -2363,12 +2361,11 @@ async function pollObstacleWatch() {
 document.getElementById('obWatchForm').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const enabled = document.getElementById('obEnabled').checked;
-  const holdSec = parseFloat(document.getElementById('obHoldSec').value);
-  const confirmCount = parseInt(document.getElementById('obConfirmCount').value, 10);
+  const sensitivity = parseInt(document.getElementById('obSensitivity').value, 10);
   await fetch('/api/obstacle_watch_settings', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({enabled: enabled, hold_duration_s: holdSec, confirm_count: confirmCount})
+    body: JSON.stringify({enabled: enabled, sensitivity_frames: sensitivity})
   });
 });
 
@@ -2399,8 +2396,7 @@ def render_page():
             .replace('__STEP_SIZE__', f'{STEP_SIZE_CM / 100:.1f}')
             .replace('__FORWARD_SPEED__', f'{FORWARD_SPEED:.2f}')
             .replace('__ROTATE_SPEED__', f'{ROTATE_SPEED:.2f}')
-            .replace('__ROBOT_SIZE__', str(ROBOT_SIZE_CM))
-            .replace('__OBSTACLE_BOX_DEPTH__', str(OBSTACLE_BOX_DEPTH_CM)))
+            .replace('__ROBOT_SIZE__', str(ROBOT_SIZE_CM)))
 
 
 def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
@@ -2514,7 +2510,7 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
         status['candidate_cells'] = [list(c) for c in watcher.get_candidate_cells()]
         front_cell = node.get_front_cell()
         status['front_cell'] = list(front_cell) if front_cell is not None else None
-        status['front_cell_status'] = node.get_cell_status(front_cell) if front_cell is not None else None
+        status['front_cell_pinned'] = node.is_cell_pinned(front_cell) if front_cell is not None else None
         return jsonify(status)
 
     @app.route('/api/obstacle_watch_settings', methods=['POST'])
@@ -2523,20 +2519,15 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
             return jsonify({'ok': False, 'error': 'no obstacle watcher running (camera unavailable)'}), 400
         data = request.get_json(force=True)
         ok = True
-        if 'hold_duration_s' in data:
+        if 'sensitivity_frames' in data:
             try:
-                ok = watcher.set_hold_duration(float(data['hold_duration_s'])) and ok
-            except (TypeError, ValueError):
-                ok = False
-        if 'confirm_count' in data:
-            try:
-                ok = watcher.set_confirm_count(int(data['confirm_count'])) and ok
+                ok = watcher.set_sensitivity(int(data['sensitivity_frames'])) and ok
             except (TypeError, ValueError):
                 ok = False
         if 'enabled' in data:
             watcher.set_enabled(bool(data['enabled']))
         if not ok:
-            return jsonify({'ok': False, 'error': 'invalid hold_duration_s/confirm_count'}), 400
+            return jsonify({'ok': False, 'error': 'invalid sensitivity_frames'}), 400
         return jsonify({'ok': True})
 
     @app.route('/api/state')
