@@ -163,7 +163,41 @@ LOOP_HZ = 20.0                 # control loop rate
 GUI_HZ = 12.0                  # GUI poll/redraw rate
 
 GRID_SPACING_CM = 50            # gridline spacing (box size), cosmetic + step-mode size
-GRID_HALF_EXTENT_CM = 500       # initial view: +/- this many cm (10m x 10m total)
+GRID_LABEL_SPACING_CM = 100     # axis tick LABELS every 1m -- gridlines themselves still
+                                 # drawn every GRID_SPACING_CM; labeling every 50cm was clutter
+# GUI map view: mostly the +X/+Y quadrant (the robot starts at (0,0) and
+# the court -- see COURT_* below -- lives entirely in positive
+# coordinates), but with a small negative strip kept visible on both
+# axes too (enough to see -1m/-2m gridlines+labels) -- fully clipping at
+# 0 felt too tight/cramped right at the edge the robot starts on.
+GRID_VIEW_EXTENT_CM = 2700      # view spans world (-GRID_VIEW_NEGATIVE_CM, same) to
+                                 # (this, this) cm -- big enough to fit the tennis court + margin
+GRID_VIEW_NEGATIVE_CM = 200     # how far negative (both axes) stays visible -- shows -1m/-2m
+
+# Tennis court overlay, drawn on the GUI map for reference (not used for
+# navigation/obstacle logic -- purely visual). Real doubles court is
+# 23.77m x 10.97m; rounded here to 24m x 11m. Rotated 90deg CCW from its
+# "natural" length-along-X orientation, so on screen the LENGTH (24m,
+# baseline to baseline) runs along +Y (vertical) and the WIDTH (11m,
+# doubles sideline to sideline) runs along +X (horizontal) -- see the
+# JS draw() code, which swaps the two axes for exactly this rotation
+# rather than using a canvas rotate() transform (simpler for an
+# axis-aligned 90deg turn, and keeps the rectangle's bounding box trivial
+# to compute). Split into two halves by a center NET line (perpendicular
+# to the length, at the midpoint, so now a HORIZONTAL line) "like a real
+# court." A COURT_MARGIN_CELLS-cell (100cm) margin separates the overall
+# anchor point from the court's own boundary: the outer margin's
+# bottom-left corner sits at world (0, 0) -- the same origin the robot
+# starts at -- and the court's OWN bottom-left corner (its actual
+# playing-surface boundary) sits COURT_MARGIN_CM further in on both
+# axes, i.e. at cell (2, 2) / world (100, 100) cm, with the same margin
+# mirrored on the far/top and right sides.
+COURT_LENGTH_CM = 2400          # 24m, baseline to baseline -- along +Y after the CCW rotation
+COURT_WIDTH_CM = 1100           # 11m, doubles sideline to sideline -- along +X after the CCW rotation
+COURT_MARGIN_CELLS = 2
+COURT_MARGIN_CM = COURT_MARGIN_CELLS * GRID_SPACING_CM   # 100cm
+COURT_ORIGIN_X_CM = COURT_MARGIN_CM   # court's own bottom-left corner, world X
+COURT_ORIGIN_Y_CM = COURT_MARGIN_CM   # court's own bottom-left corner, world Y
 
 # Step-mode distance per box, for isolating the distance calibration by
 # measuring one grid box at a time instead of a whole multi-box leg in one
@@ -171,9 +205,12 @@ GRID_HALF_EXTENT_CM = 500       # initial view: +/- this many cm (10m x 10m tota
 STEP_SIZE_CM = GRID_SPACING_CM
 
 # A* plans over the same GRID_SPACING_CM cells shown on the GUI grid.
-# Search is bounded to the visible grid so an unreachable goal (e.g. fully
-# walled off) fails fast instead of scanning an unbounded plane.
-PLANNING_HALF_EXTENT_CELLS = GRID_HALF_EXTENT_CM // GRID_SPACING_CM
+# Search is bounded (symmetrically -- unlike the GUI's positive-quadrant-
+# only VIEW, A* itself still allows negative cells, e.g. for an
+# obstacle detour that briefly swings around the +X/+Y axes) so an
+# unreachable goal (e.g. fully walled off) fails fast instead of
+# scanning an unbounded plane.
+PLANNING_HALF_EXTENT_CELLS = GRID_VIEW_EXTENT_CM // GRID_SPACING_CM
 SQRT2 = math.sqrt(2.0)
 
 # Robot footprint, for A* obstacle clearance: (x, y) is tracked at the
@@ -1973,11 +2010,18 @@ HTML_PAGE = """<!doctype html>
 </div>
 
 <script>
-const HALF_EXTENT = __HALF_EXTENT__;
+const VIEW_EXTENT = __VIEW_EXTENT__;
+const VIEW_NEGATIVE = __VIEW_NEGATIVE__;
 const SPACING = __SPACING__;
+const LABEL_SPACING = __LABEL_SPACING__;
 const CANVAS_PX = __CANVAS_PX__;
 const ROBOT_SIZE = __ROBOT_SIZE__;
-const SCALE = CANVAS_PX / (2 * HALF_EXTENT); // px per cm
+const COURT_LENGTH = __COURT_LENGTH__;
+const COURT_WIDTH = __COURT_WIDTH__;
+const COURT_ORIGIN_X = __COURT_ORIGIN_X__;
+const COURT_ORIGIN_Y = __COURT_ORIGIN_Y__;
+const VIEW_SPAN = VIEW_NEGATIVE + VIEW_EXTENT; // total world-cm width/height the canvas covers
+const SCALE = CANVAS_PX / VIEW_SPAN; // px per cm -- view is world (-VIEW_NEGATIVE, -VIEW_NEGATIVE) to (VIEW_EXTENT, VIEW_EXTENT)
 
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
@@ -2001,22 +2045,28 @@ function drawCellBox(i, j, fillStyle, strokeStyle) {
 }
 
 function toPx(xcm, ycm) {
-  return [CANVAS_PX / 2 + xcm * SCALE, CANVAS_PX / 2 - ycm * SCALE];
+  // World (-VIEW_NEGATIVE, -VIEW_NEGATIVE) sits at the canvas's
+  // BOTTOM-LEFT corner -- mostly the +X/+Y quadrant, matching where the
+  // robot starts and the court lives, but with a small negative strip
+  // (VIEW_NEGATIVE cm) kept visible on both axes too. (Y is still
+  // flipped: canvas Y grows downward, world Y grows upward.)
+  return [(xcm + VIEW_NEGATIVE) * SCALE, CANVAS_PX - (ycm + VIEW_NEGATIVE) * SCALE];
 }
 
 function draw(state) {
   ctx.clearRect(0, 0, CANVAS_PX, CANVAS_PX);
 
-  // grid
+  // grid -- mostly +X/+Y, plus a small VIEW_NEGATIVE strip on both axes
   ctx.strokeStyle = '#333';
   ctx.lineWidth = 1;
-  for (let c = -HALF_EXTENT; c <= HALF_EXTENT; c += SPACING) {
+  for (let c = -VIEW_NEGATIVE; c <= VIEW_EXTENT; c += SPACING) {
     let [px, ] = toPx(c, 0);
     ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, CANVAS_PX); ctx.stroke();
     let [, py] = toPx(0, c);
     ctx.beginPath(); ctx.moveTo(0, py); ctx.lineTo(CANVAS_PX, py); ctx.stroke();
   }
-  // axes
+  // axes (world X=0 / Y=0 lines) -- inset from the canvas edges by
+  // VIEW_NEGATIVE now, rather than sitting exactly on them.
   ctx.strokeStyle = '#666';
   ctx.lineWidth = 1.5;
   let [ox, oy] = toPx(0, 0);
@@ -2024,26 +2074,59 @@ function draw(state) {
   ctx.beginPath(); ctx.moveTo(0, oy); ctx.lineTo(CANVAS_PX, oy); ctx.stroke();
 
   // axis tick labels, in meters (1 decimal) -- internal math stays in cm
-  // throughout, this only affects the displayed text. Skips 0 on each axis
-  // to avoid overlap at the origin. View is a fixed +/-HALF_EXTENT square
-  // (no panning), so the origin (ox, oy) is always the canvas center --
-  // labels always go below/right of the axes.
+  // throughout, this only affects the displayed text. Labeled every
+  // LABEL_SPACING (1m), not every SPACING (50cm) gridline -- labeling
+  // every gridline was clutter. Skips 0 at the origin to avoid overlap.
+  // Covers the negative strip too (e.g. -1.0, -2.0). X-axis labels sit
+  // just ABOVE the X-axis line; Y-axis labels sit just right of the
+  // Y-axis line -- both now have canvas space on the "far" side too
+  // (the negative strip), unlike when the origin sat exactly on the
+  // corner.
   ctx.fillStyle = '#999';
   ctx.font = '11px monospace';
-  for (let c = -HALF_EXTENT; c <= HALF_EXTENT; c += SPACING) {
+  for (let c = -VIEW_NEGATIVE; c <= VIEW_EXTENT; c += LABEL_SPACING) {
     if (c === 0) continue;
     const m = (c / 100).toFixed(1);
     let [px, ] = toPx(c, 0);
     ctx.textAlign = 'center';
-    ctx.fillText(m, px, oy + 14);
+    ctx.fillText(m, px, oy - 6);
     let [, py] = toPx(0, c);
     ctx.textAlign = 'left';
-    ctx.fillText(m, ox + 4, py + 4);
+    ctx.fillText(m, ox + 4, py + 12);
   }
   ctx.textAlign = 'left';
   ctx.fillStyle = '#ccc';
-  ctx.fillText('X (m)', CANVAS_PX - 40, oy - 6);
+  ctx.fillText('X (m)', CANVAS_PX - 40, oy - 20);
   ctx.fillText('Y (m)', ox + 6, 12);
+
+  // tennis court overlay -- purely visual reference, not used by
+  // navigation/obstacle logic. Bottom-left corner at world
+  // (COURT_ORIGIN_X, COURT_ORIGIN_Y) cm -- COURT_MARGIN_CELLS (2 cells /
+  // 100cm) in from the origin (0,0) on both axes, matching the same
+  // margin mirrored on the far/top and right sides. Rotated 90deg CCW
+  // from its "natural" orientation: COURT_LENGTH (24m) runs along +Y
+  // (vertical) here, COURT_WIDTH (11m) runs along +X (horizontal) --
+  // just an axis swap, since it's an axis-aligned 90deg turn. Split
+  // into two halves by a center NET line "like a real court" -- now a
+  // HORIZONTAL line, since the net is always perpendicular to the
+  // length.
+  const [cx0, cy0] = toPx(COURT_ORIGIN_X, COURT_ORIGIN_Y + COURT_LENGTH); // top-left in canvas space (Y flipped)
+  const courtWpx = COURT_WIDTH * SCALE;
+  const courtHpx = COURT_LENGTH * SCALE;
+  ctx.fillStyle = 'rgba(40,120,200,0.12)';
+  ctx.fillRect(cx0, cy0, courtWpx, courtHpx);
+  ctx.strokeStyle = '#e8e8e8';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(cx0, cy0, courtWpx, courtHpx);
+  // net -- perpendicular to the length, at the midpoint -- splits the
+  // court into its two sides. Horizontal now that length runs along Y.
+  const [, netPy] = toPx(0, COURT_ORIGIN_Y + COURT_LENGTH / 2);
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(cx0, netPy);
+  ctx.lineTo(cx0 + courtWpx, netPy);
+  ctx.stroke();
 
   // obstacles (blocked A* cells) -- manually-toggled cells drawn light/
   // semi-transparent; CONFIRMED camera-pinned cells (a subset) drawn
@@ -2242,8 +2325,10 @@ canvas.addEventListener('click', async (ev) => {
   const rect = canvas.getBoundingClientRect();
   const px = (ev.clientX - rect.left) * (CANVAS_PX / rect.width);
   const py = (ev.clientY - rect.top) * (CANVAS_PX / rect.height);
-  const xcm = (px - CANVAS_PX / 2) / SCALE;
-  const ycm = -(py - CANVAS_PX / 2) / SCALE;
+  // Inverse of toPx() -- world (-VIEW_NEGATIVE, -VIEW_NEGATIVE) is the
+  // canvas's bottom-left corner.
+  const xcm = px / SCALE - VIEW_NEGATIVE;
+  const ycm = (CANVAS_PX - py) / SCALE - VIEW_NEGATIVE;
   const i = Math.round(xcm / SPACING);
   const j = Math.round(ycm / SPACING);
   await fetch('/api/toggle_obstacle', {
@@ -2421,19 +2506,25 @@ pollObstacleWatch();
 
 WEB_PORT = 8080
 GUI_POLL_MS = int(1000 / GUI_HZ)
-CANVAS_PX = 900  # bumped up from 700 for a bigger view of the 5m x 5m grid
+CANVAS_PX = 1100  # canvas is always square; view spans world (0,0) to (GRID_VIEW_EXTENT_CM, GRID_VIEW_EXTENT_CM)
 
 
 def render_page():
     return (HTML_PAGE
-            .replace('__HALF_EXTENT__', str(GRID_HALF_EXTENT_CM))
+            .replace('__VIEW_EXTENT__', str(GRID_VIEW_EXTENT_CM))
+            .replace('__VIEW_NEGATIVE__', str(GRID_VIEW_NEGATIVE_CM))
             .replace('__SPACING__', str(GRID_SPACING_CM))
+            .replace('__LABEL_SPACING__', str(GRID_LABEL_SPACING_CM))
             .replace('__CANVAS_PX__', str(CANVAS_PX))
             .replace('__POLL_MS__', str(GUI_POLL_MS))
             .replace('__STEP_SIZE__', f'{STEP_SIZE_CM / 100:.1f}')
             .replace('__FORWARD_SPEED__', f'{FORWARD_SPEED:.2f}')
             .replace('__ROTATE_SPEED__', f'{ROTATE_SPEED:.2f}')
-            .replace('__ROBOT_SIZE__', str(ROBOT_SIZE_CM)))
+            .replace('__ROBOT_SIZE__', str(ROBOT_SIZE_CM))
+            .replace('__COURT_LENGTH__', str(COURT_LENGTH_CM))
+            .replace('__COURT_WIDTH__', str(COURT_WIDTH_CM))
+            .replace('__COURT_ORIGIN_X__', str(COURT_ORIGIN_X_CM))
+            .replace('__COURT_ORIGIN_Y__', str(COURT_ORIGIN_Y_CM)))
 
 
 def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
