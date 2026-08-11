@@ -55,7 +55,10 @@ GUI:
 
 Requires Flask (pip install flask) and OpenCV (sudo apt install
 python3-opencv, or pip install opencv-python) in addition to your
-ROS2 env.
+ROS2 env. AprilTag-based position correction (see AprilTagLocalizer)
+additionally needs `pip install pupil-apriltags` -- optional: if it's
+not installed, that one feature is silently unavailable (logged once at
+startup) and everything else still runs normally.
 
 Run (after sourcing your ROS2 setup):
     python3 grid_nav.py
@@ -74,6 +77,11 @@ from geometry_msgs.msg import Twist
 from std_msgs.msg import Int32MultiArray
 
 from flask import Flask, jsonify, request, Response
+
+try:
+    from pupil_apriltags import Detector as AprilTagDetector
+except ImportError:
+    AprilTagDetector = None  # AprilTagLocalizer disables itself -- see its __init__
 
 SCRIPT_VERSION = "v2.0 - web GUI"
 
@@ -358,6 +366,51 @@ OBSTACLE_SENSITIVITY_FRAMES = 3
 OBSTACLE_STOP_DURATION_S = 1.0
 # -------------------------------------------------
 
+# AprilTag-based position correction (AprilTagLocalizer): a physical
+# AprilTag placed at a KNOWN world position (APRILTAG_WORLD_X_CM,
+# APRILTAG_WORLD_Y_CM cm) acts as a landmark to correct accumulated
+# encoder/IMU drift. Deliberately does NOT reuse CameraRangefinder's
+# ground-plane VFOV heuristic (that's a floor-projection guess, tuned
+# for obstacle ranging, not precision) -- instead uses the
+# `pupil_apriltags` library's own pose estimation, which solves for the
+# tag's 3D position directly from its actual apparent size/shape in the
+# image (a real PnP solve) against the tag's true physical size and the
+# camera's intrinsic parameters below. This is a fundamentally more
+# direct and accurate distance cue for a known, flat, known-size marker
+# than the floor-heuristic method.
+#
+# Logic: every detection tick, if the CONFIGURED tag ID is visible AND
+# its estimated distance is at or under APRILTAG_TRIGGER_DISTANCE_CM,
+# the robot's tracked (x, y) is corrected (snapped) to the tag's known
+# world position -- otherwise (not visible, or visible but farther than
+# the trigger distance) nothing happens.
+#
+# All of these are GUI/API-adjustable (tag ID, world position, physical
+# size, trigger distance) so a tag can be repositioned/reconfigured
+# without editing code.
+APRILTAG_FAMILY = 'tag36h11'          # standard AprilTag family; not GUI-exposed (would need a detector restart)
+APRILTAG_DEFAULT_ID = 0
+APRILTAG_DEFAULT_WORLD_X_CM = 0.0
+APRILTAG_DEFAULT_WORLD_Y_CM = 1300.0  # 13m -- the court's half-line, per notebook_debug.txt
+APRILTAG_DEFAULT_SIZE_CM = 16.0       # physical printed edge length of the tag's black square
+APRILTAG_TRIGGER_DISTANCE_CM = 50.0
+APRILTAG_FPS = 5.0                    # own detection thread, independent of DETECTION_FPS
+APRILTAG_QUAD_DECIMATE = 1.0          # pupil_apriltags defaults to 2.0 (half-res pre-downsample for
+                                       # speed), which can push a tag below the detector's minimum
+                                       # resolvable size at typical webcam resolutions/distances --
+                                       # 1.0 = full resolution, most accurate/sensitive, still cheap
+                                       # enough at APRILTAG_FPS=5Hz on its own thread
+
+# Camera intrinsics for AprilTag pose estimation (fx, fy focal length in
+# pixels -- square-pixel assumption; cx, cy principal point, defaulted
+# to the image center). These are a REASONABLE STARTING GUESS, not a
+# true checkerboard calibration -- accuracy of the trigger distance is
+# only as good as these. GUI/API-adjustable so they can be tuned against
+# a tag at a known measured distance without editing code.
+APRILTAG_DEFAULT_FX = 600.0
+APRILTAG_DEFAULT_FY = 600.0
+# -------------------------------------------------
+
 
 def quaternion_to_yaw(x, y, z, w):
     siny_cosp = 2.0 * (w * z + x * y)
@@ -496,7 +549,57 @@ def inflate_obstacles(obstacles, radius_cells):
 # waypoints via GridNavNode.run_path() -- no live coverage planning,
 # just a canned route derived from the court geometry above (COURT_*),
 # so it automatically follows the court if those constants ever change.
+#
+# Modes A/B's sweep EXTENT (how far it travels in X and Y) and ROW STEP
+# (the Y-axis change between successive sweep rows) are live-adjustable
+# from the GUI via ModePathSettings below -- but each mode's START POINT
+# always stays pinned to its own court corner (top-left for A, bottom-left
+# for B), only the far edge of the sweep moves with the length settings.
+MODE_X_LENGTH_CM = COURT_WIDTH_CM            # default: full court width
+MODE_Y_LENGTH_CM = COURT_LENGTH_CM / 2.0     # default: half court length (to the net line)
 MODE_ROW_STEP_CM = 200   # 2m step between boustrophedon rows (modes A/B)
+
+
+class ModePathSettings:
+    """Live-adjustable X/Y sweep length and row step for the Mode A/B
+    U-pattern coverage paths (see get_mode_a_waypoints/get_mode_b_waypoints
+    below). Same lock-guarded get/set pattern as the other adjustable
+    settings in this file (e.g. ObstacleDetector)."""
+
+    def __init__(self, x_length_cm=MODE_X_LENGTH_CM, y_length_cm=MODE_Y_LENGTH_CM,
+                 row_step_cm=MODE_ROW_STEP_CM):
+        self._lock = threading.Lock()
+        self._x_length_cm = x_length_cm
+        self._y_length_cm = y_length_cm
+        self._row_step_cm = row_step_cm
+
+    def set_x_length(self, x_length_cm):
+        x_length_cm = float(x_length_cm)
+        if x_length_cm <= 0:
+            return False
+        with self._lock:
+            self._x_length_cm = x_length_cm
+        return True
+
+    def set_y_length(self, y_length_cm):
+        y_length_cm = float(y_length_cm)
+        if y_length_cm <= 0:
+            return False
+        with self._lock:
+            self._y_length_cm = y_length_cm
+        return True
+
+    def set_row_step(self, row_step_cm):
+        row_step_cm = float(row_step_cm)
+        if row_step_cm <= 0:
+            return False
+        with self._lock:
+            self._row_step_cm = row_step_cm
+        return True
+
+    def get(self):
+        with self._lock:
+            return (self._x_length_cm, self._y_length_cm, self._row_step_cm)
 
 
 def _boustrophedon_waypoints(x_left, x_right, y_start, y_end, row_step_cm):
@@ -531,28 +634,33 @@ def _boustrophedon_waypoints(x_left, x_right, y_start, y_end, row_step_cm):
     return waypoints
 
 
-def get_mode_a_waypoints():
-    """Mode A: U-pattern coverage of the court's TOP half (far end, at
-    max Y, down to the net/half-court line), starting at the court's own
-    top-left corner, 2m rows, finishing back at the origin (0, 0)."""
+def get_mode_a_waypoints(x_length_cm=MODE_X_LENGTH_CM, y_length_cm=MODE_Y_LENGTH_CM,
+                          row_step_cm=MODE_ROW_STEP_CM):
+    """Mode A: U-pattern coverage starting at the court's own top-left
+    corner (SAME start point regardless of the length settings), sweeping
+    x_length_cm to the right and y_length_cm DOWNWARD (toward the net),
+    row_step_cm between rows, finishing back at the origin (0, 0)."""
     x_left = COURT_ORIGIN_X_CM
-    x_right = COURT_ORIGIN_X_CM + COURT_WIDTH_CM
+    x_right = COURT_ORIGIN_X_CM + x_length_cm
     y_top = COURT_ORIGIN_Y_CM + COURT_LENGTH_CM
-    y_half = COURT_ORIGIN_Y_CM + COURT_LENGTH_CM / 2.0
-    waypoints = _boustrophedon_waypoints(x_left, x_right, y_top, y_half, MODE_ROW_STEP_CM)
+    y_end = y_top - y_length_cm
+    waypoints = _boustrophedon_waypoints(x_left, x_right, y_top, y_end, row_step_cm)
     waypoints.append((0.0, 0.0))
     return waypoints
 
 
-def get_mode_b_waypoints():
-    """Mode B: same U-pattern as Mode A, mirrored onto the court's
-    BOTTOM half (near end, at the court's own bottom-left corner, up to
-    the net/half-court line), finishing back at the origin (0, 0)."""
+def get_mode_b_waypoints(x_length_cm=MODE_X_LENGTH_CM, y_length_cm=MODE_Y_LENGTH_CM,
+                          row_step_cm=MODE_ROW_STEP_CM):
+    """Mode B: same U-pattern as Mode A, starting at the court's own
+    bottom-left corner (SAME start point regardless of the length
+    settings), sweeping x_length_cm to the right and y_length_cm UPWARD
+    (toward the net), row_step_cm between rows, finishing back at the
+    origin (0, 0)."""
     x_left = COURT_ORIGIN_X_CM
-    x_right = COURT_ORIGIN_X_CM + COURT_WIDTH_CM
+    x_right = COURT_ORIGIN_X_CM + x_length_cm
     y_bottom = COURT_ORIGIN_Y_CM
-    y_half = COURT_ORIGIN_Y_CM + COURT_LENGTH_CM / 2.0
-    waypoints = _boustrophedon_waypoints(x_left, x_right, y_bottom, y_half, MODE_ROW_STEP_CM)
+    y_end = y_bottom + y_length_cm
+    waypoints = _boustrophedon_waypoints(x_left, x_right, y_bottom, y_end, row_step_cm)
     waypoints.append((0.0, 0.0))
     return waypoints
 
@@ -1227,7 +1335,7 @@ class ObstacleWatcher:
 
         self._lock = threading.Lock()
         self.sensitivity_frames = sensitivity_frames
-        self.enabled = True
+        self.enabled = False
         self._streak_cell = None
         self._hit_streak = 0
 
@@ -1352,6 +1460,240 @@ class ObstacleWatcher:
             'enabled': enabled,
             'sensitivity_frames': sensitivity_frames,
             'hit_streak': hit_streak,
+        }
+
+
+class AprilTagLocalizer:
+    """Corrects accumulated encoder/IMU position drift using a single
+    physical AprilTag placed at a known world (x, y) position.
+
+    Deliberately does NOT use CameraRangefinder's ground-plane VFOV
+    heuristic (that method projects a pixel row onto an assumed-flat
+    floor via the camera's tilt/height -- a reasonable approximation for
+    obstacle ranging, but not precise). Instead this uses the
+    `pupil_apriltags` library's own pose estimation: given the tag's
+    TRUE physical size and the camera's intrinsic parameters (fx, fy,
+    cx, cy), it solves directly for the tag's 3D position from its
+    actual apparent shape/size in the image (a real PnP solve on a
+    flat, known-size marker) -- a fundamentally more direct and accurate
+    distance cue for this specific job.
+
+    Logic each tick (APRILTAG_FPS):
+      1. Detect all AprilTags in the latest camera frame.
+      2. If the CONFIGURED tag_id isn't among them: nothing to do.
+      3. If it is: compute distance_cm = the norm of the pose's
+         translation vector (camera-to-tag straight-line distance).
+      4. If distance_cm > trigger_distance_cm: nothing to do (too far to
+         trust yet).
+      5. If distance_cm <= trigger_distance_cm:
+         node.correct_position_from_tag(world_x_cm, world_y_cm) -- snaps
+         the robot's tracked position to the tag's known location. Fires
+         on EVERY qualifying tick (not just once), so the correction
+         keeps re-affirming/tightening while the robot lingers within
+         range, rather than a single one-shot snap.
+
+    tag_id, world_x_cm, world_y_cm, tag_size_cm, trigger_distance_cm,
+    fx, fy, cx, cy are all GUI/API-adjustable. If the `pupil_apriltags`
+    package isn't installed (see AprilTagDetector import guard at the
+    top of this file), the localizer safely disables itself -- start()
+    logs a warning and does nothing, no detection thread is started, and
+    no other feature is affected.
+    """
+
+    def __init__(self, camera: 'CameraStreamer', node: 'GridNavNode',
+                 fps=APRILTAG_FPS,
+                 tag_id=APRILTAG_DEFAULT_ID,
+                 world_x_cm=APRILTAG_DEFAULT_WORLD_X_CM,
+                 world_y_cm=APRILTAG_DEFAULT_WORLD_Y_CM,
+                 tag_size_cm=APRILTAG_DEFAULT_SIZE_CM,
+                 trigger_distance_cm=APRILTAG_TRIGGER_DISTANCE_CM,
+                 fx=APRILTAG_DEFAULT_FX, fy=APRILTAG_DEFAULT_FY,
+                 cx=None, cy=None):
+        self.camera = camera
+        self.node = node
+        self.fps = fps
+
+        self._settings_lock = threading.Lock()
+        self._tag_id = int(tag_id)
+        self._world_x_cm = world_x_cm
+        self._world_y_cm = world_y_cm
+        self._tag_size_cm = tag_size_cm
+        self._trigger_distance_cm = trigger_distance_cm
+        self._fx = fx
+        self._fy = fy
+        self._cx = cx if cx is not None else CAMERA_WIDTH / 2.0
+        self._cy = cy if cy is not None else CAMERA_HEIGHT / 2.0
+
+        self._lock = threading.Lock()
+        self._visible = False
+        self._last_distance_cm = None
+        self._last_triggered = False
+        self._last_bbox = None
+
+        self._running = False
+        self._thread = None
+
+        self._detector = None
+        if AprilTagDetector is not None:
+            self._detector = AprilTagDetector(families=APRILTAG_FAMILY, quad_decimate=APRILTAG_QUAD_DECIMATE)
+        else:
+            self.node.get_logger().warn(
+                "pupil_apriltags not installed -- AprilTag position correction disabled "
+                "(pip install pupil-apriltags to enable it)."
+            )
+
+    def set_tag_id(self, tag_id):
+        with self._settings_lock:
+            self._tag_id = int(tag_id)
+        return True
+
+    def get_tag_id(self):
+        with self._settings_lock:
+            return self._tag_id
+
+    def set_world_position(self, x_cm, y_cm):
+        with self._settings_lock:
+            self._world_x_cm = float(x_cm)
+            self._world_y_cm = float(y_cm)
+        return True
+
+    def get_world_position(self):
+        with self._settings_lock:
+            return (self._world_x_cm, self._world_y_cm)
+
+    def set_tag_size(self, size_cm):
+        size_cm = float(size_cm)
+        if size_cm <= 0:
+            return False
+        with self._settings_lock:
+            self._tag_size_cm = size_cm
+        return True
+
+    def get_tag_size(self):
+        with self._settings_lock:
+            return self._tag_size_cm
+
+    def set_trigger_distance(self, distance_cm):
+        distance_cm = float(distance_cm)
+        if distance_cm <= 0:
+            return False
+        with self._settings_lock:
+            self._trigger_distance_cm = distance_cm
+        return True
+
+    def get_trigger_distance(self):
+        with self._settings_lock:
+            return self._trigger_distance_cm
+
+    def set_camera_params(self, fx=None, fy=None, cx=None, cy=None):
+        with self._settings_lock:
+            if fx is not None:
+                self._fx = float(fx)
+            if fy is not None:
+                self._fy = float(fy)
+            if cx is not None:
+                self._cx = float(cx)
+            if cy is not None:
+                self._cy = float(cy)
+        return True
+
+    def get_camera_params(self):
+        with self._settings_lock:
+            return (self._fx, self._fy, self._cx, self._cy)
+
+    def start(self):
+        if self._detector is None:
+            return  # not installed -- see __init__ warning
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _loop(self):
+        interval = 1.0 / self.fps
+        while self._running:
+            start = time.monotonic()
+            frame = self.camera.get_frame()
+            if frame is not None:
+                try:
+                    self._tick(frame)
+                except Exception as e:
+                    # Without this, an exception here (e.g. a malformed
+                    # frame or a bad pupil_apriltags call) would silently
+                    # kill this daemon thread -- the rest of the node
+                    # keeps running fine, so AprilTag detection would
+                    # just stop forever with no visible error at all.
+                    self.node.get_logger().warn(f'AprilTagLocalizer tick failed: {e!r}')
+            elapsed = time.monotonic() - start
+            time.sleep(max(0.0, interval - elapsed))
+
+    def _tick(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        tag_id = self.get_tag_id()
+        fx, fy, cx, cy = self.get_camera_params()
+        tag_size_m = self.get_tag_size() / 100.0
+
+        detections = self._detector.detect(
+            gray, estimate_tag_pose=True,
+            camera_params=(fx, fy, cx, cy), tag_size=tag_size_m,
+        )
+
+        match = None
+        for det in detections:
+            if det.tag_id == tag_id:
+                match = det
+                break
+
+        if match is None:
+            with self._lock:
+                self._visible = False
+                self._last_distance_cm = None
+                self._last_triggered = False
+                self._last_bbox = None
+            return
+
+        # pose_t is the tag's [x, y, z] translation in the camera frame,
+        # in meters (same units as tag_size passed in above) -- the
+        # straight-line camera-to-tag distance is just its norm.
+        tx, ty, tz = (float(v) for v in match.pose_t.flatten())
+        distance_cm = math.sqrt(tx * tx + ty * ty + tz * tz) * 100.0
+        trigger_distance_cm = self.get_trigger_distance()
+        triggered = distance_cm <= trigger_distance_cm
+
+        # corners is a 4x2 array of the tag's detected pixel corners --
+        # used only to draw a GUI bounding box, so a simple axis-aligned
+        # min/max is enough (no need for the tag's true rotated outline).
+        corners = match.corners
+        xs = [float(p[0]) for p in corners]
+        ys = [float(p[1]) for p in corners]
+        bbox = {'x': min(xs), 'y': min(ys), 'w': max(xs) - min(xs), 'h': max(ys) - min(ys)}
+
+        with self._lock:
+            self._visible = True
+            self._last_distance_cm = distance_cm
+            self._last_triggered = triggered
+            self._last_bbox = bbox
+
+        if triggered:
+            world_x_cm, world_y_cm = self.get_world_position()
+            self.node.correct_position_from_tag(world_x_cm, world_y_cm)
+
+    def get_status(self):
+        with self._lock:
+            visible = self._visible
+            distance_cm = self._last_distance_cm
+            triggered = self._last_triggered
+            bbox = self._last_bbox
+        return {
+            'available': self._detector is not None,
+            'visible': visible,
+            'distance_cm': distance_cm,
+            'triggered': triggered,
+            'bbox': bbox,
         }
 
 
@@ -1926,6 +2268,35 @@ class GridNavNode(Node):
                 return
             self.x, self.y = self._live_position_locked()
 
+    def correct_position_from_tag(self, tag_x_cm, tag_y_cm):
+        """Called by AprilTagLocalizer once a known-position tag is seen
+        closer than its trigger distance -- snaps the robot's tracked
+        position to that known-good landmark, correcting accumulated
+        encoder/IMU drift. Unlike reset_position(), this is a LIGHTWEIGHT
+        correction: it does NOT touch state/legs/goal, so it can fire
+        mid-drive (e.g. while running a Mode A/B/C preset path) without
+        interrupting whatever the robot is currently doing.
+
+        Applies a RIGID SHIFT (the delta between the tag's known position
+        and the robot's current live-estimated position), not just an
+        overwrite -- if mid-DRIVE, leg_start_x/y get the same shift so
+        the leg's own progress-so-far math stays internally consistent,
+        instead of self.x/y being silently overwritten and then
+        immediately clobbered back to the stale value by the next
+        leg-completion calculation (which always recomputes from
+        leg_start_x/y + leg_progress_cm, not from self.x/y directly)."""
+        with self._lock:
+            live_x, live_y = self._live_position_locked()
+            dx = tag_x_cm - live_x
+            dy = tag_y_cm - live_y
+            self.x += dx
+            self.y += dy
+            if self.state == 'RUNNING' and self.phase == 'DRIVE' and self.legs \
+                    and self.legs[self.leg_idx][0] == 'move':
+                self.leg_start_x += dx
+                self.leg_start_y += dy
+            self.path.append((tag_x_cm, tag_y_cm))
+
     def pin_cells(self, cells):
         """Permanently add an arbitrary collection of (i, j) grid cells to
         the A* obstacle map, tracked in pinned_cells (a subset of
@@ -2082,6 +2453,13 @@ HTML_PAGE = """<!doctype html>
       <button id="modeBBtn" style="background:#1a3a5a; flex:1;">Mode B</button>
       <button id="modeCBtn" style="background:#1a3a5a; flex:1;">Mode C</button>
     </div>
+    <form id="modeSettingsForm">
+      <div style="font-size:11px; color:#999;">Mode A/B U-pattern sweep (same start corner, adjustable extent):</div>
+      <div class="row"><label>X Length (cm)</label><input id="modeXLength" type="number" value="__MODE_X_LENGTH__" step="1" min="1"></div>
+      <div class="row"><label>Y Length (cm)</label><input id="modeYLength" type="number" value="__MODE_Y_LENGTH__" step="1" min="1"></div>
+      <div class="row"><label>Row Step (cm)</label><input id="modeRowStep" type="number" value="__MODE_ROW_STEP__" step="1" min="1"></div>
+      <button type="submit">Set Mode Path Settings</button>
+    </form>
     <button id="resetBtn" style="background:#5a2a2a;">Reset Position to (0,0)</button>
     <button id="continueBtn" style="background:#2a5a2a; display:none;">Continue to Next Box</button>
     <button id="clearObstaclesBtn" style="background:#5a4a1a;">Clear Obstacles</button>
@@ -2104,11 +2482,20 @@ HTML_PAGE = """<!doctype html>
       <div class="stat-box wide"><div class="k">Heading (ref=0)</div><div class="v" id="s-heading">--</div></div>
       <div class="stat-box wide"><div class="k">Target Heading</div><div class="v" id="s-target">--</div></div>
       <div class="stat-box wide"><div class="k">Obstacle Watch</div><div class="v" id="s-obwatch">--</div></div>
+      <div class="stat-box wide"><div class="k">AprilTag</div><div class="v" id="s-apriltag">--</div></div>
     </div>
     <form id="obWatchForm">
-      <div class="row"><label style="display:inline"><input id="obEnabled" type="checkbox" style="width:auto" checked> Obstacle Avoidance Enabled</label></div>
+      <div class="row"><label style="display:inline"><input id="obEnabled" type="checkbox" style="width:auto"> Obstacle Avoidance Enabled</label></div>
       <div class="row"><label>Sensitivity (consecutive frames to pin, 1=instant)</label><input id="obSensitivity" type="number" value="3" step="1" min="1"></div>
       <button type="submit">Set Obstacle Watch</button>
+    </form>
+    <form id="aprilTagForm">
+      <div class="row"><label>Tag ID</label><input id="atTagId" type="number" value="__APRILTAG_ID__" step="1" min="0"></div>
+      <div class="row"><label>World X (cm)</label><input id="atWorldX" type="number" value="__APRILTAG_WORLD_X__" step="1"></div>
+      <div class="row"><label>World Y (cm)</label><input id="atWorldY" type="number" value="__APRILTAG_WORLD_Y__" step="1"></div>
+      <div class="row"><label>Tag Size (cm)</label><input id="atTagSize" type="number" value="__APRILTAG_SIZE__" step="0.1" min="0.1"></div>
+      <div class="row"><label>Trigger Distance (cm)</label><input id="atTrigger" type="number" value="__APRILTAG_TRIGGER__" step="1" min="1"></div>
+      <button type="submit">Set AprilTag Config</button>
     </form>
   </div>
   <div class="camera">
@@ -2119,6 +2506,7 @@ HTML_PAGE = """<!doctype html>
       <div class="center-line"></div>
       <div class="guide-lines" id="guideLines"></div>
       <div class="detection-boxes" id="detectionBoxes"></div>
+      <div class="detection-boxes" id="aprilTagBoxes"></div>
       <div class="crosshair"></div>
     </div>
     <form id="camCalibForm">
@@ -2492,6 +2880,18 @@ document.getElementById('modeABtn').addEventListener('click', () => runMode('A')
 document.getElementById('modeBBtn').addEventListener('click', () => runMode('B'));
 document.getElementById('modeCBtn').addEventListener('click', () => runMode('C'));
 
+document.getElementById('modeSettingsForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const xLength = parseFloat(document.getElementById('modeXLength').value);
+  const yLength = parseFloat(document.getElementById('modeYLength').value);
+  const rowStep = parseFloat(document.getElementById('modeRowStep').value);
+  await fetch('/api/mode_settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({x_length_cm: xLength, y_length_cm: yLength, row_step_cm: rowStep})
+  });
+});
+
 document.getElementById('clearObstaclesBtn').addEventListener('click', async () => {
   await fetch('/api/clear_obstacles', {method: 'POST'});
 });
@@ -2666,14 +3066,79 @@ document.getElementById('obWatchForm').addEventListener('submit', async (ev) => 
   });
 });
 
+async function pollAprilTag() {
+  const container = document.getElementById('aprilTagBoxes');
+  try {
+    const res = await fetch('/api/apriltag_state');
+    const at = await res.json();
+    if (!at.available) {
+      set('s-apriltag', 'n/a (no camera / pupil_apriltags not installed)');
+    } else if (!at.visible) {
+      set('s-apriltag', `not visible (id=${at.tag_id}, trigger<=${at.trigger_distance_cm}cm)`);
+    } else {
+      const distText = at.distance_cm !== null && at.distance_cm !== undefined
+            ? at.distance_cm.toFixed(1) : '?';
+      const trigText = at.triggered ? 'TRIGGERED -- position corrected' : 'visible, out of range';
+      set('s-apriltag', `id=${at.tag_id} dist=${distText}cm -- ${trigText}`);
+    }
+
+    container.innerHTML = '';
+    if (at.visible && at.bbox) {
+      const color = at.triggered ? '#00ff00' : '#ffff00';
+      const box = document.createElement('div');
+      box.className = 'detection-box';
+      box.style.left = `${(at.bbox.x / at.frame_width * 100).toFixed(2)}%`;
+      box.style.top = `${(at.bbox.y / at.frame_height * 100).toFixed(2)}%`;
+      box.style.width = `${(at.bbox.w / at.frame_width * 100).toFixed(2)}%`;
+      box.style.height = `${(at.bbox.h / at.frame_height * 100).toFixed(2)}%`;
+      box.style.borderColor = color;
+
+      const label = document.createElement('div');
+      label.className = 'detection-box-label';
+      label.style.color = color;
+      const distText = (at.distance_cm === null || at.distance_cm === undefined)
+            ? '?m' : `${(at.distance_cm / 100).toFixed(2)}m`;
+      label.textContent = `tag${at.tag_id} ~${distText}`;
+      box.appendChild(label);
+
+      container.appendChild(box);
+    }
+  } catch (e) {
+    set('s-apriltag', 'connection lost');
+    container.innerHTML = '';
+  }
+}
+
+document.getElementById('aprilTagForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const tagId = parseInt(document.getElementById('atTagId').value, 10);
+  const worldX = parseFloat(document.getElementById('atWorldX').value);
+  const worldY = parseFloat(document.getElementById('atWorldY').value);
+  const tagSize = parseFloat(document.getElementById('atTagSize').value);
+  const trigger = parseFloat(document.getElementById('atTrigger').value);
+  await fetch('/api/apriltag_settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      tag_id: tagId,
+      world_x_cm: worldX,
+      world_y_cm: worldY,
+      tag_size_cm: tagSize,
+      trigger_distance_cm: trigger
+    })
+  });
+});
+
 setInterval(poll, __POLL_MS__);
 setInterval(pollCamera, __POLL_MS__);
 setInterval(pollDetections, __POLL_MS__);
 setInterval(pollObstacleWatch, __POLL_MS__);
+setInterval(pollAprilTag, __POLL_MS__);
 poll();
 pollCamera();
 pollDetections();
 pollObstacleWatch();
+pollAprilTag();
 </script>
 </body>
 </html>
@@ -2699,13 +3164,25 @@ def render_page():
             .replace('__COURT_LENGTH__', str(COURT_LENGTH_CM))
             .replace('__COURT_WIDTH__', str(COURT_WIDTH_CM))
             .replace('__COURT_ORIGIN_X__', str(COURT_ORIGIN_X_CM))
-            .replace('__COURT_ORIGIN_Y__', str(COURT_ORIGIN_Y_CM)))
+            .replace('__COURT_ORIGIN_Y__', str(COURT_ORIGIN_Y_CM))
+            .replace('__APRILTAG_ID__', str(APRILTAG_DEFAULT_ID))
+            .replace('__APRILTAG_WORLD_X__', str(APRILTAG_DEFAULT_WORLD_X_CM))
+            .replace('__APRILTAG_WORLD_Y__', str(APRILTAG_DEFAULT_WORLD_Y_CM))
+            .replace('__APRILTAG_SIZE__', str(APRILTAG_DEFAULT_SIZE_CM))
+            .replace('__APRILTAG_TRIGGER__', str(APRILTAG_TRIGGER_DISTANCE_CM))
+            .replace('__MODE_X_LENGTH__', str(MODE_X_LENGTH_CM))
+            .replace('__MODE_Y_LENGTH__', str(MODE_Y_LENGTH_CM))
+            .replace('__MODE_ROW_STEP__', str(MODE_ROW_STEP_CM)))
 
 
 def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
                rangefinder: CameraRangefinder,
                detector: 'ObstacleDetector | None',
-               watcher: 'ObstacleWatcher | None') -> Flask:
+               watcher: 'ObstacleWatcher | None',
+               apriltag: 'AprilTagLocalizer | None' = None,
+               mode_settings: 'ModePathSettings | None' = None) -> Flask:
+    if mode_settings is None:
+        mode_settings = ModePathSettings()
     app = Flask(__name__)
     # Werkzeug's request logging is noisy at GUI_HZ polling rates (and would
     # be far worse for the continuous /video_feed stream).
@@ -2838,6 +3315,55 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
             return jsonify({'ok': False, 'error': 'invalid sensitivity_frames'}), 400
         return jsonify({'ok': True})
 
+    @app.route('/api/apriltag_state')
+    def api_apriltag_state():
+        if apriltag is None:
+            return jsonify({'available': False})
+        status = apriltag.get_status()
+        tag_id = apriltag.get_tag_id()
+        world_x_cm, world_y_cm = apriltag.get_world_position()
+        status['tag_id'] = tag_id
+        status['world_x_cm'] = world_x_cm
+        status['world_y_cm'] = world_y_cm
+        status['tag_size_cm'] = apriltag.get_tag_size()
+        status['trigger_distance_cm'] = apriltag.get_trigger_distance()
+        status['frame_width'] = CAMERA_WIDTH
+        status['frame_height'] = CAMERA_HEIGHT
+        return jsonify(status)
+
+    @app.route('/api/apriltag_settings', methods=['POST'])
+    def api_apriltag_settings():
+        if apriltag is None:
+            return jsonify({'ok': False, 'error': 'AprilTag localizer not running (camera unavailable or pupil_apriltags not installed)'}), 400
+        data = request.get_json(force=True)
+        ok = True
+        if 'tag_id' in data:
+            try:
+                ok = apriltag.set_tag_id(int(data['tag_id'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if 'world_x_cm' in data or 'world_y_cm' in data:
+            cur_x, cur_y = apriltag.get_world_position()
+            try:
+                wx = float(data['world_x_cm']) if 'world_x_cm' in data else cur_x
+                wy = float(data['world_y_cm']) if 'world_y_cm' in data else cur_y
+                ok = apriltag.set_world_position(wx, wy) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if 'tag_size_cm' in data:
+            try:
+                ok = apriltag.set_tag_size(float(data['tag_size_cm'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if 'trigger_distance_cm' in data:
+            try:
+                ok = apriltag.set_trigger_distance(float(data['trigger_distance_cm'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if not ok:
+            return jsonify({'ok': False, 'error': 'invalid AprilTag setting value'}), 400
+        return jsonify({'ok': True})
+
     @app.route('/api/state')
     def api_state():
         return jsonify(node.get_snapshot())
@@ -2863,14 +3389,47 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
     def api_run_mode():
         data = request.get_json(force=True)
         mode = data.get('mode')
-        waypoints_by_mode = {
-            'A': get_mode_a_waypoints,
-            'B': get_mode_b_waypoints,
-            'C': get_mode_c_waypoints,
-        }
-        if mode not in waypoints_by_mode:
+        if mode not in ('A', 'B', 'C'):
             return jsonify({'ok': False, 'error': f'unknown mode {mode!r} (expected A/B/C)'}), 400
-        node.run_path(waypoints_by_mode[mode]())
+        if mode == 'C':
+            waypoints = get_mode_c_waypoints()
+        else:
+            x_length_cm, y_length_cm, row_step_cm = mode_settings.get()
+            fn = get_mode_a_waypoints if mode == 'A' else get_mode_b_waypoints
+            waypoints = fn(x_length_cm, y_length_cm, row_step_cm)
+        node.run_path(waypoints)
+        return jsonify({'ok': True})
+
+    @app.route('/api/mode_settings')
+    def api_mode_settings_get():
+        x_length_cm, y_length_cm, row_step_cm = mode_settings.get()
+        return jsonify({
+            'x_length_cm': x_length_cm,
+            'y_length_cm': y_length_cm,
+            'row_step_cm': row_step_cm,
+        })
+
+    @app.route('/api/mode_settings', methods=['POST'])
+    def api_mode_settings_post():
+        data = request.get_json(force=True)
+        ok = True
+        if 'x_length_cm' in data:
+            try:
+                ok = mode_settings.set_x_length(float(data['x_length_cm'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if 'y_length_cm' in data:
+            try:
+                ok = mode_settings.set_y_length(float(data['y_length_cm'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if 'row_step_cm' in data:
+            try:
+                ok = mode_settings.set_row_step(float(data['row_step_cm'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if not ok:
+            return jsonify({'ok': False, 'error': 'invalid mode-path setting value'}), 400
         return jsonify({'ok': True})
 
     @app.route('/api/set_speed', methods=['POST'])
@@ -2938,6 +3497,7 @@ def main(args=None):
 
     detector = None
     watcher = None
+    apriltag = None
     if camera is not None:
         detector = ObstacleDetector(camera, rangefinder)
         detector.start()
@@ -2947,7 +3507,18 @@ def main(args=None):
         watcher.start()
         node.get_logger().info('Obstacle confirmation watcher running')
 
-    app = create_app(node, camera, rangefinder, detector, watcher)
+        if AprilTagDetector is not None:
+            apriltag = AprilTagLocalizer(camera, node)
+            apriltag.start()
+            node.get_logger().info(f'AprilTag position-correction localizer running at {APRILTAG_FPS} Hz')
+        else:
+            node.get_logger().warn(
+                'pupil_apriltags not installed -- AprilTag position correction disabled '
+                '(pip install pupil-apriltags to enable it).'
+            )
+
+    mode_settings = ModePathSettings()
+    app = create_app(node, camera, rangefinder, detector, watcher, apriltag, mode_settings)
     node.get_logger().info(f'Web GUI at http://<this-device-ip>:{WEB_PORT}')
     try:
         app.run(host='0.0.0.0', port=WEB_PORT, threaded=True, use_reloader=False)
@@ -2956,6 +3527,8 @@ def main(args=None):
     finally:
         if watcher is not None:
             watcher.stop()
+        if apriltag is not None:
+            apriltag.stop()
         if detector is not None:
             detector.stop()
         if camera is not None:

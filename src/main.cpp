@@ -210,6 +210,19 @@ void error_loop(int blink_count) {
 const int LEFT_MOTOR_INVERT  = -1;
 const int RIGHT_MOTOR_INVERT = -1;
 
+// ---------------- Minimum motor PWM (stiction floor) --------------
+// Below a certain PWM duty, a motor's own static friction stalls it out
+// completely instead of actually turning — a commanded speed that's low
+// but nonzero can end up doing nothing. This floors the OUTPUT pwm
+// (0-255) applied whenever a wheel is commanded to move AT ALL, so a
+// small commanded speed still produces a real minimum spin instead of
+// silently sitting still. Kept separate per wheel since they don't
+// necessarily need the same floor (e.g. more friction/load on one side) —
+// tune these up if a wheel still doesn't move at low commanded speeds,
+// or down if the minimum spin is faster than you want.
+const int LEFT_MIN_MOTOR_PWM  = 40;
+const int RIGHT_MIN_MOTOR_PWM = 60;
+
 void set_motors(float lin_x, float ang_z) {
     float left  = (lin_x - ang_z) * LEFT_MOTOR_INVERT;
     float right = (lin_x + ang_z) * RIGHT_MOTOR_INVERT;
@@ -228,13 +241,21 @@ void set_motors(float lin_x, float ang_z) {
     }
     motorsWereStopped = !commandingMotion;
 
-    auto drive = [](int d_pin, int p_pin, float val) {
+    auto drive = [](int d_pin, int p_pin, float val, int minPwm) {
         digitalWrite(d_pin, val >= 0 ? HIGH : LOW);
-        analogWrite(p_pin, (int)constrain(fabs(val) * 255.0f, 0, 255));
+        float mag = fabs(val);
+        int pwm = (int)constrain(mag * 255.0f, 0, 255);
+        // Only floor a REAL nonzero command -- an actual zero command
+        // (mag == 0) must still produce pwm 0, or the robot would never
+        // fully stop.
+        if (mag > 0.0f && pwm < minPwm) {
+            pwm = minPwm;
+        }
+        analogWrite(p_pin, pwm);
     };
 
-    drive(DIR1_PIN, PWM1_PIN, left);
-    drive(DIR2_PIN, PWM2_PIN, right);
+    drive(DIR1_PIN, PWM1_PIN, left, LEFT_MIN_MOTOR_PWM);
+    drive(DIR2_PIN, PWM2_PIN, right, RIGHT_MIN_MOTOR_PWM);
 }
 
 void cmd_vel_callback(const void * msgin) {
