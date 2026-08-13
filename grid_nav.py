@@ -276,19 +276,18 @@ DETECTION_FPS = 5.0                     # detection is heavier than streaming; r
 # of exactly that with too aggressive a blur). GUI/API-adjustable.
 DETECTION_BLUR_KSIZE = 3
 
-# Ignore black/white straight line markings (floor tape, tile grout
-# seams, thresholds) via HSV color segmentation, applied to the EDGE MAP
-# before the vertical-line search runs: any Canny edge pixel that falls
-# on a "black" (V below black_value_max) or "white" (S below
-# white_sat_max AND V above white_value_min) region of the frame is
-# erased first. All three are GUI/API-adjustable -- tune them live
-# against the debug feed, since the right cutoff depends on actual
-# ambient lighting. (NOTE: setting black_value_max too high can eat a
-# real leg/pillar's own edge if it's dark -- that's what testing at 0
-# revealed the vertical-line pattern in the first place.)
+# Ignore black straight line markings (floor tape, tile grout seams,
+# thresholds) via HSV color segmentation, applied to the EDGE MAP before
+# the vertical-line search runs: any Canny edge pixel that falls on a
+# "black" (V below black_value_max) region of the frame is erased first.
+# GUI/API-adjustable -- tune it live against the debug feed, since the
+# right cutoff depends on actual ambient lighting. (NOTE: setting this
+# too high can eat a real leg/pillar's own edge if it's dark -- that's
+# what testing at 0 revealed the vertical-line pattern in the first
+# place.) White-line rejection (a separate HSV low-saturation/high-value
+# check) was removed -- it was rejecting real obstacles along with floor
+# markings, per live testing.
 DETECTION_BLACK_VALUE_MAX = 90      # 0-255 HSV V; below this = "black"
-DETECTION_WHITE_SAT_MAX = 40        # 0-255 HSV S; below this (AND V above WHITE_VALUE_MIN) = "white"
-DETECTION_WHITE_VALUE_MIN = 200     # 0-255 HSV V; above this (AND S below WHITE_SAT_MAX) = "white"
 
 # VERTICAL-LINE obstacle condition:
 #   1. The edge must extend from near the top of the frame downward --
@@ -409,6 +408,73 @@ APRILTAG_QUAD_DECIMATE = 1.0          # pupil_apriltags defaults to 2.0 (half-re
 # a tag at a known measured distance without editing code.
 APRILTAG_DEFAULT_FX = 600.0
 APRILTAG_DEFAULT_FY = 600.0
+# -------------------------------------------------
+
+# ---------------- AprilTag start-position setup gate + homing -------
+# A SEPARATE AprilTag (its own tag ID/size -- APRILTAG_START_DEFAULT_ID,
+# GUI: "Start Point AprilTag Config" -- fully independent from the
+# PIN-POSITION tag's "Set AprilTag Config" settings above, mounted at the
+# robot's physical home spot) drives two things:
+#   1. SETUP GATE: before the operator is allowed to send the robot
+#      anywhere (Go / Mode A/B/C), the GUI requires them to click
+#      "Confirm Start Position" -- which only succeeds while the tag is
+#      within APRILTAG_SETUP_MAX_DISTANCE_CM and roughly centered in
+#      frame (APRILTAG_SETUP_CENTER_TOLERANCE_FRAC). This is deliberately
+#      LOOSE/human-tolerant (not a precision measurement) -- it exists to
+#      catch gross setup mistakes (camera aimed away, way out of range),
+#      not to nail an exact 2.000m. On success the tracked pose snaps to
+#      the defined home pose (0, 0) @ HOMING_HEADING_DEG.
+#   2. HOMING: when a Mode A/B/C preset path finishes its last coverage
+#      waypoint, the robot returns in THREE stages -- (a) an ordinary
+#      odometry leg to x=0 (at whatever y it actually ended up at, which
+#      may have drifted), (b) a rotate-in-place leg to face the tag's
+#      expected direction (HOMING_HEADING_DEG), then (c) a single
+#      straight-line drive toward (0, 0), tracked by encoder dead
+#      reckoning exactly like a normal 'move' leg (see
+#      _begin_homing_straight_locked()/_homing_tick_locked()). Stage (c)
+#      steers by heading-hold ONLY (no pixel-centering loop -- keeps the
+#      final approach nearly straight, "less angular"); the AprilTag,
+#      when visible, only REFINES the target distance/position (like a
+#      running correct_position_from_tag()) and, once that reading holds
+#      steady, locks in an EXACT final pose. If the tag is never seen,
+#      the leg still completes at its original odometry estimate --
+#      "use odometry to compare if it's at (0, 0) yet."
+APRILTAG_START_DEFAULT_ID = 6   # the start-point tag's default ID -- independent of APRILTAG_DEFAULT_ID
+                                 # (the pin-position tag's ID) above; change via the GUI's
+                                 # "Start Point AprilTag Config" form without touching pin-position settings
+APRILTAG_SETUP_MAX_DISTANCE_CM = 250.0        # "within 2m" with slack for human imprecision
+APRILTAG_SETUP_CENTER_TOLERANCE_FRAC = 0.25   # tag center within 25% of half-frame-width of dead center
+
+HOMING_HEADING_DEG = -90.0        # the home pose's defined heading (0deg = "+X" = heading_ref)
+# Final resting distance from the tag -- the point the straight-line leg
+# converges to gets FORCIBLY RELABELED as (0, 0) once locked in (see
+# _calibrate_start_pose_locked()), so this is really "how far short of
+# the tag's own physical position does 'home' sit." 100cm = stop as soon
+# as the AprilTag reads under 1m away, rather than driving all the way
+# up to it. Both this and the tolerance below are live-adjustable via
+# the GUI (see HomingDistanceSettings).
+HOMING_TARGET_DISTANCE_CM = 100.0
+HOMING_DISTANCE_TOLERANCE_CM = 15.0
+HOMING_HOLD_TICKS = 5              # consecutive in-tolerance AprilTag readings required before locking in the pose
+# Live-adjustable -- see HomingSpeedSettings. max_rotate caps the TOTAL
+# steering command (heading-hold + centering combined, see
+# HOMING_CENTER_KP below) -- there is no separate pixel-centering-only
+# loop like the old design, so this can stay well under max_forward.
+HOMING_MAX_ROTATE_SPEED = 0.20
+HOMING_MAX_FORWARD_SPEED = 0.20
+# Once the AprilTag is visible during the STRAIGHT stage, this ADDS a
+# gentle left-right centering nudge on top of the normal heading-hold
+# correction (it doesn't replace it) -- so residual x/heading error from
+# the earlier RETURN_X/ROTATE stages still gets corrected once the tag
+# is actually in view, without reintroducing the old aggressive
+# pixel-only steering that caused excessive angular movement. Deliberately
+# small relative to HOMING_MAX_ROTATE_SPEED for that reason.
+HOMING_CENTER_KP = 0.15            # normalized frame offset [-1,1] -> additional rotate command fraction
+# Confirmed backwards via earlier live testing (tag drifted further
+# off-center instead of recentering) -- same empirical-tuning idea as
+# PIVOT_ANGULAR_SIGN/DRIVE_CORRECTION_SIGN above. Flip to +1 if it turns
+# out backwards again after some other change.
+HOMING_CENTER_SIGN = -1
 # -------------------------------------------------
 
 
@@ -558,20 +624,36 @@ def inflate_obstacles(obstacles, radius_cells):
 MODE_X_LENGTH_CM = COURT_WIDTH_CM            # default: full court width
 MODE_Y_LENGTH_CM = COURT_LENGTH_CM / 2.0     # default: half court length (to the net line)
 MODE_ROW_STEP_CM = 200   # 2m step between boustrophedon rows (modes A/B)
+# Empirical per-row real-world X drift compensation -- observed behavior
+# was each row's ACTUAL physical X landing ~50cm off from the one before
+# it (a roughly linear-with-row-count systematic error, likely from
+# imperfect 90deg turns compounding row over row), even though the
+# COMMANDED/planned X is identical every row (always x_left or x_right).
+# Rather than chase the underlying encoder/heading root cause, this adds
+# a compensating offset directly to each row's commanded waypoints:
+# row N gets N * MODE_ROW_X_OFFSET_CM added to its X, in the direction
+# opposite the observed drift, so the REAL resting position converges
+# back onto the intended row X instead of drifting further every row.
+# 0.0 = no compensation (previous behavior). Sign/magnitude are specific
+# to this robot's actual drift and were not measured here -- tune live
+# via the GUI's "Row X Drift Offset" field while watching real rows land.
+MODE_ROW_X_OFFSET_CM = 0.0
 
 
 class ModePathSettings:
-    """Live-adjustable X/Y sweep length and row step for the Mode A/B
-    U-pattern coverage paths (see get_mode_a_waypoints/get_mode_b_waypoints
-    below). Same lock-guarded get/set pattern as the other adjustable
-    settings in this file (e.g. ObstacleDetector)."""
+    """Live-adjustable X/Y sweep length, row step, and per-row X drift
+    compensation for the Mode A/B U-pattern coverage paths (see
+    get_mode_a_waypoints/get_mode_b_waypoints below). Same lock-guarded
+    get/set pattern as the other adjustable settings in this file (e.g.
+    ObstacleDetector)."""
 
     def __init__(self, x_length_cm=MODE_X_LENGTH_CM, y_length_cm=MODE_Y_LENGTH_CM,
-                 row_step_cm=MODE_ROW_STEP_CM):
+                 row_step_cm=MODE_ROW_STEP_CM, row_x_offset_cm=MODE_ROW_X_OFFSET_CM):
         self._lock = threading.Lock()
         self._x_length_cm = x_length_cm
         self._y_length_cm = y_length_cm
         self._row_step_cm = row_step_cm
+        self._row_x_offset_cm = row_x_offset_cm
 
     def set_x_length(self, x_length_cm):
         x_length_cm = float(x_length_cm)
@@ -597,18 +679,141 @@ class ModePathSettings:
             self._row_step_cm = row_step_cm
         return True
 
+    def set_row_x_offset(self, row_x_offset_cm):
+        with self._lock:
+            self._row_x_offset_cm = float(row_x_offset_cm)
+        return True
+
     def get(self):
         with self._lock:
-            return (self._x_length_cm, self._y_length_cm, self._row_step_cm)
+            return (self._x_length_cm, self._y_length_cm, self._row_step_cm, self._row_x_offset_cm)
 
 
-def _boustrophedon_waypoints(x_left, x_right, y_start, y_end, row_step_cm):
+class SetupGateSettings:
+    """Live-adjustable error tolerance for the AprilTag start-position
+    setup gate (see GridNavNode.check_apriltag_setup_ready()) -- how far
+    away and how off-center the tag is allowed to be while still letting
+    the operator hit "Confirm Start Position". Deliberately loose by
+    default (see APRILTAG_SETUP_* constants); adjustable here since
+    "how tolerant is tolerant enough" is a judgment call best made while
+    actually testing the physical setup, not a fixed constant."""
+
+    def __init__(self, max_distance_cm=APRILTAG_SETUP_MAX_DISTANCE_CM,
+                 center_tolerance_frac=APRILTAG_SETUP_CENTER_TOLERANCE_FRAC):
+        self._lock = threading.Lock()
+        self._max_distance_cm = max_distance_cm
+        self._center_tolerance_frac = center_tolerance_frac
+
+    def set_max_distance(self, max_distance_cm):
+        max_distance_cm = float(max_distance_cm)
+        if max_distance_cm <= 0:
+            return False
+        with self._lock:
+            self._max_distance_cm = max_distance_cm
+        return True
+
+    def set_center_tolerance(self, center_tolerance_frac):
+        center_tolerance_frac = float(center_tolerance_frac)
+        if not (0.0 < center_tolerance_frac <= 1.0):
+            return False
+        with self._lock:
+            self._center_tolerance_frac = center_tolerance_frac
+        return True
+
+    def get(self):
+        with self._lock:
+            return (self._max_distance_cm, self._center_tolerance_frac)
+
+
+class HomingDistanceSettings:
+    """Live-adjustable final resting distance (+ tolerance) for the
+    return-home AprilTag vision servo (see
+    GridNavNode._homing_tick_locked()) -- how close to the tag "home"
+    actually is. 0.0 = drive all the way up to the tag itself. Whatever
+    point the servo converges to gets forcibly relabeled as (0, 0) once
+    locked in, so this is a judgment call about how close the camera can
+    physically/safely get to your mounted tag, not a fixed constant."""
+
+    def __init__(self, target_distance_cm=HOMING_TARGET_DISTANCE_CM,
+                 distance_tolerance_cm=HOMING_DISTANCE_TOLERANCE_CM):
+        self._lock = threading.Lock()
+        self._target_distance_cm = target_distance_cm
+        self._distance_tolerance_cm = distance_tolerance_cm
+
+    def set_target_distance(self, target_distance_cm):
+        target_distance_cm = float(target_distance_cm)
+        if target_distance_cm < 0:
+            return False
+        with self._lock:
+            self._target_distance_cm = target_distance_cm
+        return True
+
+    def set_distance_tolerance(self, distance_tolerance_cm):
+        distance_tolerance_cm = float(distance_tolerance_cm)
+        if distance_tolerance_cm <= 0:
+            return False
+        with self._lock:
+            self._distance_tolerance_cm = distance_tolerance_cm
+        return True
+
+    def get(self):
+        with self._lock:
+            return (self._target_distance_cm, self._distance_tolerance_cm)
+
+
+class HomingSpeedSettings:
+    """Live-adjustable max forward/rotate speed caps for the return-home
+    behavior (both the AprilTag vision servo and the odometry fallback --
+    see GridNavNode._homing_tick_locked()). Deliberately separate from
+    the normal drive/rotate speed (see set_speed()) since this is meant
+    to be a slow, precise final approach -- too fast and the servo
+    overshoots the target every tick and can never hold HOMING_HOLD_TICKS
+    consecutive in-tolerance ticks to actually stop."""
+
+    def __init__(self, max_forward_speed=HOMING_MAX_FORWARD_SPEED,
+                 max_rotate_speed=HOMING_MAX_ROTATE_SPEED):
+        self._lock = threading.Lock()
+        self._max_forward_speed = max_forward_speed
+        self._max_rotate_speed = max_rotate_speed
+
+    def set_max_forward_speed(self, max_forward_speed):
+        max_forward_speed = float(max_forward_speed)
+        if max_forward_speed <= 0:
+            return False
+        with self._lock:
+            self._max_forward_speed = max_forward_speed
+        return True
+
+    def set_max_rotate_speed(self, max_rotate_speed):
+        max_rotate_speed = float(max_rotate_speed)
+        if max_rotate_speed <= 0:
+            return False
+        with self._lock:
+            self._max_rotate_speed = max_rotate_speed
+        return True
+
+    def get(self):
+        with self._lock:
+            return (self._max_forward_speed, self._max_rotate_speed)
+
+
+def _boustrophedon_waypoints(x_left, x_right, y_start, y_end, row_step_cm, row_x_offset_cm=0.0):
     """Generate the TURN-POINT waypoints of a U-pattern (boustrophedon /
     lawnmower) coverage sweep: full-width passes between x_left and
     x_right, stepping row_step_cm from y_start toward y_end (inclusive),
     reversing direction (left<->right) each row. y_start may be greater
     or less than y_end -- the step direction follows automatically.
-    Does NOT include a return-to-origin point; callers append that."""
+    Does NOT include a return-to-origin point; callers append that.
+
+    row_x_offset_cm (see MODE_ROW_X_OFFSET_CM): an empirical per-row X
+    compensation added to BOTH of a row's waypoints, accumulating by row
+    index (row 0 gets none, row 1 gets one unit, row 2 gets two, ...) to
+    counter an observed real-world drift that otherwise grows row over
+    row even though the COMMANDED x_left/x_right never change. current_x
+    (the alternation state machine) always tracks the un-offset
+    x_left/x_right values -- the offset is applied only at the point
+    each waypoint is appended, so it never contaminates the alternation
+    logic itself."""
     direction = 1.0 if y_end >= y_start else -1.0
     step = direction * abs(row_step_cm)
     rows = []
@@ -623,55 +828,57 @@ def _boustrophedon_waypoints(x_left, x_right, y_start, y_end, row_step_cm):
     waypoints = []
     current_x = x_left
     for idx, row_y in enumerate(rows):
+        row_offset = idx * row_x_offset_cm
         if idx == 0:
-            waypoints.append((x_left, row_y))
-            waypoints.append((x_right, row_y))
+            waypoints.append((x_left + row_offset, row_y))
+            waypoints.append((x_right + row_offset, row_y))
             current_x = x_right
         else:
-            waypoints.append((current_x, row_y))  # step to this row, same side as last
+            waypoints.append((current_x + row_offset, row_y))  # step to this row, same side as last
             current_x = x_left if current_x == x_right else x_right
-            waypoints.append((current_x, row_y))  # sweep across
+            waypoints.append((current_x + row_offset, row_y))  # sweep across
     return waypoints
 
 
 def get_mode_a_waypoints(x_length_cm=MODE_X_LENGTH_CM, y_length_cm=MODE_Y_LENGTH_CM,
-                          row_step_cm=MODE_ROW_STEP_CM):
+                          row_step_cm=MODE_ROW_STEP_CM, row_x_offset_cm=MODE_ROW_X_OFFSET_CM):
     """Mode A: U-pattern coverage starting at the court's own top-left
     corner (SAME start point regardless of the length settings), sweeping
     x_length_cm to the right and y_length_cm DOWNWARD (toward the net),
-    row_step_cm between rows, finishing back at the origin (0, 0)."""
+    row_step_cm between rows (row_x_offset_cm: see MODE_ROW_X_OFFSET_CM).
+    Does NOT include a return-to-origin point -- once the last coverage
+    waypoint is reached, GridNavNode's return-home sequence (see
+    run_path()'s mode_name / _begin_homing_locked()) takes over instead
+    of blindly driving back to (0, 0) via odometry."""
     x_left = COURT_ORIGIN_X_CM
     x_right = COURT_ORIGIN_X_CM + x_length_cm
     y_top = COURT_ORIGIN_Y_CM + COURT_LENGTH_CM
     y_end = y_top - y_length_cm
-    waypoints = _boustrophedon_waypoints(x_left, x_right, y_top, y_end, row_step_cm)
-    waypoints.append((0.0, 0.0))
-    return waypoints
+    return _boustrophedon_waypoints(x_left, x_right, y_top, y_end, row_step_cm, row_x_offset_cm)
 
 
 def get_mode_b_waypoints(x_length_cm=MODE_X_LENGTH_CM, y_length_cm=MODE_Y_LENGTH_CM,
-                          row_step_cm=MODE_ROW_STEP_CM):
+                          row_step_cm=MODE_ROW_STEP_CM, row_x_offset_cm=MODE_ROW_X_OFFSET_CM):
     """Mode B: same U-pattern as Mode A, starting at the court's own
     bottom-left corner (SAME start point regardless of the length
     settings), sweeping x_length_cm to the right and y_length_cm UPWARD
-    (toward the net), row_step_cm between rows, finishing back at the
-    origin (0, 0)."""
+    (toward the net), row_step_cm between rows. Does NOT include a
+    return-to-origin point -- see get_mode_a_waypoints()."""
     x_left = COURT_ORIGIN_X_CM
     x_right = COURT_ORIGIN_X_CM + x_length_cm
     y_bottom = COURT_ORIGIN_Y_CM
     y_end = y_bottom + y_length_cm
-    waypoints = _boustrophedon_waypoints(x_left, x_right, y_bottom, y_end, row_step_cm)
-    waypoints.append((0.0, 0.0))
-    return waypoints
+    return _boustrophedon_waypoints(x_left, x_right, y_bottom, y_end, row_step_cm, row_x_offset_cm)
 
 
 def get_mode_c_waypoints():
     """Mode C: one loop around the OUTER margin box (the court plus its
     COURT_MARGIN_CELLS border on every side) -- (0,0) -> far corner along
-    Y -> far corner along both -> far corner along X -> back to (0,0)."""
+    Y -> far corner along both -> far corner along X. Does NOT include the
+    final return-to-origin leg -- see get_mode_a_waypoints()."""
     outer_x = COURT_ORIGIN_X_CM * 2 + COURT_WIDTH_CM
     outer_y = COURT_ORIGIN_Y_CM * 2 + COURT_LENGTH_CM
-    return [(0.0, 0.0), (0.0, outer_y), (outer_x, outer_y), (outer_x, 0.0), (0.0, 0.0)]
+    return [(0.0, 0.0), (0.0, outer_y), (outer_x, outer_y), (outer_x, 0.0)]
 
 
 class CameraStreamer:
@@ -966,8 +1173,6 @@ class ObstacleDetector:
     def __init__(self, camera: 'CameraStreamer', rangefinder: CameraRangefinder,
                  fps=DETECTION_FPS,
                  black_value_max=DETECTION_BLACK_VALUE_MAX,
-                 white_sat_max=DETECTION_WHITE_SAT_MAX,
-                 white_value_min=DETECTION_WHITE_VALUE_MIN,
                  blur_ksize=DETECTION_BLUR_KSIZE,
                  downscale=DETECTION_DOWNSCALE):
         self.camera = camera
@@ -976,8 +1181,6 @@ class ObstacleDetector:
 
         self._settings_lock = threading.Lock()
         self._black_value_max = black_value_max
-        self._white_sat_max = white_sat_max
-        self._white_value_min = white_value_min
         self._blur_ksize = blur_ksize
         self._downscale = downscale
 
@@ -1002,35 +1205,6 @@ class ObstacleDetector:
     def get_black_value_max(self):
         with self._settings_lock:
             return self._black_value_max
-
-    def set_white_sat_max(self, saturation):
-        """Live-adjustable -- 0-255 HSV S (saturation) cutoff, paired with
-        white_value_min. A pixel is rejected as "white" if its S
-        is BELOW this AND its V is above white_value_min."""
-        saturation = int(saturation)
-        if not (0 <= saturation <= 255):
-            return False
-        with self._settings_lock:
-            self._white_sat_max = saturation
-        return True
-
-    def get_white_sat_max(self):
-        with self._settings_lock:
-            return self._white_sat_max
-
-    def set_white_value_min(self, value):
-        """Live-adjustable -- 0-255 HSV V (brightness) cutoff, paired with
-        white_sat_max. See set_white_sat_max()."""
-        value = int(value)
-        if not (0 <= value <= 255):
-            return False
-        with self._settings_lock:
-            self._white_value_min = value
-        return True
-
-    def get_white_value_min(self):
-        with self._settings_lock:
-            return self._white_value_min
 
     def set_blur_ksize(self, ksize):
         """Live-adjustable -- GaussianBlur kernel size applied before
@@ -1122,7 +1296,7 @@ class ObstacleDetector:
         small = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale != 1.0 else roi
         inv_scale = 1.0 / scale
 
-        # Black/white LINE color segmentation -- still computed (as
+        # Black LINE color segmentation -- still computed (as
         # line_coverage_pct, a tuning/debug stat), but NO LONGER applied
         # to erase edges before the vertical-line search. Confirmed with
         # a real cv2 test: a dark leg/pillar (which is exactly what
@@ -1133,14 +1307,12 @@ class ObstacleDetector:
         # anyway: a real painted line is short and wide, while the
         # vertical shape filter below (top-anchored, tall, thin) already
         # rejects that shape on its own, so color-based erasure was only
-        # ever hurting real vertical obstacles.
+        # ever hurting real vertical obstacles. White-line rejection was
+        # removed entirely -- it was rejecting real obstacles too.
         hsv_small = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-        sat = hsv_small[..., 1]
         val = hsv_small[..., 2]
         black_value_max = self.get_black_value_max()
-        white_sat_max = self.get_white_sat_max()
-        white_value_min = self.get_white_value_min()
-        line_mask = (val < black_value_max) | ((sat < white_sat_max) & (val > white_value_min))
+        line_mask = val < black_value_max
         line_pixel_count = int(line_mask.sum())
         total_pixel_count = line_mask.shape[0] * line_mask.shape[1]
         line_coverage_pct = (line_pixel_count / total_pixel_count) * 100.0 if total_pixel_count > 0 else 0.0
@@ -1464,40 +1636,54 @@ class ObstacleWatcher:
 
 
 class AprilTagLocalizer:
-    """Corrects accumulated encoder/IMU position drift using a single
-    physical AprilTag placed at a known world (x, y) position.
+    """Tracks up to TWO independent AprilTags from the same camera feed
+    -- deliberately kept as two fully separate configs (tag ID, size,
+    etc.) so tuning one never risks disturbing the other:
+
+    1. PIN-POSITION tag (tag_id/world_x_cm/world_y_cm/tag_size_cm/
+       trigger_distance_cm, GUI: "Set AprilTag Config") -- corrects
+       accumulated encoder/IMU position drift whenever this tag is seen
+       closer than trigger_distance_cm. See get_status()/set_tag_id() etc.
+    2. START-POINT tag (start_tag_id/start_tag_size_cm, GUI: "Start
+       Point AprilTag Config") -- used by the setup gate
+       (check_apriltag_setup_ready()) and the return-home vision servo
+       (_homing_tick_locked()) in GridNavNode; always targets world
+       position (0, 0) by definition (that's what "home" means), so it
+       has no world_x/y or trigger_distance settings of its own. See
+       get_start_status()/set_start_tag_id().
 
     Deliberately does NOT use CameraRangefinder's ground-plane VFOV
     heuristic (that method projects a pixel row onto an assumed-flat
     floor via the camera's tilt/height -- a reasonable approximation for
     obstacle ranging, but not precise). Instead this uses the
-    `pupil_apriltags` library's own pose estimation: given the tag's
+    `pupil_apriltags` library's own pose estimation: given each tag's
     TRUE physical size and the camera's intrinsic parameters (fx, fy,
     cx, cy), it solves directly for the tag's 3D position from its
     actual apparent shape/size in the image (a real PnP solve on a
     flat, known-size marker) -- a fundamentally more direct and accurate
-    distance cue for this specific job.
+    distance cue for this specific job. pupil_apriltags applies tag_size
+    UNIFORMLY to every tag within one detect() call (no per-tag size
+    dict support), so each tag is measured with its OWN separate
+    detect() call scoped to its own true physical size (skipped/shared
+    when both tags happen to be configured the same size) -- still one
+    shared camera frame, just two passes over it when sizes differ.
 
-    Logic each tick (APRILTAG_FPS):
-      1. Detect all AprilTags in the latest camera frame.
-      2. If the CONFIGURED tag_id isn't among them: nothing to do.
-      3. If it is: compute distance_cm = the norm of the pose's
-         translation vector (camera-to-tag straight-line distance).
-      4. If distance_cm > trigger_distance_cm: nothing to do (too far to
-         trust yet).
-      5. If distance_cm <= trigger_distance_cm:
-         node.correct_position_from_tag(world_x_cm, world_y_cm) -- snaps
-         the robot's tracked position to the tag's known location. Fires
-         on EVERY qualifying tick (not just once), so the correction
-         keeps re-affirming/tightening while the robot lingers within
-         range, rather than a single one-shot snap.
+    Logic each tick (APRILTAG_FPS), independently per tag:
+      1. Detect all AprilTags in the latest camera frame (one or two
+         `detect()` calls, per tag size -- see above).
+      2. PIN-POSITION: if trigger_distance_cm's tag is within range,
+         node.correct_position_from_tag(world_x_cm, world_y_cm) fires on
+         EVERY qualifying tick (not just once), so the correction keeps
+         re-affirming/tightening while the robot lingers in range.
+      3. START-POINT: just updates get_start_status() -- GridNavNode's
+         setup gate / homing servo read that directly; this class does
+         not act on it.
 
-    tag_id, world_x_cm, world_y_cm, tag_size_cm, trigger_distance_cm,
-    fx, fy, cx, cy are all GUI/API-adjustable. If the `pupil_apriltags`
-    package isn't installed (see AprilTagDetector import guard at the
-    top of this file), the localizer safely disables itself -- start()
-    logs a warning and does nothing, no detection thread is started, and
-    no other feature is affected.
+    If the `pupil_apriltags` package isn't installed (see
+    AprilTagDetector import guard at the top of this file), the
+    localizer safely disables itself -- start() logs a warning and does
+    nothing, no detection thread is started, and no other feature is
+    affected.
     """
 
     def __init__(self, camera: 'CameraStreamer', node: 'GridNavNode',
@@ -1508,7 +1694,9 @@ class AprilTagLocalizer:
                  tag_size_cm=APRILTAG_DEFAULT_SIZE_CM,
                  trigger_distance_cm=APRILTAG_TRIGGER_DISTANCE_CM,
                  fx=APRILTAG_DEFAULT_FX, fy=APRILTAG_DEFAULT_FY,
-                 cx=None, cy=None):
+                 cx=None, cy=None,
+                 start_tag_id=APRILTAG_START_DEFAULT_ID,
+                 start_tag_size_cm=APRILTAG_DEFAULT_SIZE_CM):
         self.camera = camera
         self.node = node
         self.fps = fps
@@ -1523,12 +1711,17 @@ class AprilTagLocalizer:
         self._fy = fy
         self._cx = cx if cx is not None else CAMERA_WIDTH / 2.0
         self._cy = cy if cy is not None else CAMERA_HEIGHT / 2.0
+        self._start_tag_id = int(start_tag_id)
+        self._start_tag_size_cm = start_tag_size_cm
 
         self._lock = threading.Lock()
         self._visible = False
         self._last_distance_cm = None
         self._last_triggered = False
         self._last_bbox = None
+        self._start_visible = False
+        self._start_distance_cm = None
+        self._start_bbox = None
 
         self._running = False
         self._thread = None
@@ -1585,6 +1778,27 @@ class AprilTagLocalizer:
         with self._settings_lock:
             return self._trigger_distance_cm
 
+    def set_start_tag_id(self, tag_id):
+        with self._settings_lock:
+            self._start_tag_id = int(tag_id)
+        return True
+
+    def get_start_tag_id(self):
+        with self._settings_lock:
+            return self._start_tag_id
+
+    def set_start_tag_size(self, size_cm):
+        size_cm = float(size_cm)
+        if size_cm <= 0:
+            return False
+        with self._settings_lock:
+            self._start_tag_size_cm = size_cm
+        return True
+
+    def get_start_tag_size(self):
+        with self._settings_lock:
+            return self._start_tag_size_cm
+
     def set_camera_params(self, fx=None, fy=None, cx=None, cy=None):
         with self._settings_lock:
             if fx is not None:
@@ -1631,56 +1845,85 @@ class AprilTagLocalizer:
             elapsed = time.monotonic() - start
             time.sleep(max(0.0, interval - elapsed))
 
+    @staticmethod
+    def _bbox_from_corners(det):
+        # corners is a 4x2 array of the tag's detected pixel corners --
+        # used only to draw a GUI bounding box, so a simple axis-aligned
+        # min/max is enough (no need for the tag's true rotated outline).
+        corners = det.corners
+        xs = [float(p[0]) for p in corners]
+        ys = [float(p[1]) for p in corners]
+        return {'x': min(xs), 'y': min(ys), 'w': max(xs) - min(xs), 'h': max(ys) - min(ys)}
+
+    @staticmethod
+    def _distance_cm_from_pose(det):
+        # pose_t is the tag's [x, y, z] translation in the camera frame,
+        # in meters -- the straight-line camera-to-tag distance is just
+        # its norm.
+        tx, ty, tz = (float(v) for v in det.pose_t.flatten())
+        return math.sqrt(tx * tx + ty * ty + tz * tz) * 100.0
+
     def _tick(self, frame):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         tag_id = self.get_tag_id()
+        start_tag_id = self.get_start_tag_id()
         fx, fy, cx, cy = self.get_camera_params()
         tag_size_m = self.get_tag_size() / 100.0
+        start_tag_size_m = self.get_start_tag_size() / 100.0
 
-        detections = self._detector.detect(
+        # pupil_apriltags applies tag_size UNIFORMLY to every tag within a
+        # single detect() call (this build's Detector.detect() takes a
+        # single float, not a per-tag {id: size} dict -- confirmed by a
+        # real TypeError: "must be real number, not dict"). With two
+        # differently-sized tags, that means two separate detect() calls,
+        # each scoped to one tag's own true physical size, and we just
+        # read the ONE relevant match's pose out of each. Skip the
+        # redundant second call when both tags happen to be the same size.
+        pin_detections = self._detector.detect(
             gray, estimate_tag_pose=True,
             camera_params=(fx, fy, cx, cy), tag_size=tag_size_m,
         )
+        if start_tag_size_m == tag_size_m:
+            start_detections = pin_detections
+        else:
+            start_detections = self._detector.detect(
+                gray, estimate_tag_pose=True,
+                camera_params=(fx, fy, cx, cy), tag_size=start_tag_size_m,
+            )
 
-        match = None
-        for det in detections:
-            if det.tag_id == tag_id:
-                match = det
-                break
+        pin_match = next((d for d in pin_detections if d.tag_id == tag_id), None)
+        start_match = next((d for d in start_detections if d.tag_id == start_tag_id), None)
 
-        if match is None:
+        if pin_match is None:
             with self._lock:
                 self._visible = False
                 self._last_distance_cm = None
                 self._last_triggered = False
                 self._last_bbox = None
-            return
+        else:
+            distance_cm = self._distance_cm_from_pose(pin_match)
+            trigger_distance_cm = self.get_trigger_distance()
+            triggered = distance_cm <= trigger_distance_cm
+            bbox = self._bbox_from_corners(pin_match)
+            with self._lock:
+                self._visible = True
+                self._last_distance_cm = distance_cm
+                self._last_triggered = triggered
+                self._last_bbox = bbox
+            if triggered:
+                world_x_cm, world_y_cm = self.get_world_position()
+                self.node.correct_position_from_tag(world_x_cm, world_y_cm)
 
-        # pose_t is the tag's [x, y, z] translation in the camera frame,
-        # in meters (same units as tag_size passed in above) -- the
-        # straight-line camera-to-tag distance is just its norm.
-        tx, ty, tz = (float(v) for v in match.pose_t.flatten())
-        distance_cm = math.sqrt(tx * tx + ty * ty + tz * tz) * 100.0
-        trigger_distance_cm = self.get_trigger_distance()
-        triggered = distance_cm <= trigger_distance_cm
-
-        # corners is a 4x2 array of the tag's detected pixel corners --
-        # used only to draw a GUI bounding box, so a simple axis-aligned
-        # min/max is enough (no need for the tag's true rotated outline).
-        corners = match.corners
-        xs = [float(p[0]) for p in corners]
-        ys = [float(p[1]) for p in corners]
-        bbox = {'x': min(xs), 'y': min(ys), 'w': max(xs) - min(xs), 'h': max(ys) - min(ys)}
-
-        with self._lock:
-            self._visible = True
-            self._last_distance_cm = distance_cm
-            self._last_triggered = triggered
-            self._last_bbox = bbox
-
-        if triggered:
-            world_x_cm, world_y_cm = self.get_world_position()
-            self.node.correct_position_from_tag(world_x_cm, world_y_cm)
+        if start_match is None:
+            with self._lock:
+                self._start_visible = False
+                self._start_distance_cm = None
+                self._start_bbox = None
+        else:
+            with self._lock:
+                self._start_visible = True
+                self._start_distance_cm = self._distance_cm_from_pose(start_match)
+                self._start_bbox = self._bbox_from_corners(start_match)
 
     def get_status(self):
         with self._lock:
@@ -1694,6 +1937,22 @@ class AprilTagLocalizer:
             'distance_cm': distance_cm,
             'triggered': triggered,
             'bbox': bbox,
+            'frame_width': CAMERA_WIDTH,
+            'frame_height': CAMERA_HEIGHT,
+        }
+
+    def get_start_status(self):
+        with self._lock:
+            visible = self._start_visible
+            distance_cm = self._start_distance_cm
+            bbox = self._start_bbox
+        return {
+            'available': self._detector is not None,
+            'visible': visible,
+            'distance_cm': distance_cm,
+            'bbox': bbox,
+            'frame_width': CAMERA_WIDTH,
+            'frame_height': CAMERA_HEIGHT,
         }
 
 
@@ -1743,6 +2002,13 @@ class GridNavNode(Node):
         # restarting the node, to test how speed affects distance accuracy.
         self.forward_speed = FORWARD_SPEED
         self.rotate_speed = ROTATE_SPEED
+        # Live-adjustable via the web GUI (see set_pulses_per_cm()) --
+        # encoder calibration constant, converts raw pulse counts to cm
+        # traveled (control_loop's DRIVE phase). Wrong wheel diameter/
+        # encoder resolution assumptions show up as consistent over/under
+        # -shoot on every commanded distance -- tunable live instead of
+        # editing PULSES_PER_CM and restarting.
+        self.pulses_per_cm = PULSES_PER_CM
 
         self._lock = threading.Lock()
 
@@ -1780,6 +2046,65 @@ class GridNavNode(Node):
         # the current goal is reached (_goal_reached_locked()). Empty
         # for an ordinary single-goal "Go".
         self.waypoint_queue = []
+        # Which Mode A/B/C is currently running (None for an ordinary
+        # single-goal "Go" or a manually-issued run_path()) -- once
+        # waypoint_queue drains AND this is set, _goal_reached_locked()
+        # kicks off the AprilTag-assisted return-home behavior instead
+        # of just going IDLE. See _begin_homing_locked()/HOMING_* consts.
+        self.active_mode = None
+        # None | 'RETURN_X' | 'ROTATE' | 'STRAIGHT' -- which stage of the
+        # return-home sequence is active (see _begin_homing_locked(),
+        # _begin_homing_straight_locked(), _homing_tick_locked()).
+        self.homing_stage = None
+        # Consecutive in-tolerance AprilTag readings during the STRAIGHT
+        # stage (see _homing_tick_locked()).
+        self.homing_hold_count = 0
+        # STRAIGHT-stage dead-reckoning state -- same math as a normal
+        # 'move' leg (leg_start_x/y, leg_unit_dx/dy, leg_baseline_pulses,
+        # leg_progress_cm), kept separate so the ordinary leg system is
+        # untouched. homing_target_distance_cm starts as the odometry
+        # estimate and gets refined live by the AprilTag when visible
+        # (see _begin_homing_straight_locked()/_homing_tick_locked()).
+        self.homing_leg_start_x = 0.0
+        self.homing_leg_start_y = 0.0
+        self.homing_unit_dx = 0.0
+        self.homing_unit_dy = 0.0
+        self.homing_target_heading = 0.0
+        self.homing_baseline_pulses = 0
+        self.homing_progress_cm = 0.0
+        self.homing_target_distance_cm = 0.0
+        # Set externally in main() once constructed (None if no camera /
+        # pupil_apriltags unavailable) -- used by the setup gate and by
+        # _homing_tick_locked() for the return-home vision servo.
+        self.apriltag_localizer = None
+        # Gates set_goal()/run_path() (enforced at the Flask route level,
+        # see /api/goal, /api/run_mode) -- False until the operator
+        # confirms the AprilTag-verified start position (see
+        # confirm_start_position()).
+        self.setup_confirmed = False
+        # Set externally in main() -- live-adjustable distance/centering
+        # tolerance for check_apriltag_setup_ready() (see SetupGateSettings).
+        self.setup_gate_settings = SetupGateSettings()
+        # Live-adjustable final resting distance from the tag for the
+        # return-home vision servo (see _homing_tick_locked() and
+        # HomingDistanceSettings).
+        self.homing_distance_settings = HomingDistanceSettings()
+        # Live-adjustable max forward/rotate speed for the return-home
+        # behavior (see _homing_tick_locked() and HomingSpeedSettings).
+        self.homing_speed_settings = HomingSpeedSettings()
+        # Live telemetry from the most recent _homing_tick_locked() call
+        # (mode, distance, offset, hold count, etc.) -- purely for GUI
+        # display (see get_snapshot()), so the operator can actually see
+        # what the homing behavior is doing/why it hasn't stopped, instead
+        # of the display freezing once setup_confirmed flips True. None
+        # until homing has run at least one tick.
+        self.homing_debug = None
+        # (x_cm, y_cm) world position of the start-point AprilTag, computed
+        # from the measured distance + the robot's calibrated heading at
+        # the moment confirm_start_position() succeeds -- purely a GUI
+        # overlay marker (see _pin_apriltag_position_locked()), not used
+        # by navigation. None until the first successful confirm.
+        self.apriltag_pin_position = None
 
         # Obstacle map for A* planning: set of blocked (i, j) grid cells,
         # cell (i, j) centered at (i * GRID_SPACING_CM, j * GRID_SPACING_CM).
@@ -1828,9 +2153,25 @@ class GridNavNode(Node):
         with self._lock:
             self.current_yaw = yaw
             if self.heading_ref is None:
-                self.heading_ref = yaw
+                # Whatever direction the robot physically faces at boot is
+                # defined as HOMING_HEADING_DEG (-90deg by default, i.e.
+                # "facing the start-point AprilTag") right from the start
+                # -- not "+X"/0deg. Previously 0deg was locked here, which
+                # meant physically placing the robot facing the tag at
+                # boot still read as some arbitrary heading, requiring an
+                # inconvenient manual pick-up-and-rotate before
+                # confirm_start_position() would work. Now, as long as the
+                # robot is physically aimed at the tag when it's powered
+                # on/the IMU locks, it's already correctly calibrated --
+                # no extra rotation needed (confirm_start_position() still
+                # re-locks this from the tag's live measurement anyway, so
+                # this is just a convenient starting point, not the only
+                # calibration opportunity).
+                self.heading_ref = normalize_angle(yaw - math.radians(HOMING_HEADING_DEG))
                 self.get_logger().info(
-                    f'Heading reference locked (this is "+X"): {math.degrees(yaw):.1f} deg'
+                    f'Heading reference locked (boot orientation defined as '
+                    f'{HOMING_HEADING_DEG:.0f}deg -- point the robot at the start AprilTag '
+                    f'before/at power-on): raw yaw {math.degrees(yaw):.1f} deg'
                 )
 
     def encoder_callback(self, msg: Int32MultiArray):
@@ -1863,14 +2204,18 @@ class GridNavNode(Node):
 
     def set_goal(self, gx, gy, end_dir_deg=None, step_mode=False):
         """Public entry point (manual "Go" / /api/goal) -- cancels any
-        in-progress preset path (see run_path()) before driving to this
-        goal, since a manually-entered goal should override whatever
-        automatic path was running."""
+        in-progress preset path (see run_path()) AND any pending
+        return-home sequence before driving to this goal, since a
+        manually-entered goal should override whatever automatic
+        behavior was running."""
         with self._lock:
             self.waypoint_queue = []
+            self.active_mode = None
+            self.homing_stage = None
+            self.homing_debug = None
             self._set_goal_locked(gx, gy, end_dir_deg, step_mode)
 
-    def run_path(self, waypoints):
+    def run_path(self, waypoints, mode_name=None):
         """Queue a fixed sequence of (x, y) cm waypoints -- e.g. one of
         the GUI's preset Mode A/B/C coverage paths (see
         get_mode_a_waypoints() etc.). Drives to the first waypoint now;
@@ -1878,24 +2223,92 @@ class GridNavNode(Node):
         to the next one (_goal_reached_locked()) until the queue is
         empty. An obstacle-triggered replan (replan_current_goal())
         re-routes to the CURRENT waypoint only, leaving the rest of the
-        queue untouched."""
+        queue untouched.
+
+        mode_name (e.g. 'A'/'B'/'C') marks this as a preset coverage
+        run -- once the LAST queued waypoint is reached,
+        _goal_reached_locked() automatically kicks off the AprilTag
+        return-home sequence (_begin_homing_locked()) instead of just
+        going IDLE. Pass None (the default) for an ordinary path with no
+        automatic return-home behavior."""
         waypoints = [(float(x), float(y)) for x, y in waypoints]
         if not waypoints:
             return
         with self._lock:
             self.waypoint_queue = waypoints[1:]
+            self.active_mode = mode_name
+            self.homing_stage = None
             self._set_goal_locked(waypoints[0][0], waypoints[0][1])
         self.get_logger().info(f'Running preset path -- {len(waypoints)} waypoint(s)')
 
     def _goal_reached_locked(self):
         """Caller must hold self._lock. Call once the current goal's
         legs are all complete. Advances to the next queued waypoint (see
-        run_path()) if any is pending, otherwise goes IDLE."""
+        run_path()) if any is pending; otherwise, if this was a leg of
+        the return-home sequence (see _begin_homing_locked()), advances
+        its stage; otherwise, if this was the final leg of a Mode A/B/C
+        run, kicks off the return-home sequence; otherwise goes IDLE."""
         if self.waypoint_queue:
             nx, ny = self.waypoint_queue.pop(0)
             self._set_goal_locked(nx, ny)
-        else:
-            self.state = 'IDLE'
+            return
+        if self.homing_stage == 'RETURN_X':
+            # x=0 leg done -- the robot is NOT necessarily facing the tag
+            # yet (that leg only drove along X), so rotate in place to
+            # face it before driving the final straight stretch.
+            self.homing_stage = 'ROTATE'
+            self._set_goal_locked(self.x, self.y, end_dir_deg=HOMING_HEADING_DEG)
+            return
+        if self.homing_stage == 'ROTATE':
+            self._begin_homing_straight_locked()
+            return
+        if self.active_mode is not None:
+            self.active_mode = None
+            self._begin_homing_locked()
+            return
+        self.state = 'IDLE'
+
+    def _begin_homing_locked(self):
+        """Caller must hold self._lock. Called once a Mode A/B/C preset
+        path's last coverage waypoint is reached -- starts the
+        return-home sequence with an ordinary odometry leg to x=0 (at
+        the robot's actual current y). _goal_reached_locked() then
+        rotates to face the tag, then hands off to
+        _begin_homing_straight_locked() for the final stretch."""
+        self.homing_stage = 'RETURN_X'
+        self.homing_hold_count = 0
+        self._set_goal_locked(0.0, self.y)
+
+    def _begin_homing_straight_locked(self):
+        """Caller must hold self._lock. Called once the robot has driven
+        to x=0 and rotated to face the tag's expected direction -- sets
+        up a single straight-line "leg" toward (0, 0), driven and
+        tracked exactly like the same math as a normal 'move' leg
+        (encoder dead-reckoning, so self.x/self.y and the GUI's live
+        position both update normally -- see _homing_tick_locked() and
+        _live_position_locked()). The target distance starts as the
+        ODOMETRY estimate (straight-line distance from here to (0, 0));
+        _homing_tick_locked() refines that target live from the AprilTag
+        whenever it's visible, WITHOUT changing the steering itself --
+        vision corrects the estimated distance/position (like a running
+        correct_position_from_tag()), it doesn't drive a separate
+        centering-steering loop, so the final approach stays a slow,
+        nearly-straight line instead of swinging side to side."""
+        self.homing_stage = 'STRAIGHT'
+        self.homing_hold_count = 0
+        self.state = 'HOMING'
+        self.homing_leg_start_x = self.x
+        self.homing_leg_start_y = self.y
+        rad = math.radians(HOMING_HEADING_DEG)
+        self.homing_unit_dx = math.cos(rad)
+        self.homing_unit_dy = Y_AXIS_SIGN * math.sin(rad)
+        self.homing_target_heading = normalize_angle(self.heading_ref + rad)
+        self.homing_baseline_pulses = self.last_pulses if self.last_pulses is not None else 0
+        self.homing_progress_cm = 0.0
+        # Odometry's own best estimate of how far is left to (0, 0) --
+        # refined live by the AprilTag if/when it's visible.
+        self.homing_target_distance_cm = math.hypot(self.x, self.y)
+        self.drive_pid.reset(angle_diff(self.homing_target_heading, self.current_yaw))
 
     def _set_goal_locked(self, gx, gy, end_dir_deg=None, step_mode=False):
         """Caller must hold self._lock. Does the actual A*-plan-and-start
@@ -1948,6 +2361,8 @@ class GridNavNode(Node):
                 self.phase = None
                 self.planned_path = []
                 self.waypoint_queue = []
+                self.active_mode = None
+                self.homing_stage = None
                 self.get_logger().warn(
                     f'No path to ({gx:.1f}, {gy:.1f}) cm -- blocked by obstacles (incl. robot '
                     f'clearance margin) or out of range. Stopped -- send a new goal once clear.'
@@ -2038,6 +2453,17 @@ class GridNavNode(Node):
             f'Speed updated: forward={self.forward_speed:.3f} rotate={self.rotate_speed:.3f}'
         )
 
+    def set_pulses_per_cm(self, pulses_per_cm):
+        """Adjust the encoder pulses-per-cm calibration live, without
+        restarting the node."""
+        pulses_per_cm = float(pulses_per_cm)
+        if pulses_per_cm <= 0:
+            return False
+        with self._lock:
+            self.pulses_per_cm = pulses_per_cm
+        self.get_logger().info(f'pulses_per_cm updated: {pulses_per_cm:.3f}')
+        return True
+
     # ---------------- Control loop ----------------
 
     def control_loop(self):
@@ -2046,6 +2472,10 @@ class GridNavNode(Node):
         with self._lock:
             if self.stopped_for_obstacle:
                 self.cmd_pub.publish(twist)  # all-zero -- held for a genuine obstacle stop
+                return
+
+            if self.state == 'HOMING':
+                self._homing_tick_locked()
                 return
 
             if self.state != 'RUNNING' or self.current_yaw is None or self.last_pulses is None:
@@ -2099,7 +2529,7 @@ class GridNavNode(Node):
 
             # phase == 'DRIVE'
             traveled_pulses = self.last_pulses - self.leg_baseline_pulses
-            traveled_cm = abs(traveled_pulses) / PULSES_PER_CM
+            traveled_cm = abs(traveled_pulses) / self.pulses_per_cm
             # Live progress along this leg's direction, updated every tick
             # (not yet committed to x/y) -- lets the GUI show real-time
             # position and distance-so-far while driving, like
@@ -2138,7 +2568,7 @@ class GridNavNode(Node):
                 return
 
             if self.step_mode:
-                step_traveled_cm = abs(self.last_pulses - self.step_baseline_pulses) / PULSES_PER_CM
+                step_traveled_cm = abs(self.last_pulses - self.step_baseline_pulses) / self.pulses_per_cm
                 if step_traveled_cm >= STEP_SIZE_CM:
                     self.awaiting_continue = True
                     self.cmd_pub.publish(twist)  # all-zero -- full stop for measuring
@@ -2181,6 +2611,9 @@ class GridNavNode(Node):
                 and self.legs[self.leg_idx][0] == 'move':
             x = self.leg_start_x + self.leg_unit_dx * self.leg_progress_cm
             y = self.leg_start_y + self.leg_unit_dy * self.leg_progress_cm
+        elif self.state == 'HOMING' and self.homing_stage == 'STRAIGHT':
+            x = self.homing_leg_start_x + self.homing_unit_dx * self.homing_progress_cm
+            y = self.homing_leg_start_y + self.homing_unit_dy * self.homing_progress_cm
         return x, y
 
     def is_driving(self):
@@ -2297,6 +2730,204 @@ class GridNavNode(Node):
                 self.leg_start_y += dy
             self.path.append((tag_x_cm, tag_y_cm))
 
+    def _calibrate_start_pose_locked(self, heading_deg):
+        """Caller must hold self._lock. Snaps the tracked pose to the
+        DEFINED home pose (0, 0, heading_deg) -- used both by
+        confirm_start_position() (operator-confirmed initial setup) and
+        by _homing_tick_locked() (finalizing a completed return-home
+        vision servo). Unlike correct_position_from_tag(), this ALSO
+        resets heading_ref (not just x/y), since the whole point is
+        establishing the ground-truth reference every other heading
+        angle in this file is measured against -- if no IMU data has
+        arrived yet, heading_ref is left alone (still None; the normal
+        "lock on first IMU message" path in imu_callback will run
+        instead, which won't match heading_deg -- calibration should be
+        redone once IMU data is flowing)."""
+        self.x = 0.0
+        self.y = 0.0
+        if self.current_yaw is not None:
+            self.heading_ref = normalize_angle(self.current_yaw - math.radians(heading_deg))
+        self.path.append((0.0, 0.0))
+
+    def calibrate_start_pose(self, heading_deg):
+        with self._lock:
+            self._calibrate_start_pose_locked(heading_deg)
+
+    def check_apriltag_setup_ready(self):
+        """Loose, human-tolerant check of whether the configured
+        AprilTag is CURRENTLY within the SETUP thresholds (live-adjustable
+        -- see self.setup_gate_settings/SetupGateSettings) -- used both to
+        light up the GUI's readiness indicator and to gate
+        confirm_start_position(). Returns (ready, reason, distance_cm,
+        offset_frac) -- distance_cm/offset_frac are None whenever the tag
+        isn't visible at all."""
+        if self.apriltag_localizer is None:
+            return False, 'no AprilTag localizer available (camera unavailable or pupil_apriltags not installed)', None, None
+        status = self.apriltag_localizer.get_start_status()
+        if not status['available']:
+            return False, 'pupil_apriltags not installed / camera unavailable', None, None
+        if not status['visible'] or status['bbox'] is None or status['distance_cm'] is None:
+            return False, 'tag not visible', None, None
+
+        frame_w = status['frame_width']
+        bbox = status['bbox']
+        tag_center_x = bbox['x'] + bbox['w'] / 2.0
+        offset_frac = (tag_center_x - frame_w / 2.0) / (frame_w / 2.0)
+        distance_cm = status['distance_cm']
+        max_distance_cm, center_tolerance_frac = self.setup_gate_settings.get()
+
+        if distance_cm > max_distance_cm:
+            return False, f'too far ({distance_cm:.0f}cm, need <= {max_distance_cm:.0f}cm)', distance_cm, offset_frac
+        if abs(offset_frac) > center_tolerance_frac:
+            return False, 'tag not centered enough in frame', distance_cm, offset_frac
+        return True, 'ok', distance_cm, offset_frac
+
+    def confirm_start_position(self):
+        """Operator-triggered (GUI "Confirm Start Position" button /
+        /api/confirm_start) -- only succeeds while check_apriltag_setup_ready()
+        passes. On success, calibrates the tracked pose to the defined
+        home pose (0, 0) @ HOMING_HEADING_DEG, unlocks movement
+        (set_goal()/run_path() are gated on self.setup_confirmed at the
+        Flask route level), and pins the AprilTag's own world position on
+        the GUI map (purely a visual reference -- see
+        self.apriltag_pin_position), computed from the just-measured
+        distance and the newly-calibrated heading. Returns (ok, reason)."""
+        ready, reason, distance_cm, _ = self.check_apriltag_setup_ready()
+        if not ready:
+            return False, reason
+        self.calibrate_start_pose(HOMING_HEADING_DEG)
+        with self._lock:
+            self.setup_confirmed = True
+            # The tag sits distance_cm straight ahead along the
+            # just-calibrated heading (HOMING_HEADING_DEG) from the new
+            # (0, 0) origin -- same forward-unit-vector convention used
+            # for 'move' legs (_start_leg_locked(): target = heading_ref +
+            # atan2(Y_AXIS_SIGN*uy, ux)), inverted to solve for (ux, uy)
+            # given a known heading instead of the other way around.
+            rad = math.radians(HOMING_HEADING_DEG)
+            ux, uy = math.cos(rad), Y_AXIS_SIGN * math.sin(rad)
+            self.apriltag_pin_position = (distance_cm * ux, distance_cm * uy)
+        self.get_logger().info(
+            f'Start position confirmed via AprilTag -- pose set to (0, 0) @ '
+            f'{HOMING_HEADING_DEG:.0f}deg, movement unlocked. Tag pinned at '
+            f'({self.apriltag_pin_position[0]:.1f}, {self.apriltag_pin_position[1]:.1f}) cm.'
+        )
+        return True, 'ok'
+
+    def is_setup_confirmed(self):
+        with self._lock:
+            return self.setup_confirmed
+
+    def _homing_tick_locked(self):
+        """Caller must hold self._lock. Runs one control_loop tick of the
+        STRAIGHT stage (see _begin_homing_straight_locked()) -- a single
+        straight-line drive toward (0, 0), tracked by encoder dead
+        reckoning exactly like a normal 'move' leg (so self.x/self.y and
+        the GUI's live position update every tick, not just at the end).
+        By the time this stage runs, x is already 0 (the RETURN_X stage
+        guarantees that) and the robot is already facing the tag's
+        expected direction (the ROTATE stage).
+
+        Steering is heading-hold ONLY (self.drive_pid against the fixed
+        target heading set when this stage began) -- there is no
+        pixel-offset centering loop, so the robot drives nearly straight
+        instead of swinging side to side chasing the tag in frame.
+
+        Stopping decision is a strict either/or, checked fresh every
+        tick:
+          - AprilTag currently visible: judged PURELY from its live
+            distance reading (ignoring odometry entirely) -- once that
+            reading holds within tolerance for HOMING_HOLD_TICKS
+            consecutive ticks, locks in an EXACT final pose via
+            _calibrate_start_pose_locked().
+          - AprilTag not visible (right now, or the whole time): falls
+            back to the plain odometry distance estimate
+            (self.homing_target_distance_cm, fixed at whatever it was
+            set to when this stage began) -- if it never sees the tag,
+            it just uses odometry."""
+        twist = Twist()
+        if self.current_yaw is None or self.last_pulses is None:
+            self.cmd_pub.publish(twist)  # no IMU/encoder data yet -- hold still
+            return
+
+        max_forward_speed, max_rotate_speed = self.homing_speed_settings.get()
+
+        traveled_pulses = self.last_pulses - self.homing_baseline_pulses
+        traveled_cm = abs(traveled_pulses) / self.pulses_per_cm
+        self.homing_progress_cm = traveled_cm
+
+        status = self.apriltag_localizer.get_start_status() if self.apriltag_localizer is not None else None
+        tag_visible = bool(status and status['available'] and status['visible']
+                            and status['distance_cm'] is not None)
+
+        # Strict either/or, per x=0 already being guaranteed true here
+        # (this stage only ever starts after the RETURN_X leg has
+        # already driven x to 0): if the tag is visible, judge "are we
+        # there yet" from ITS live distance reading ALONE -- not blended
+        # with odometry. If it's not visible (at this tick, or the whole
+        # time), fall back to the plain odometry distance estimate
+        # (self.homing_target_distance_cm, fixed at whatever it was set
+        # to when this stage began) instead.
+        at_distance = False
+        distance_cm = None
+        if tag_visible:
+            target_distance_cm, distance_tolerance_cm = self.homing_distance_settings.get()
+            distance_cm = status['distance_cm']
+            at_distance = abs(distance_cm - target_distance_cm) <= distance_tolerance_cm
+            if at_distance:
+                self.homing_hold_count += 1
+            else:
+                self.homing_hold_count = 0
+        else:
+            self.homing_hold_count = 0
+
+        self.homing_debug = {
+            'tag_visible': tag_visible,
+            'distance_cm': distance_cm,
+            'traveled_cm': traveled_cm,
+            'target_distance_cm': self.homing_target_distance_cm,
+            'hold_count': self.homing_hold_count,
+            'hold_ticks_needed': HOMING_HOLD_TICKS,
+        }
+
+        vision_locked_in = tag_visible and at_distance and self.homing_hold_count >= HOMING_HOLD_TICKS
+        # The bare odometry distance-covered check only ever completes
+        # things while the tag is NOT visible -- whenever it IS visible,
+        # completion goes exclusively through the hold-count-confirmed
+        # vision path above (ignoring odometry entirely, as requested).
+        odometry_arrived = (not tag_visible) and (traveled_cm >= self.homing_target_distance_cm)
+
+        if vision_locked_in or odometry_arrived:
+            self.x = self.homing_leg_start_x + self.homing_unit_dx * traveled_cm
+            self.y = self.homing_leg_start_y + self.homing_unit_dy * traveled_cm
+            self.path.append((self.x, self.y))
+            self.state = 'IDLE'
+            self.homing_stage = None
+            self.homing_hold_count = 0
+            self.homing_debug = None
+            self.cmd_pub.publish(twist)
+            if vision_locked_in:
+                # AprilTag-confirmed -- snap to the EXACT defined home
+                # pose, correcting any residual dead-reckoning error.
+                self._calibrate_start_pose_locked(HOMING_HEADING_DEG)
+                self.get_logger().info(
+                    'Homing complete (AprilTag-confirmed) -- pose locked to (0, 0) @ '
+                    f'{HOMING_HEADING_DEG:.0f}deg.'
+                )
+            else:
+                self.get_logger().info(
+                    'Homing complete (odometry' + (' -- AprilTag never came into view).'
+                    if not tag_visible else ', tag visible but not yet confirmed).')
+                )
+            return
+
+        twist.linear.x = min(self.forward_speed, max_forward_speed)
+        herr = angle_diff(self.homing_target_heading, self.current_yaw)
+        correction = self.drive_pid.compute(herr)
+        rotate_cmd = DRIVE_CORRECTION_SIGN * correction
+        twist.angular.z = max(-max_rotate_speed, min(max_rotate_speed, rotate_cmd))
+        self.cmd_pub.publish(twist)
+
     def pin_cells(self, cells):
         """Permanently add an arbitrary collection of (i, j) grid cells to
         the A* obstacle map, tracked in pinned_cells (a subset of
@@ -2385,6 +3016,10 @@ class GridNavNode(Node):
                 'leg_target_distance_cm': self.leg_target_distance_cm if self.phase == 'DRIVE' else None,
                 'forward_speed': self.forward_speed,
                 'rotate_speed': self.rotate_speed,
+                'pulses_per_cm': self.pulses_per_cm,
+                'apriltag_pin': list(self.apriltag_pin_position) if self.apriltag_pin_position else None,
+                'homing_stage': self.homing_stage,
+                'homing_debug': dict(self.homing_debug) if self.homing_debug else None,
             }
 
 
@@ -2440,6 +3075,28 @@ HTML_PAGE = """<!doctype html>
 <h1>grid_nav.py -- live position (poll __POLL_MS__ms)</h1>
 <div class="layout">
   <div class="left">
+    <div style="font-size:11px; color:#999;">Start-position setup (point camera at the home AprilTag, ~2m away, roughly centered):</div>
+    <div class="stats" style="margin-bottom:6px;">
+      <div class="stat-box wide"><div class="k">Setup Status</div><div class="v" id="s-setup">--</div></div>
+    </div>
+    <button id="confirmStartBtn" style="background:#444;" disabled>Confirm Start Position</button>
+    <form id="startTagForm">
+      <div style="font-size:11px; color:#999;">Start Point AprilTag Config (independent of the pin-position tag above):</div>
+      <div class="row"><label>Tag ID</label><input id="stTagId" type="number" value="__START_TAG_ID__" step="1" min="0"></div>
+      <div class="row"><label>Tag Size (cm)</label><input id="stTagSize" type="number" value="__START_TAG_SIZE__" step="0.1" min="0.1"></div>
+      <button type="submit">Set Start Point AprilTag Config</button>
+    </form>
+    <form id="setupSettingsForm">
+      <div class="row"><label>Max Distance (cm)</label><input id="setupMaxDist" type="number" value="__SETUP_MAX_DIST__" step="1" min="1"></div>
+      <div class="row"><label>Center Tolerance (0-1)</label><input id="setupCenterTol" type="number" value="__SETUP_CENTER_TOL__" step="0.01" min="0.01" max="1"></div>
+      <button type="submit">Set Setup Tolerance</button>
+    </form>
+    <form id="homingDistanceForm">
+      <div style="font-size:11px; color:#999;">Return-home final resting distance from the tag (0 = drive up to the tag itself):</div>
+      <div class="row"><label>Target Distance (cm)</label><input id="homingTargetDist" type="number" value="__HOMING_TARGET_DIST__" step="1" min="0"></div>
+      <div class="row"><label>Distance Tolerance (cm)</label><input id="homingDistTol" type="number" value="__HOMING_DIST_TOL__" step="1" min="1"></div>
+      <button type="submit">Set Homing Distance</button>
+    </form>
     <form id="goalForm">
       <div class="row"><label>Goal X (cm)</label><input id="goalX" type="number" value="0" step="1"></div>
       <div class="row"><label>Goal Y (cm)</label><input id="goalY" type="number" value="0" step="1"></div>
@@ -2458,6 +3115,7 @@ HTML_PAGE = """<!doctype html>
       <div class="row"><label>X Length (cm)</label><input id="modeXLength" type="number" value="__MODE_X_LENGTH__" step="1" min="1"></div>
       <div class="row"><label>Y Length (cm)</label><input id="modeYLength" type="number" value="__MODE_Y_LENGTH__" step="1" min="1"></div>
       <div class="row"><label>Row Step (cm)</label><input id="modeRowStep" type="number" value="__MODE_ROW_STEP__" step="1" min="1"></div>
+      <div class="row"><label>Row X Drift Offset (cm/row)</label><input id="modeRowXOffset" type="number" value="__MODE_ROW_X_OFFSET__" step="0.5"></div>
       <button type="submit">Set Mode Path Settings</button>
     </form>
     <button id="resetBtn" style="background:#5a2a2a;">Reset Position to (0,0)</button>
@@ -2468,6 +3126,10 @@ HTML_PAGE = """<!doctype html>
       <div class="row"><label>Drive Speed (0-1)</label><input id="speedFwd" type="number" value="__FORWARD_SPEED__" step="0.01" min="0.01" max="1"></div>
       <div class="row"><label>Rotate Speed (0-1)</label><input id="speedRot" type="number" value="__ROTATE_SPEED__" step="0.01" min="0.01" max="1"></div>
       <button type="submit">Set Speed</button>
+    </form>
+    <form id="pulsesForm">
+      <div class="row"><label>Pulses Per CM</label><input id="pulsesPerCm" type="number" value="__PULSES_PER_CM__" step="0.1" min="0.1"></div>
+      <button type="submit">Set Pulses Per CM</button>
     </form>
     <div class="stats" id="stats">
       <div class="stat-box wide"><div class="k">Position</div><div class="v" id="s-pos">--</div></div>
@@ -2483,7 +3145,14 @@ HTML_PAGE = """<!doctype html>
       <div class="stat-box wide"><div class="k">Target Heading</div><div class="v" id="s-target">--</div></div>
       <div class="stat-box wide"><div class="k">Obstacle Watch</div><div class="v" id="s-obwatch">--</div></div>
       <div class="stat-box wide"><div class="k">AprilTag</div><div class="v" id="s-apriltag">--</div></div>
+      <div class="stat-box wide"><div class="k">Homing (return-to-start)</div><div class="v" id="s-homing">--</div></div>
     </div>
+    <form id="homingSpeedForm">
+      <div style="font-size:11px; color:#999;">Return-home speed caps (slower than normal drive speed, for a precise final approach):</div>
+      <div class="row"><label>Max Forward Speed (0-1)</label><input id="homingMaxFwd" type="number" value="__HOMING_MAX_FWD__" step="0.01" min="0.01" max="1"></div>
+      <div class="row"><label>Max Rotate Speed (0-1)</label><input id="homingMaxRot" type="number" value="__HOMING_MAX_ROT__" step="0.01" min="0.01" max="1"></div>
+      <button type="submit">Set Homing Speed</button>
+    </form>
     <form id="obWatchForm">
       <div class="row"><label style="display:inline"><input id="obEnabled" type="checkbox" style="width:auto"> Obstacle Avoidance Enabled</label></div>
       <div class="row"><label>Sensitivity (consecutive frames to pin, 1=instant)</label><input id="obSensitivity" type="number" value="3" step="1" min="1"></div>
@@ -2507,6 +3176,7 @@ HTML_PAGE = """<!doctype html>
       <div class="guide-lines" id="guideLines"></div>
       <div class="detection-boxes" id="detectionBoxes"></div>
       <div class="detection-boxes" id="aprilTagBoxes"></div>
+      <div class="detection-boxes" id="startTagBoxes"></div>
       <div class="crosshair"></div>
     </div>
     <form id="camCalibForm">
@@ -2518,8 +3188,6 @@ HTML_PAGE = """<!doctype html>
     <div class="stat-box wide"><div class="k">Tilt / Crosshair Distance</div><div class="v" id="s-cam">not calibrated</div></div>
     <form id="detectSizeForm">
       <div class="row"><label>Black V Max (0-255)</label><input id="detectBlackVMax" type="number" value="90" step="1" min="0" max="255"></div>
-      <div class="row"><label>White S Max (0-255)</label><input id="detectWhiteSMax" type="number" value="40" step="1" min="0" max="255"></div>
-      <div class="row"><label>White V Min (0-255)</label><input id="detectWhiteVMin" type="number" value="200" step="1" min="0" max="255"></div>
       <div class="row"><label>Blur Kernel Size (odd, e.g. 3/5/7)</label><input id="detectBlurKsize" type="number" value="3" step="2" min="1" max="21"></div>
       <button type="submit">Set Detection Params</button>
     </form>
@@ -2744,6 +3412,23 @@ function draw(state) {
     ctx.beginPath(); ctx.moveTo(gx - 6, gy + 6); ctx.lineTo(gx + 6, gy - 6); ctx.stroke();
   }
 
+  // AprilTag pin -- the start-point tag's own world position, computed
+  // once at confirm_start_position() time from the measured distance +
+  // calibrated heading (see GridNavNode.confirm_start_position()). Purely
+  // a visual reference for where the physical tag sits relative to the
+  // court/robot, not used by navigation itself.
+  if (state.apriltag_pin) {
+    let [apx, apy] = toPx(state.apriltag_pin[0], state.apriltag_pin[1]);
+    ctx.fillStyle = '#00bfff';
+    ctx.strokeStyle = '#003a4d';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(apx, apy, 6, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#00bfff';
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('AprilTag', apx, apy - 10);
+  }
+
   // robot footprint box (ROBOT_SIZE x ROBOT_SIZE cm) -- state.x/y is the
   // FRONT-LEFT wheel, one CORNER of the box (not its center), so in the
   // robot's own local frame (+x = forward, +y = left) the box spans
@@ -2822,6 +3507,25 @@ function updateStatus(state) {
   set('s-heading', fmt(state.heading_deg));
   set('s-target', fmt(state.target_heading_deg));
   document.getElementById('continueBtn').style.display = state.awaiting_continue ? 'block' : 'none';
+
+  const hd = state.homing_debug;
+  if (state.homing_stage === 'RETURN_X') {
+    set('s-homing', 'returning home -- driving to x=0');
+  } else if (state.homing_stage === 'ROTATE') {
+    set('s-homing', 'returning home -- rotating to face the tag');
+  } else if (state.homing_stage === 'STRAIGHT' && hd) {
+    const traveledText = `${(hd.traveled_cm / 100).toFixed(2)}m / ${(hd.target_distance_cm / 100).toFixed(2)}m`;
+    if (hd.tag_visible) {
+      const holdText = (hd.hold_count > 0) ? ` -- LOCKING IN (${hd.hold_count}/${hd.hold_ticks_needed})` : '';
+      set('s-homing', `final approach -- ${traveledText} (AprilTag: ${hd.distance_cm.toFixed(0)}cm)${holdText}`);
+    } else {
+      set('s-homing', `final approach -- ${traveledText} (odometry only, tag not visible)`);
+    }
+  } else if (state.homing_stage) {
+    set('s-homing', 'returning home...');
+  } else {
+    set('s-homing', 'not active');
+  }
 }
 
 async function poll() {
@@ -2865,6 +3569,16 @@ document.getElementById('speedForm').addEventListener('submit', async (ev) => {
   });
 });
 
+document.getElementById('pulsesForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const pulsesPerCm = parseFloat(document.getElementById('pulsesPerCm').value);
+  await fetch('/api/set_pulses_per_cm', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({pulses_per_cm: pulsesPerCm})
+  });
+});
+
 document.getElementById('resetBtn').addEventListener('click', async () => {
   await fetch('/api/reset_position', {method: 'POST'});
 });
@@ -2885,10 +3599,11 @@ document.getElementById('modeSettingsForm').addEventListener('submit', async (ev
   const xLength = parseFloat(document.getElementById('modeXLength').value);
   const yLength = parseFloat(document.getElementById('modeYLength').value);
   const rowStep = parseFloat(document.getElementById('modeRowStep').value);
+  const rowXOffset = parseFloat(document.getElementById('modeRowXOffset').value);
   await fetch('/api/mode_settings', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({x_length_cm: xLength, y_length_cm: yLength, row_step_cm: rowStep})
+    body: JSON.stringify({x_length_cm: xLength, y_length_cm: yLength, row_step_cm: rowStep, row_x_offset_cm: rowXOffset})
   });
 });
 
@@ -3015,16 +3730,12 @@ async function pollDetections() {
 document.getElementById('detectSizeForm').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const blackVMax = parseFloat(document.getElementById('detectBlackVMax').value);
-  const whiteSMax = parseFloat(document.getElementById('detectWhiteSMax').value);
-  const whiteVMin = parseFloat(document.getElementById('detectWhiteVMin').value);
   const blurKsize = parseInt(document.getElementById('detectBlurKsize').value, 10);
   await fetch('/api/detection_settings', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       black_value_max: blackVMax,
-      white_sat_max: whiteSMax,
-      white_value_min: whiteVMin,
       blur_ksize: blurKsize
     })
   });
@@ -3129,16 +3840,136 @@ document.getElementById('aprilTagForm').addEventListener('submit', async (ev) =>
   });
 });
 
+let setupConfirmed = false;
+
+function setMovementButtonsEnabled(enabled) {
+  for (const id of ['modeABtn', 'modeBBtn', 'modeCBtn']) {
+    document.getElementById(id).disabled = !enabled;
+  }
+  const goBtn = document.querySelector('#goalForm button[type="submit"]');
+  if (goBtn) goBtn.disabled = !enabled;
+}
+
+async function pollSetup() {
+  try {
+    const res = await fetch('/api/setup_status');
+    const su = await res.json();
+    setupConfirmed = su.confirmed;
+    setMovementButtonsEnabled(su.confirmed);
+
+    const confirmBtn = document.getElementById('confirmStartBtn');
+    if (su.confirmed) {
+      set('s-setup', 'CONFIRMED -- movement unlocked');
+      confirmBtn.disabled = true;
+      confirmBtn.style.background = '#2a5a2a';
+    } else if (su.ready) {
+      set('s-setup', `ready -- dist=${su.distance_cm.toFixed(0)}cm, click Confirm`);
+      confirmBtn.disabled = false;
+      confirmBtn.style.background = '#2a5a2a';
+    } else {
+      set('s-setup', `not ready -- ${su.reason}`);
+      confirmBtn.disabled = true;
+      confirmBtn.style.background = '#444';
+    }
+  } catch (e) {
+    set('s-setup', 'connection lost');
+  }
+}
+
+document.getElementById('confirmStartBtn').addEventListener('click', async () => {
+  await fetch('/api/confirm_start', {method: 'POST'});
+  pollSetup();
+});
+
+document.getElementById('setupSettingsForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const maxDist = parseFloat(document.getElementById('setupMaxDist').value);
+  const centerTol = parseFloat(document.getElementById('setupCenterTol').value);
+  await fetch('/api/setup_settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({max_distance_cm: maxDist, center_tolerance_frac: centerTol})
+  });
+});
+
+document.getElementById('homingDistanceForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const targetDist = parseFloat(document.getElementById('homingTargetDist').value);
+  const distTol = parseFloat(document.getElementById('homingDistTol').value);
+  await fetch('/api/homing_distance_settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({target_distance_cm: targetDist, distance_tolerance_cm: distTol})
+  });
+});
+
+document.getElementById('homingSpeedForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const maxFwd = parseFloat(document.getElementById('homingMaxFwd').value);
+  const maxRot = parseFloat(document.getElementById('homingMaxRot').value);
+  await fetch('/api/homing_speed_settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({max_forward_speed: maxFwd, max_rotate_speed: maxRot})
+  });
+});
+
+async function pollStartTag() {
+  const container = document.getElementById('startTagBoxes');
+  try {
+    const res = await fetch('/api/start_apriltag_state');
+    const st = await res.json();
+    container.innerHTML = '';
+    if (st.available && st.visible && st.bbox) {
+      const color = '#00bfff';
+      const box = document.createElement('div');
+      box.className = 'detection-box';
+      box.style.left = `${(st.bbox.x / st.frame_width * 100).toFixed(2)}%`;
+      box.style.top = `${(st.bbox.y / st.frame_height * 100).toFixed(2)}%`;
+      box.style.width = `${(st.bbox.w / st.frame_width * 100).toFixed(2)}%`;
+      box.style.height = `${(st.bbox.h / st.frame_height * 100).toFixed(2)}%`;
+      box.style.borderColor = color;
+
+      const label = document.createElement('div');
+      label.className = 'detection-box-label';
+      label.style.color = color;
+      const distText = (st.distance_cm === null || st.distance_cm === undefined)
+            ? '?m' : `${(st.distance_cm / 100).toFixed(2)}m`;
+      label.textContent = `start-tag${st.tag_id} ~${distText}`;
+      box.appendChild(label);
+
+      container.appendChild(box);
+    }
+  } catch (e) {
+    container.innerHTML = '';
+  }
+}
+
+document.getElementById('startTagForm').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const tagId = parseInt(document.getElementById('stTagId').value, 10);
+  const tagSize = parseFloat(document.getElementById('stTagSize').value);
+  await fetch('/api/start_apriltag_settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({tag_id: tagId, tag_size_cm: tagSize})
+  });
+});
+
 setInterval(poll, __POLL_MS__);
 setInterval(pollCamera, __POLL_MS__);
 setInterval(pollDetections, __POLL_MS__);
 setInterval(pollObstacleWatch, __POLL_MS__);
 setInterval(pollAprilTag, __POLL_MS__);
+setInterval(pollSetup, __POLL_MS__);
+setInterval(pollStartTag, __POLL_MS__);
 poll();
 pollCamera();
 pollDetections();
 pollObstacleWatch();
 pollAprilTag();
+pollSetup();
+pollStartTag();
 </script>
 </body>
 </html>
@@ -3160,6 +3991,7 @@ def render_page():
             .replace('__STEP_SIZE__', f'{STEP_SIZE_CM / 100:.1f}')
             .replace('__FORWARD_SPEED__', f'{FORWARD_SPEED:.2f}')
             .replace('__ROTATE_SPEED__', f'{ROTATE_SPEED:.2f}')
+            .replace('__PULSES_PER_CM__', str(PULSES_PER_CM))
             .replace('__ROBOT_SIZE__', str(ROBOT_SIZE_CM))
             .replace('__COURT_LENGTH__', str(COURT_LENGTH_CM))
             .replace('__COURT_WIDTH__', str(COURT_WIDTH_CM))
@@ -3172,7 +4004,16 @@ def render_page():
             .replace('__APRILTAG_TRIGGER__', str(APRILTAG_TRIGGER_DISTANCE_CM))
             .replace('__MODE_X_LENGTH__', str(MODE_X_LENGTH_CM))
             .replace('__MODE_Y_LENGTH__', str(MODE_Y_LENGTH_CM))
-            .replace('__MODE_ROW_STEP__', str(MODE_ROW_STEP_CM)))
+            .replace('__MODE_ROW_STEP__', str(MODE_ROW_STEP_CM))
+            .replace('__MODE_ROW_X_OFFSET__', str(MODE_ROW_X_OFFSET_CM))
+            .replace('__SETUP_MAX_DIST__', str(APRILTAG_SETUP_MAX_DISTANCE_CM))
+            .replace('__SETUP_CENTER_TOL__', str(APRILTAG_SETUP_CENTER_TOLERANCE_FRAC))
+            .replace('__START_TAG_ID__', str(APRILTAG_START_DEFAULT_ID))
+            .replace('__START_TAG_SIZE__', str(APRILTAG_DEFAULT_SIZE_CM))
+            .replace('__HOMING_TARGET_DIST__', str(HOMING_TARGET_DISTANCE_CM))
+            .replace('__HOMING_DIST_TOL__', str(HOMING_DISTANCE_TOLERANCE_CM))
+            .replace('__HOMING_MAX_FWD__', str(HOMING_MAX_FORWARD_SPEED))
+            .replace('__HOMING_MAX_ROT__', str(HOMING_MAX_ROTATE_SPEED)))
 
 
 def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
@@ -3267,16 +4108,6 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
                 ok = detector.set_black_value_max(float(data['black_value_max'])) and ok
             except (TypeError, ValueError):
                 ok = False
-        if 'white_sat_max' in data:
-            try:
-                ok = detector.set_white_sat_max(float(data['white_sat_max'])) and ok
-            except (TypeError, ValueError):
-                ok = False
-        if 'white_value_min' in data:
-            try:
-                ok = detector.set_white_value_min(float(data['white_value_min'])) and ok
-            except (TypeError, ValueError):
-                ok = False
         if 'blur_ksize' in data:
             try:
                 ok = detector.set_blur_ksize(int(data['blur_ksize'])) and ok
@@ -3327,8 +4158,6 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
         status['world_y_cm'] = world_y_cm
         status['tag_size_cm'] = apriltag.get_tag_size()
         status['trigger_distance_cm'] = apriltag.get_trigger_distance()
-        status['frame_width'] = CAMERA_WIDTH
-        status['frame_height'] = CAMERA_HEIGHT
         return jsonify(status)
 
     @app.route('/api/apriltag_settings', methods=['POST'])
@@ -3364,12 +4193,43 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
             return jsonify({'ok': False, 'error': 'invalid AprilTag setting value'}), 400
         return jsonify({'ok': True})
 
+    @app.route('/api/start_apriltag_state')
+    def api_start_apriltag_state():
+        if apriltag is None:
+            return jsonify({'available': False})
+        status = apriltag.get_start_status()
+        status['tag_id'] = apriltag.get_start_tag_id()
+        status['tag_size_cm'] = apriltag.get_start_tag_size()
+        return jsonify(status)
+
+    @app.route('/api/start_apriltag_settings', methods=['POST'])
+    def api_start_apriltag_settings():
+        if apriltag is None:
+            return jsonify({'ok': False, 'error': 'AprilTag localizer not running (camera unavailable or pupil_apriltags not installed)'}), 400
+        data = request.get_json(force=True)
+        ok = True
+        if 'tag_id' in data:
+            try:
+                ok = apriltag.set_start_tag_id(int(data['tag_id'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if 'tag_size_cm' in data:
+            try:
+                ok = apriltag.set_start_tag_size(float(data['tag_size_cm'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if not ok:
+            return jsonify({'ok': False, 'error': 'invalid start-point AprilTag setting value'}), 400
+        return jsonify({'ok': True})
+
     @app.route('/api/state')
     def api_state():
         return jsonify(node.get_snapshot())
 
     @app.route('/api/goal', methods=['POST'])
     def api_goal():
+        if not node.is_setup_confirmed():
+            return jsonify({'ok': False, 'error': 'start position not confirmed yet -- see AprilTag setup'}), 400
         data = request.get_json(force=True)
         try:
             gx = float(data['x'])
@@ -3387,6 +4247,8 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
 
     @app.route('/api/run_mode', methods=['POST'])
     def api_run_mode():
+        if not node.is_setup_confirmed():
+            return jsonify({'ok': False, 'error': 'start position not confirmed yet -- see AprilTag setup'}), 400
         data = request.get_json(force=True)
         mode = data.get('mode')
         if mode not in ('A', 'B', 'C'):
@@ -3394,19 +4256,95 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
         if mode == 'C':
             waypoints = get_mode_c_waypoints()
         else:
-            x_length_cm, y_length_cm, row_step_cm = mode_settings.get()
+            x_length_cm, y_length_cm, row_step_cm, row_x_offset_cm = mode_settings.get()
             fn = get_mode_a_waypoints if mode == 'A' else get_mode_b_waypoints
-            waypoints = fn(x_length_cm, y_length_cm, row_step_cm)
-        node.run_path(waypoints)
+            waypoints = fn(x_length_cm, y_length_cm, row_step_cm, row_x_offset_cm)
+        node.run_path(waypoints, mode)
+        return jsonify({'ok': True})
+
+    @app.route('/api/setup_status')
+    def api_setup_status():
+        ready, reason, distance_cm, offset_frac = node.check_apriltag_setup_ready()
+        max_distance_cm, center_tolerance_frac = node.setup_gate_settings.get()
+        return jsonify({
+            'confirmed': node.is_setup_confirmed(),
+            'ready': ready,
+            'reason': reason,
+            'distance_cm': distance_cm,
+            'offset_frac': offset_frac,
+            'max_distance_cm': max_distance_cm,
+            'center_tolerance_frac': center_tolerance_frac,
+        })
+
+    @app.route('/api/confirm_start', methods=['POST'])
+    def api_confirm_start():
+        ok, reason = node.confirm_start_position()
+        if not ok:
+            return jsonify({'ok': False, 'error': reason}), 400
+        return jsonify({'ok': True})
+
+    @app.route('/api/setup_settings', methods=['POST'])
+    def api_setup_settings():
+        data = request.get_json(force=True)
+        ok = True
+        if 'max_distance_cm' in data:
+            try:
+                ok = node.setup_gate_settings.set_max_distance(float(data['max_distance_cm'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if 'center_tolerance_frac' in data:
+            try:
+                ok = node.setup_gate_settings.set_center_tolerance(float(data['center_tolerance_frac'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if not ok:
+            return jsonify({'ok': False, 'error': 'invalid setup-gate tolerance value'}), 400
+        return jsonify({'ok': True})
+
+    @app.route('/api/homing_distance_settings', methods=['POST'])
+    def api_homing_distance_settings():
+        data = request.get_json(force=True)
+        ok = True
+        if 'target_distance_cm' in data:
+            try:
+                ok = node.homing_distance_settings.set_target_distance(float(data['target_distance_cm'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if 'distance_tolerance_cm' in data:
+            try:
+                ok = node.homing_distance_settings.set_distance_tolerance(float(data['distance_tolerance_cm'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if not ok:
+            return jsonify({'ok': False, 'error': 'invalid homing distance setting value'}), 400
+        return jsonify({'ok': True})
+
+    @app.route('/api/homing_speed_settings', methods=['POST'])
+    def api_homing_speed_settings():
+        data = request.get_json(force=True)
+        ok = True
+        if 'max_forward_speed' in data:
+            try:
+                ok = node.homing_speed_settings.set_max_forward_speed(float(data['max_forward_speed'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if 'max_rotate_speed' in data:
+            try:
+                ok = node.homing_speed_settings.set_max_rotate_speed(float(data['max_rotate_speed'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if not ok:
+            return jsonify({'ok': False, 'error': 'invalid homing speed setting value'}), 400
         return jsonify({'ok': True})
 
     @app.route('/api/mode_settings')
     def api_mode_settings_get():
-        x_length_cm, y_length_cm, row_step_cm = mode_settings.get()
+        x_length_cm, y_length_cm, row_step_cm, row_x_offset_cm = mode_settings.get()
         return jsonify({
             'x_length_cm': x_length_cm,
             'y_length_cm': y_length_cm,
             'row_step_cm': row_step_cm,
+            'row_x_offset_cm': row_x_offset_cm,
         })
 
     @app.route('/api/mode_settings', methods=['POST'])
@@ -3428,6 +4366,11 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
                 ok = mode_settings.set_row_step(float(data['row_step_cm'])) and ok
             except (TypeError, ValueError):
                 ok = False
+        if 'row_x_offset_cm' in data:
+            try:
+                ok = mode_settings.set_row_x_offset(float(data['row_x_offset_cm'])) and ok
+            except (TypeError, ValueError):
+                ok = False
         if not ok:
             return jsonify({'ok': False, 'error': 'invalid mode-path setting value'}), 400
         return jsonify({'ok': True})
@@ -3443,6 +4386,17 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
         except (TypeError, ValueError):
             return jsonify({'ok': False, 'error': 'invalid speed value'}), 400
         node.set_speed(forward=forward, rotate=rotate)
+        return jsonify({'ok': True})
+
+    @app.route('/api/set_pulses_per_cm', methods=['POST'])
+    def api_set_pulses_per_cm():
+        data = request.get_json(force=True)
+        try:
+            pulses_per_cm = float(data['pulses_per_cm'])
+        except (KeyError, TypeError, ValueError):
+            return jsonify({'ok': False, 'error': 'invalid pulses_per_cm value'}), 400
+        if not node.set_pulses_per_cm(pulses_per_cm):
+            return jsonify({'ok': False, 'error': 'pulses_per_cm must be positive'}), 400
         return jsonify({'ok': True})
 
     @app.route('/api/toggle_obstacle', methods=['POST'])
@@ -3516,6 +4470,8 @@ def main(args=None):
                 'pupil_apriltags not installed -- AprilTag position correction disabled '
                 '(pip install pupil-apriltags to enable it).'
             )
+
+    node.apriltag_localizer = apriltag  # used by the setup gate and the return-home vision servo
 
     mode_settings = ModePathSettings()
     app = create_app(node, camera, rangefinder, detector, watcher, apriltag, mode_settings)
