@@ -276,18 +276,30 @@ DETECTION_FPS = 5.0                     # detection is heavier than streaming; r
 # of exactly that with too aggressive a blur). GUI/API-adjustable.
 DETECTION_BLUR_KSIZE = 3
 
-# Ignore black straight line markings (floor tape, tile grout seams,
-# thresholds) via HSV color segmentation, applied to the EDGE MAP before
-# the vertical-line search runs: any Canny edge pixel that falls on a
-# "black" (V below black_value_max) region of the frame is erased first.
-# GUI/API-adjustable -- tune it live against the debug feed, since the
-# right cutoff depends on actual ambient lighting. (NOTE: setting this
-# too high can eat a real leg/pillar's own edge if it's dark -- that's
-# what testing at 0 revealed the vertical-line pattern in the first
-# place.) White-line rejection (a separate HSV low-saturation/high-value
-# check) was removed -- it was rejecting real obstacles along with floor
-# markings, per live testing.
+# Ignore black/white straight line markings (floor tape, tile grout
+# seams, court lines) via HSV color segmentation, computed from the same
+# downscaled frame as the Canny edge map.
+#
+# BLACK ("V below black_value_max") is intentionally NOT applied to erase
+# edges -- only tracked as a stat (line_coverage_pct) -- confirmed with a
+# real cv2 test that a dark leg/pillar (exactly what black_value_max is
+# tuned to reject as floor tape) got wiped from the edge map entirely
+# before the vertical search ever ran. The vertical-line SHAPE filter
+# below (top-anchored, tall, thin) already rejects floor tape's shape on
+# its own, so a color veto here was only ever hurting real obstacles.
+#
+# WHITE ("S below white_sat_max AND V above white_value_min") IS applied
+# -- any Canny edge pixel landing in a white region (e.g. painted court
+# lines) is erased before the vertical-line search runs. Re-enabled per
+# explicit request; if it starts eating real light-colored obstacles,
+# that's the tradeoff to revisit (raise white_sat_max / lower
+# white_value_min to narrow what counts as "white", or disable again).
+#
+# Both are GUI/API-adjustable -- tune live against the debug feed, since
+# the right cutoffs depend on actual ambient lighting.
 DETECTION_BLACK_VALUE_MAX = 90      # 0-255 HSV V; below this = "black"
+DETECTION_WHITE_SAT_MAX = 40        # 0-255 HSV S; below this (AND V above WHITE_VALUE_MIN) = "white"
+DETECTION_WHITE_VALUE_MIN = 200     # 0-255 HSV V; above this (AND S below WHITE_SAT_MAX) = "white"
 
 # VERTICAL-LINE obstacle condition:
 #   1. The edge must extend from near the top of the frame downward --
@@ -446,30 +458,36 @@ APRILTAG_SETUP_MAX_DISTANCE_CM = 250.0        # "within 2m" with slack for human
 APRILTAG_SETUP_CENTER_TOLERANCE_FRAC = 0.25   # tag center within 25% of half-frame-width of dead center
 
 HOMING_HEADING_DEG = -90.0        # the home pose's defined heading (0deg = "+X" = heading_ref)
-# Final resting distance from the tag -- the point the straight-line leg
-# converges to gets FORCIBLY RELABELED as (0, 0) once locked in (see
-# _calibrate_start_pose_locked()), so this is really "how far short of
-# the tag's own physical position does 'home' sit." 100cm = stop as soon
-# as the AprilTag reads under 1m away, rather than driving all the way
-# up to it. Both this and the tolerance below are live-adjustable via
-# the GUI (see HomingDistanceSettings).
+# Fallback resting distance from the tag, used ONLY if the operator's
+# initial confirm_start_position() reading is unavailable for some
+# reason -- in normal operation, the ACTUAL stop threshold is the
+# distance (and frame offset) recorded from the very reading the
+# operator confirmed setup with (see GridNavNode.homing_reference_distance_cm/
+# homing_reference_offset_frac, set in confirm_start_position()), not
+# this constant -- so homing reproduces the EXACT same camera view (same
+# distance, same left-right offset) it started from, rather than a fixed
+# target picked in advance. Both this and the tolerances below are
+# live-adjustable via the GUI (see HomingDistanceSettings).
 HOMING_TARGET_DISTANCE_CM = 100.0
 HOMING_DISTANCE_TOLERANCE_CM = 15.0
+HOMING_CENTER_TOLERANCE_FRAC = 0.06   # how close to the reference frame-offset counts as "centered like at confirm"
 HOMING_HOLD_TICKS = 5              # consecutive in-tolerance AprilTag readings required before locking in the pose
 # Live-adjustable -- see HomingSpeedSettings. max_rotate caps the TOTAL
 # steering command (heading-hold + centering combined, see
 # HOMING_CENTER_KP below) -- there is no separate pixel-centering-only
 # loop like the old design, so this can stay well under max_forward.
-HOMING_MAX_ROTATE_SPEED = 0.20
+HOMING_MAX_ROTATE_SPEED = 0.25
 HOMING_MAX_FORWARD_SPEED = 0.20
 # Once the AprilTag is visible during the STRAIGHT stage, this ADDS a
 # gentle left-right centering nudge on top of the normal heading-hold
-# correction (it doesn't replace it) -- so residual x/heading error from
-# the earlier RETURN_X/ROTATE stages still gets corrected once the tag
-# is actually in view, without reintroducing the old aggressive
-# pixel-only steering that caused excessive angular movement. Deliberately
-# small relative to HOMING_MAX_ROTATE_SPEED for that reason.
-HOMING_CENTER_KP = 0.15            # normalized frame offset [-1,1] -> additional rotate command fraction
+# correction (it doesn't replace it) -- steering toward the REFERENCE
+# frame offset (recorded at confirm_start_position()), not necessarily
+# dead-center -- so residual x/heading error from the earlier
+# RETURN_X/ROTATE stages still gets corrected once the tag is actually
+# in view, without reintroducing the old aggressive pixel-only steering
+# that caused excessive angular movement. Deliberately small relative to
+# HOMING_MAX_ROTATE_SPEED for that reason.
+HOMING_CENTER_KP = 0.15            # normalized frame offset error [-1,1] -> additional rotate command fraction
 # Confirmed backwards via earlier live testing (tag drifted further
 # off-center instead of recentering) -- same empirical-tuning idea as
 # PIVOT_ANGULAR_SIGN/DRIVE_CORRECTION_SIGN above. Flip to +1 if it turns
@@ -621,9 +639,9 @@ def inflate_obstacles(obstacles, radius_cells):
 # from the GUI via ModePathSettings below -- but each mode's START POINT
 # always stays pinned to its own court corner (top-left for A, bottom-left
 # for B), only the far edge of the sweep moves with the length settings.
-MODE_X_LENGTH_CM = COURT_WIDTH_CM            # default: full court width
-MODE_Y_LENGTH_CM = COURT_LENGTH_CM / 2.0     # default: half court length (to the net line)
-MODE_ROW_STEP_CM = 200   # 2m step between boustrophedon rows (modes A/B)
+MODE_X_LENGTH_CM = 500.0   # default sweep width
+MODE_Y_LENGTH_CM = 300.0   # default sweep depth
+MODE_ROW_STEP_CM = 100.0   # 1m step between boustrophedon rows (modes A/B)
 # Empirical per-row real-world X drift compensation -- observed behavior
 # was each row's ACTUAL physical X landing ~50cm off from the one before
 # it (a roughly linear-with-row-count systematic error, likely from
@@ -726,19 +744,22 @@ class SetupGateSettings:
 
 
 class HomingDistanceSettings:
-    """Live-adjustable final resting distance (+ tolerance) for the
-    return-home AprilTag vision servo (see
-    GridNavNode._homing_tick_locked()) -- how close to the tag "home"
-    actually is. 0.0 = drive all the way up to the tag itself. Whatever
-    point the servo converges to gets forcibly relabeled as (0, 0) once
-    locked in, so this is a judgment call about how close the camera can
-    physically/safely get to your mounted tag, not a fixed constant."""
+    """Live-adjustable tolerances for the return-home AprilTag vision
+    servo (see GridNavNode._homing_tick_locked()) -- how close a live
+    reading needs to match the REFERENCE reading (distance + frame
+    offset, recorded once at confirm_start_position() -- see
+    GridNavNode.homing_reference_distance_cm/homing_reference_offset_frac)
+    before it counts as "home." target_distance_cm/its tolerance are only
+    used as a FALLBACK on the rare chance the reference was never
+    captured; day to day, tune how forgiving the match needs to be."""
 
     def __init__(self, target_distance_cm=HOMING_TARGET_DISTANCE_CM,
-                 distance_tolerance_cm=HOMING_DISTANCE_TOLERANCE_CM):
+                 distance_tolerance_cm=HOMING_DISTANCE_TOLERANCE_CM,
+                 center_tolerance_frac=HOMING_CENTER_TOLERANCE_FRAC):
         self._lock = threading.Lock()
         self._target_distance_cm = target_distance_cm
         self._distance_tolerance_cm = distance_tolerance_cm
+        self._center_tolerance_frac = center_tolerance_frac
 
     def set_target_distance(self, target_distance_cm):
         target_distance_cm = float(target_distance_cm)
@@ -756,9 +777,17 @@ class HomingDistanceSettings:
             self._distance_tolerance_cm = distance_tolerance_cm
         return True
 
+    def set_center_tolerance(self, center_tolerance_frac):
+        center_tolerance_frac = float(center_tolerance_frac)
+        if not (0.0 < center_tolerance_frac <= 1.0):
+            return False
+        with self._lock:
+            self._center_tolerance_frac = center_tolerance_frac
+        return True
+
     def get(self):
         with self._lock:
-            return (self._target_distance_cm, self._distance_tolerance_cm)
+            return (self._target_distance_cm, self._distance_tolerance_cm, self._center_tolerance_frac)
 
 
 class HomingSpeedSettings:
@@ -1173,6 +1202,8 @@ class ObstacleDetector:
     def __init__(self, camera: 'CameraStreamer', rangefinder: CameraRangefinder,
                  fps=DETECTION_FPS,
                  black_value_max=DETECTION_BLACK_VALUE_MAX,
+                 white_sat_max=DETECTION_WHITE_SAT_MAX,
+                 white_value_min=DETECTION_WHITE_VALUE_MIN,
                  blur_ksize=DETECTION_BLUR_KSIZE,
                  downscale=DETECTION_DOWNSCALE):
         self.camera = camera
@@ -1181,6 +1212,8 @@ class ObstacleDetector:
 
         self._settings_lock = threading.Lock()
         self._black_value_max = black_value_max
+        self._white_sat_max = white_sat_max
+        self._white_value_min = white_value_min
         self._blur_ksize = blur_ksize
         self._downscale = downscale
 
@@ -1205,6 +1238,36 @@ class ObstacleDetector:
     def get_black_value_max(self):
         with self._settings_lock:
             return self._black_value_max
+
+    def set_white_sat_max(self, saturation):
+        """Live-adjustable -- 0-255 HSV S (saturation) cutoff, paired
+        with white_value_min. A pixel is treated as "white" (and its
+        edge erased before the vertical-line search) if its S is BELOW
+        this AND its V is above white_value_min."""
+        saturation = int(saturation)
+        if not (0 <= saturation <= 255):
+            return False
+        with self._settings_lock:
+            self._white_sat_max = saturation
+        return True
+
+    def get_white_sat_max(self):
+        with self._settings_lock:
+            return self._white_sat_max
+
+    def set_white_value_min(self, value):
+        """Live-adjustable -- 0-255 HSV V (brightness) cutoff, paired
+        with white_sat_max. See set_white_sat_max()."""
+        value = int(value)
+        if not (0 <= value <= 255):
+            return False
+        with self._settings_lock:
+            self._white_value_min = value
+        return True
+
+    def get_white_value_min(self):
+        with self._settings_lock:
+            return self._white_value_min
 
     def set_blur_ksize(self, ksize):
         """Live-adjustable -- GaussianBlur kernel size applied before
@@ -1296,30 +1359,31 @@ class ObstacleDetector:
         small = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale != 1.0 else roi
         inv_scale = 1.0 / scale
 
-        # Black LINE color segmentation -- still computed (as
-        # line_coverage_pct, a tuning/debug stat), but NO LONGER applied
-        # to erase edges before the vertical-line search. Confirmed with
-        # a real cv2 test: a dark leg/pillar (which is exactly what
-        # black_value_max is tuned to reject as floor tape) got wiped
-        # from the edge map entirely before the vertical search ever
-        # ran -- this is precisely the bug testing at black_value_max=0
-        # exposed. Floor tape doesn't need a color-based veto here
-        # anyway: a real painted line is short and wide, while the
-        # vertical shape filter below (top-anchored, tall, thin) already
-        # rejects that shape on its own, so color-based erasure was only
-        # ever hurting real vertical obstacles. White-line rejection was
-        # removed entirely -- it was rejecting real obstacles too.
+        # Black/white LINE color segmentation. BLACK is only tracked as a
+        # stat (line_coverage_pct) -- NOT applied to erase edges (see
+        # DETECTION_BLACK_VALUE_MAX comment for why: it wiped real dark
+        # obstacles). WHITE IS applied -- any Canny edge pixel landing on
+        # a white region (e.g. painted court lines) is erased before the
+        # vertical-line search runs.
         hsv_small = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        sat = hsv_small[..., 1]
         val = hsv_small[..., 2]
         black_value_max = self.get_black_value_max()
-        line_mask = val < black_value_max
+        white_sat_max = self.get_white_sat_max()
+        white_value_min = self.get_white_value_min()
+        black_mask = val < black_value_max
+        white_mask = (sat < white_sat_max) & (val > white_value_min)
+        line_mask = black_mask | white_mask
         line_pixel_count = int(line_mask.sum())
         total_pixel_count = line_mask.shape[0] * line_mask.shape[1]
         line_coverage_pct = (line_pixel_count / total_pixel_count) * 100.0 if total_pixel_count > 0 else 0.0
 
-        # Plain Canny edges -- full, unfiltered by color. The
-        # vertical-line SHAPE filter below is what separates real
-        # pillars/legs from floor clutter, not a color veto.
+        # Canny edges, unfiltered by color at first -- the vertical-line
+        # SHAPE filter below is what separates real pillars/legs from
+        # floor clutter for anything color alone can't rule out, but the
+        # white-line mask above gets erased from the edge map here first
+        # (court lines are wide/flat/white -- easy false positives for
+        # the vertical-line search, unlike a real obstacle's own edge).
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         # A lighter default blur + lower Canny thresholds than a first
         # pass here -- GaussianBlur(5,5) + Canny(50,150) smoothed real
@@ -1332,6 +1396,7 @@ class ObstacleDetector:
         blur_ksize = self.get_blur_ksize()
         blurred = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
         edges = cv2.Canny(blurred, 30, 90)
+        edges[white_mask] = 0
 
         # VERTICAL-LINE pattern match: a small vertical morphological
         # CLOSE bridges minor gaps in an otherwise-continuous vertical
@@ -1508,6 +1573,19 @@ class ObstacleWatcher:
         self._lock = threading.Lock()
         self.sensitivity_frames = sensitivity_frames
         self.enabled = False
+        # Configured up front, before the robot starts a task (Go / Mode
+        # A/B/C) -- what to do once an obstacle is confirmed:
+        #   True  ("avoid"): the full stop -> pin -> replan -> go pipeline
+        #         -- A* re-routes around the newly pinned cells and the
+        #         mission (including any Mode A/B/C waypoint queue)
+        #         continues automatically.
+        #   False ("stop only", the default): stop and pin the obstacle
+        #         same as always, but do NOT replan or resume -- the
+        #         mission is aborted to IDLE and stays that way until the
+        #         operator sends a new command. Safer default (matches
+        #         obstacle detection itself defaulting off) -- avoidance
+        #         is an explicit opt-in.
+        self.avoid_enabled = False
         self._streak_cell = None
         self._hit_streak = 0
 
@@ -1529,6 +1607,14 @@ class ObstacleWatcher:
             if not enabled:
                 self._streak_cell = None
                 self._hit_streak = 0
+        return True
+
+    def set_avoid_enabled(self, avoid_enabled: bool):
+        """Configures the RESPONSE to a confirmed obstacle -- see the
+        avoid_enabled comment in __init__. Independent of set_enabled()
+        (which is the master detection/response on-off switch)."""
+        with self._lock:
+            self.avoid_enabled = bool(avoid_enabled)
         return True
 
     def start(self):
@@ -1556,6 +1642,7 @@ class ObstacleWatcher:
         with self._lock:
             enabled = self.enabled
             sensitivity_frames = self.sensitivity_frames
+            avoid_enabled = self.avoid_enabled
         if not enabled:
             return
 
@@ -1598,17 +1685,29 @@ class ObstacleWatcher:
             # single front cell -- a real obstacle is rarely smaller
             # than one 50cm grid cell, so treating the detection as a
             # single point underestimates its footprint.
-            if self.node.pin_cells(self.node.get_front_block_cells()):
-                # replan_current_goal() -> set_goal() runs A* fresh from
-                # the just-committed live position -- this is the only
-                # time path planning runs beyond the initial goal: at
-                # start, and again right here when an obstacle is
-                # confirmed. Never on a timer/poll.
-                self.node.replan_current_goal()
-            # Release the stop -- the new plan's first leg (ROTATE phase,
-            # already set up by replan_current_goal() above) starts on
-            # the very next control_loop tick. This is "go."
-            self.node.set_stopped_for_obstacle(False)
+            pinned = self.node.pin_cells(self.node.get_front_block_cells())
+            if avoid_enabled:
+                if pinned:
+                    # replan_current_goal() -> set_goal() runs A* fresh
+                    # from the just-committed live position -- this is
+                    # one of only two times path planning runs beyond
+                    # the initial goal: at start, and again right here
+                    # when an obstacle is confirmed. Never on a
+                    # timer/poll. Preserves any pending Mode A/B/C
+                    # waypoint_queue -- the mission continues.
+                    self.node.replan_current_goal()
+                # Release the stop -- the new plan's first leg (ROTATE
+                # phase, already set up by replan_current_goal() above)
+                # starts on the very next control_loop tick. This is "go."
+                self.node.set_stopped_for_obstacle(False)
+            else:
+                # "Stop only" -- the obstacle is pinned (visible on the
+                # map, avoided by any FUTURE goal), but the current
+                # mission is abandoned rather than auto-continued. Leaves
+                # the robot fully controllable again (a new Go/Mode
+                # command works normally) instead of stuck mid-stop.
+                self.node.abort_to_idle()
+                self.node.set_stopped_for_obstacle(False)
             with self._lock:
                 self._streak_cell = None
                 self._hit_streak = 0
@@ -1626,10 +1725,12 @@ class ObstacleWatcher:
     def get_status(self):
         with self._lock:
             enabled = self.enabled
+            avoid_enabled = self.avoid_enabled
             sensitivity_frames = self.sensitivity_frames
             hit_streak = self._hit_streak
         return {
             'enabled': enabled,
+            'avoid_enabled': avoid_enabled,
             'sensitivity_frames': sensitivity_frames,
             'hit_streak': hit_streak,
         }
@@ -2092,6 +2193,14 @@ class GridNavNode(Node):
         # Live-adjustable max forward/rotate speed for the return-home
         # behavior (see _homing_tick_locked() and HomingSpeedSettings).
         self.homing_speed_settings = HomingSpeedSettings()
+        # The AprilTag distance/frame-offset reading recorded the moment
+        # confirm_start_position() succeeds -- this is the ACTUAL target
+        # _homing_tick_locked() drives back to (not a fixed constant), so
+        # the robot reproduces the exact same camera view (same distance,
+        # same left-right offset) it started from. None until the first
+        # successful confirm.
+        self.homing_reference_distance_cm = None
+        self.homing_reference_offset_frac = None
         # Live telemetry from the most recent _homing_tick_locked() call
         # (mode, distance, offset, hold count, etc.) -- purely for GUI
         # display (see get_snapshot()), so the operator can actually see
@@ -2355,14 +2464,7 @@ class GridNavNode(Node):
                 # waypoints -- a route that can't even reach its current
                 # waypoint shouldn't blindly attempt the next ones either.
                 self.goal = (gx, gy)
-                self.state = 'IDLE'
-                self.legs = []
-                self.leg_idx = 0
-                self.phase = None
-                self.planned_path = []
-                self.waypoint_queue = []
-                self.active_mode = None
-                self.homing_stage = None
+                self._abort_to_idle_locked()
                 self.get_logger().warn(
                     f'No path to ({gx:.1f}, {gy:.1f}) cm -- blocked by obstacles (incl. robot '
                     f'clearance margin) or out of range. Stopped -- send a new goal once clear.'
@@ -2788,16 +2890,22 @@ class GridNavNode(Node):
         passes. On success, calibrates the tracked pose to the defined
         home pose (0, 0) @ HOMING_HEADING_DEG, unlocks movement
         (set_goal()/run_path() are gated on self.setup_confirmed at the
-        Flask route level), and pins the AprilTag's own world position on
-        the GUI map (purely a visual reference -- see
-        self.apriltag_pin_position), computed from the just-measured
-        distance and the newly-calibrated heading. Returns (ok, reason)."""
-        ready, reason, distance_cm, _ = self.check_apriltag_setup_ready()
+        Flask route level), pins the AprilTag's own world position on the
+        GUI map (purely a visual reference -- see self.apriltag_pin_position),
+        and -- the actual homing target -- records this exact distance
+        and frame-offset reading as homing_reference_distance_cm/
+        homing_reference_offset_frac, so _homing_tick_locked() later
+        drives back to the SAME camera view (same distance, same
+        left-right offset) instead of a fixed constant. Returns
+        (ok, reason)."""
+        ready, reason, distance_cm, offset_frac = self.check_apriltag_setup_ready()
         if not ready:
             return False, reason
         self.calibrate_start_pose(HOMING_HEADING_DEG)
         with self._lock:
             self.setup_confirmed = True
+            self.homing_reference_distance_cm = distance_cm
+            self.homing_reference_offset_frac = offset_frac
             # The tag sits distance_cm straight ahead along the
             # just-calibrated heading (HOMING_HEADING_DEG) from the new
             # (0, 0) origin -- same forward-unit-vector convention used
@@ -2810,7 +2918,8 @@ class GridNavNode(Node):
         self.get_logger().info(
             f'Start position confirmed via AprilTag -- pose set to (0, 0) @ '
             f'{HOMING_HEADING_DEG:.0f}deg, movement unlocked. Tag pinned at '
-            f'({self.apriltag_pin_position[0]:.1f}, {self.apriltag_pin_position[1]:.1f}) cm.'
+            f'({self.apriltag_pin_position[0]:.1f}, {self.apriltag_pin_position[1]:.1f}) cm. '
+            f'Homing reference: distance={distance_cm:.1f}cm, offset={offset_frac:.3f}.'
         )
         return True, 'ok'
 
@@ -2828,18 +2937,37 @@ class GridNavNode(Node):
         guarantees that) and the robot is already facing the tag's
         expected direction (the ROTATE stage).
 
-        Steering is heading-hold ONLY (self.drive_pid against the fixed
-        target heading set when this stage began) -- there is no
-        pixel-offset centering loop, so the robot drives nearly straight
-        instead of swinging side to side chasing the tag in frame.
+        Steering is heading-hold (self.drive_pid against the fixed target
+        heading set when this stage began) as the base correction --
+        PLUS a small additional left-right centering nudge
+        (HOMING_CENTER_KP against the tag's offset from the REFERENCE
+        frame offset, not necessarily dead-center) once the AprilTag is
+        actually visible, to correct any residual x/heading error from
+        the earlier RETURN_X/ROTATE stages. This is deliberately gentle
+        (added on top of heading-hold, not a replacement, and small
+        relative to the overall rotate cap) so the robot still drives
+        close to straight instead of swinging side to side chasing the
+        tag in frame like the old design did.
 
         Stopping decision is a strict either/or, checked fresh every
         tick:
-          - AprilTag currently visible: judged PURELY from its live
-            distance reading (ignoring odometry entirely) -- once that
-            reading holds within tolerance for HOMING_HOLD_TICKS
-            consecutive ticks, locks in an EXACT final pose via
-            _calibrate_start_pose_locked().
+          - AprilTag currently visible: judged from its live distance
+            reading alone (not blended with odometry), compared against
+            the EFFECTIVE target -- max(homing_reference_distance_cm,
+            homing_distance_settings' target_distance_cm) if a reference
+            was captured at confirm_start_position(), else just the
+            settings target. That max() is a SAFETY FLOOR: however close
+            the operator physically placed the tag at confirm time, the
+            robot will never try to stop nearer than the settings target
+            (100cm by default) -- if they confirmed from farther than
+            that, the farther (their) distance is honored instead. Once
+            that holds within tolerance for HOMING_HOLD_TICKS consecutive
+            ticks, locks in an EXACT final pose via
+            _calibrate_start_pose_locked(). Centering (offset vs.
+            homing_reference_offset_frac) is NOT a requirement to stop --
+            expecting the live frame offset to exactly reproduce the
+            confirm-time reading proved too strict in practice -- it's
+            still used to steer (see above), just not to gate completion.
           - AprilTag not visible (right now, or the whole time): falls
             back to the plain odometry distance estimate
             (self.homing_target_distance_cm, fixed at whatever it was
@@ -2863,17 +2991,44 @@ class GridNavNode(Node):
         # Strict either/or, per x=0 already being guaranteed true here
         # (this stage only ever starts after the RETURN_X leg has
         # already driven x to 0): if the tag is visible, judge "are we
-        # there yet" from ITS live distance reading ALONE -- not blended
-        # with odometry. If it's not visible (at this tick, or the whole
-        # time), fall back to the plain odometry distance estimate
-        # (self.homing_target_distance_cm, fixed at whatever it was set
-        # to when this stage began) instead.
+        # there yet" from ITS live distance AND offset readings ALONE --
+        # not blended with odometry. If it's not visible (at this tick,
+        # or the whole time), fall back to the plain odometry distance
+        # estimate (self.homing_target_distance_cm, fixed at whatever it
+        # was set to when this stage began) instead.
         at_distance = False
+        at_center = False
         distance_cm = None
+        offset_frac = None
+        offset_error = None
         if tag_visible:
-            target_distance_cm, distance_tolerance_cm = self.homing_distance_settings.get()
+            settings_target_cm, distance_tolerance_cm, center_tolerance_frac = self.homing_distance_settings.get()
+            # settings_target_cm (100cm default) is a SAFETY FLOOR, not
+            # just a no-reference fallback: however close the operator
+            # confirmed from, never try to stop nearer than this. If they
+            # confirmed from farther away, honor that farther distance.
+            if self.homing_reference_distance_cm is not None:
+                target_distance_cm = max(self.homing_reference_distance_cm, settings_target_cm)
+            else:
+                target_distance_cm = settings_target_cm
+            reference_offset_frac = (self.homing_reference_offset_frac
+                                      if self.homing_reference_offset_frac is not None else 0.0)
+
             distance_cm = status['distance_cm']
             at_distance = abs(distance_cm - target_distance_cm) <= distance_tolerance_cm
+
+            # Left-right centering offset -- [-1, 1], + = tag right of
+            # center. offset_error is relative to the REFERENCE offset
+            # (recorded at confirm), not necessarily dead-center -- used
+            # for the steering nudge below. NOT required to match for the
+            # stop decision (see docstring) -- distance alone gates that.
+            frame_w = status['frame_width']
+            bbox = status['bbox']
+            tag_center_x = bbox['x'] + bbox['w'] / 2.0
+            offset_frac = (tag_center_x - frame_w / 2.0) / (frame_w / 2.0)
+            offset_error = offset_frac - reference_offset_frac
+            at_center = abs(offset_error) <= center_tolerance_frac
+
             if at_distance:
                 self.homing_hold_count += 1
             else:
@@ -2884,12 +3039,21 @@ class GridNavNode(Node):
         self.homing_debug = {
             'tag_visible': tag_visible,
             'distance_cm': distance_cm,
+            'offset_frac': offset_frac,
+            'reference_distance_cm': self.homing_reference_distance_cm,
+            'reference_offset_frac': self.homing_reference_offset_frac,
+            'at_distance': at_distance,
+            'at_center': at_center,
             'traveled_cm': traveled_cm,
             'target_distance_cm': self.homing_target_distance_cm,
             'hold_count': self.homing_hold_count,
             'hold_ticks_needed': HOMING_HOLD_TICKS,
         }
 
+        # Distance alone gates the stop -- centering (at_center) proved
+        # too strict as a REQUIREMENT in practice (the live offset rarely
+        # matches the confirm-time reading exactly), so it's steering
+        # guidance only now, not part of this condition.
         vision_locked_in = tag_visible and at_distance and self.homing_hold_count >= HOMING_HOLD_TICKS
         # The bare odometry distance-covered check only ever completes
         # things while the tag is NOT visible -- whenever it IS visible,
@@ -2925,6 +3089,8 @@ class GridNavNode(Node):
         herr = angle_diff(self.homing_target_heading, self.current_yaw)
         correction = self.drive_pid.compute(herr)
         rotate_cmd = DRIVE_CORRECTION_SIGN * correction
+        if tag_visible:
+            rotate_cmd += HOMING_CENTER_SIGN * (-HOMING_CENTER_KP * offset_error)
         twist.angular.z = max(-max_rotate_speed, min(max_rotate_speed, rotate_cmd))
         self.cmd_pub.publish(twist)
 
@@ -2957,6 +3123,33 @@ class GridNavNode(Node):
             step_mode = self.step_mode
             self.get_logger().warn(f'Replanning path to {goal} around newly pinned obstacle(s)')
             self._set_goal_locked(goal[0], goal[1], end_dir_deg, step_mode)
+
+    def _abort_to_idle_locked(self):
+        """Caller must hold self._lock. Fully abandons whatever the robot
+        is currently doing -- a leg-based goal/path (RUNNING) or a
+        return-home sequence (HOMING) -- and goes IDLE, clearing legs,
+        the planned path, any pending Mode A/B/C waypoint queue, and
+        homing state. Leaves the robot fully controllable again (a fresh
+        set_goal()/run_path() works normally right after) instead of
+        stuck mid-task. Used both when A* genuinely can't find a path
+        (see _set_goal_locked()) and by ObstacleWatcher's "stop only"
+        mode (see avoid_enabled)."""
+        self.state = 'IDLE'
+        self.legs = []
+        self.leg_idx = 0
+        self.phase = None
+        self.planned_path = []
+        self.waypoint_queue = []
+        self.active_mode = None
+        self.homing_stage = None
+        self.homing_hold_count = 0
+        self.homing_debug = None
+
+    def abort_to_idle(self):
+        """Public entry point -- see _abort_to_idle_locked()."""
+        with self._lock:
+            self._abort_to_idle_locked()
+        self.stop_robot()
 
     def reset_position(self):
         """Zero the tracked (x, y) without restarting the node. Goals are
@@ -3092,9 +3285,10 @@ HTML_PAGE = """<!doctype html>
       <button type="submit">Set Setup Tolerance</button>
     </form>
     <form id="homingDistanceForm">
-      <div style="font-size:11px; color:#999;">Return-home final resting distance from the tag (0 = drive up to the tag itself):</div>
-      <div class="row"><label>Target Distance (cm)</label><input id="homingTargetDist" type="number" value="__HOMING_TARGET_DIST__" step="1" min="0"></div>
+      <div style="font-size:11px; color:#999;">Return-home target: reproduces the distance/offset from your Confirm reading. These are the fallback (used only if no reference was ever captured) and tolerances:</div>
+      <div class="row"><label>Fallback Target Distance (cm)</label><input id="homingTargetDist" type="number" value="__HOMING_TARGET_DIST__" step="1" min="0"></div>
       <div class="row"><label>Distance Tolerance (cm)</label><input id="homingDistTol" type="number" value="__HOMING_DIST_TOL__" step="1" min="1"></div>
+      <div class="row"><label>Center Tolerance (0-1)</label><input id="homingCenterTol" type="number" value="__HOMING_CENTER_TOL__" step="0.01" min="0.01" max="1"></div>
       <button type="submit">Set Homing Distance</button>
     </form>
     <form id="goalForm">
@@ -3154,8 +3348,10 @@ HTML_PAGE = """<!doctype html>
       <button type="submit">Set Homing Speed</button>
     </form>
     <form id="obWatchForm">
-      <div class="row"><label style="display:inline"><input id="obEnabled" type="checkbox" style="width:auto"> Obstacle Avoidance Enabled</label></div>
+      <div class="row"><label style="display:inline"><input id="obEnabled" type="checkbox" style="width:auto"> Obstacle Detection Enabled</label></div>
+      <div class="row"><label style="display:inline"><input id="obAvoidEnabled" type="checkbox" style="width:auto"> Auto-Avoid (replan + continue -- unchecked = stop only)</label></div>
       <div class="row"><label>Sensitivity (consecutive frames to pin, 1=instant)</label><input id="obSensitivity" type="number" value="3" step="1" min="1"></div>
+      <div style="font-size:11px; color:#999;">Configure before starting a task -- applies to whatever obstacle is confirmed next.</div>
       <button type="submit">Set Obstacle Watch</button>
     </form>
     <form id="aprilTagForm">
@@ -3188,6 +3384,8 @@ HTML_PAGE = """<!doctype html>
     <div class="stat-box wide"><div class="k">Tilt / Crosshair Distance</div><div class="v" id="s-cam">not calibrated</div></div>
     <form id="detectSizeForm">
       <div class="row"><label>Black V Max (0-255)</label><input id="detectBlackVMax" type="number" value="90" step="1" min="0" max="255"></div>
+      <div class="row"><label>White S Max (0-255)</label><input id="detectWhiteSMax" type="number" value="40" step="1" min="0" max="255"></div>
+      <div class="row"><label>White V Min (0-255)</label><input id="detectWhiteVMin" type="number" value="200" step="1" min="0" max="255"></div>
       <div class="row"><label>Blur Kernel Size (odd, e.g. 3/5/7)</label><input id="detectBlurKsize" type="number" value="3" step="2" min="1" max="21"></div>
       <button type="submit">Set Detection Params</button>
     </form>
@@ -3517,7 +3715,13 @@ function updateStatus(state) {
     const traveledText = `${(hd.traveled_cm / 100).toFixed(2)}m / ${(hd.target_distance_cm / 100).toFixed(2)}m`;
     if (hd.tag_visible) {
       const holdText = (hd.hold_count > 0) ? ` -- LOCKING IN (${hd.hold_count}/${hd.hold_ticks_needed})` : '';
-      set('s-homing', `final approach -- ${traveledText} (AprilTag: ${hd.distance_cm.toFixed(0)}cm)${holdText}`);
+      const refDist = (hd.reference_distance_cm === null || hd.reference_distance_cm === undefined)
+            ? '?' : hd.reference_distance_cm.toFixed(0);
+      const refOff = (hd.reference_offset_frac === null || hd.reference_offset_frac === undefined)
+            ? '?' : (hd.reference_offset_frac * 100).toFixed(0);
+      const matchText = `dist ${hd.at_distance ? 'OK' : '..'} / center ${hd.at_center ? 'OK' : '..'}`;
+      set('s-homing', `final approach -- ${traveledText} (AprilTag: ${hd.distance_cm.toFixed(0)}cm vs ref ${refDist}cm, `
+            + `offset=${(hd.offset_frac * 100).toFixed(0)}% vs ref ${refOff}% -- ${matchText})${holdText}`);
     } else {
       set('s-homing', `final approach -- ${traveledText} (odometry only, tag not visible)`);
     }
@@ -3730,12 +3934,16 @@ async function pollDetections() {
 document.getElementById('detectSizeForm').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const blackVMax = parseFloat(document.getElementById('detectBlackVMax').value);
+  const whiteSMax = parseFloat(document.getElementById('detectWhiteSMax').value);
+  const whiteVMin = parseFloat(document.getElementById('detectWhiteVMin').value);
   const blurKsize = parseInt(document.getElementById('detectBlurKsize').value, 10);
   await fetch('/api/detection_settings', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       black_value_max: blackVMax,
+      white_sat_max: whiteSMax,
+      white_value_min: whiteVMin,
       blur_ksize: blurKsize
     })
   });
@@ -3746,14 +3954,15 @@ async function pollObstacleWatch() {
     const res = await fetch('/api/obstacle_watch');
     const ow = await res.json();
     candidateCells = ow.candidate_cells || [];
+    const avoidText = ow.avoid_enabled ? 'avoid: auto-replan' : 'avoid: stop only';
     if (!ow.active) {
       set('s-obwatch', 'n/a (no camera)');
     } else if (!ow.enabled) {
       set('s-obwatch', 'DISABLED');
     } else if (ow.hit_streak > 0) {
-      set('s-obwatch', `WATCHING -- ${ow.hit_streak}/${ow.sensitivity_frames} consecutive frames`);
+      set('s-obwatch', `WATCHING -- ${ow.hit_streak}/${ow.sensitivity_frames} consecutive frames (${avoidText})`);
     } else {
-      set('s-obwatch', `clear (sensitivity=${ow.sensitivity_frames} frame(s))`);
+      set('s-obwatch', `clear (sensitivity=${ow.sensitivity_frames} frame(s), ${avoidText})`);
     }
     if (ow.front_cell) {
       const pinnedText = ow.front_cell_pinned ? 'PINNED' : 'not pinned';
@@ -3769,11 +3978,12 @@ async function pollObstacleWatch() {
 document.getElementById('obWatchForm').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const enabled = document.getElementById('obEnabled').checked;
+  const avoidEnabled = document.getElementById('obAvoidEnabled').checked;
   const sensitivity = parseInt(document.getElementById('obSensitivity').value, 10);
   await fetch('/api/obstacle_watch_settings', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({enabled: enabled, sensitivity_frames: sensitivity})
+    body: JSON.stringify({enabled: enabled, avoid_enabled: avoidEnabled, sensitivity_frames: sensitivity})
   });
 });
 
@@ -3896,10 +4106,11 @@ document.getElementById('homingDistanceForm').addEventListener('submit', async (
   ev.preventDefault();
   const targetDist = parseFloat(document.getElementById('homingTargetDist').value);
   const distTol = parseFloat(document.getElementById('homingDistTol').value);
+  const centerTol = parseFloat(document.getElementById('homingCenterTol').value);
   await fetch('/api/homing_distance_settings', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({target_distance_cm: targetDist, distance_tolerance_cm: distTol})
+    body: JSON.stringify({target_distance_cm: targetDist, distance_tolerance_cm: distTol, center_tolerance_frac: centerTol})
   });
 });
 
@@ -4012,6 +4223,7 @@ def render_page():
             .replace('__START_TAG_SIZE__', str(APRILTAG_DEFAULT_SIZE_CM))
             .replace('__HOMING_TARGET_DIST__', str(HOMING_TARGET_DISTANCE_CM))
             .replace('__HOMING_DIST_TOL__', str(HOMING_DISTANCE_TOLERANCE_CM))
+            .replace('__HOMING_CENTER_TOL__', str(HOMING_CENTER_TOLERANCE_FRAC))
             .replace('__HOMING_MAX_FWD__', str(HOMING_MAX_FORWARD_SPEED))
             .replace('__HOMING_MAX_ROT__', str(HOMING_MAX_ROTATE_SPEED)))
 
@@ -4108,6 +4320,16 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
                 ok = detector.set_black_value_max(float(data['black_value_max'])) and ok
             except (TypeError, ValueError):
                 ok = False
+        if 'white_sat_max' in data:
+            try:
+                ok = detector.set_white_sat_max(float(data['white_sat_max'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if 'white_value_min' in data:
+            try:
+                ok = detector.set_white_value_min(float(data['white_value_min'])) and ok
+            except (TypeError, ValueError):
+                ok = False
         if 'blur_ksize' in data:
             try:
                 ok = detector.set_blur_ksize(int(data['blur_ksize'])) and ok
@@ -4142,6 +4364,8 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
                 ok = False
         if 'enabled' in data:
             watcher.set_enabled(bool(data['enabled']))
+        if 'avoid_enabled' in data:
+            watcher.set_avoid_enabled(bool(data['avoid_enabled']))
         if not ok:
             return jsonify({'ok': False, 'error': 'invalid sensitivity_frames'}), 400
         return jsonify({'ok': True})
@@ -4313,6 +4537,11 @@ def create_app(node: GridNavNode, camera: 'CameraStreamer | None',
         if 'distance_tolerance_cm' in data:
             try:
                 ok = node.homing_distance_settings.set_distance_tolerance(float(data['distance_tolerance_cm'])) and ok
+            except (TypeError, ValueError):
+                ok = False
+        if 'center_tolerance_frac' in data:
+            try:
+                ok = node.homing_distance_settings.set_center_tolerance(float(data['center_tolerance_frac'])) and ok
             except (TypeError, ValueError):
                 ok = False
         if not ok:
