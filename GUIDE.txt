@@ -78,8 +78,9 @@ network. Everything below is identical to the mock.
 1.4  The control panel, section by section
 ----------------------------------------------------------------
 
-Every section below is a collapsible card in the left-hand panel
-(tap/click its title bar to expand or collapse it).
+Every section below is a plain labeled box in the left-hand column of
+the page (controls on the left, camera in the middle, map on the
+right -- all always visible, nothing to expand/collapse).
 
 --- Start-Position Setup ---
   Setup Status            Read-only. Shows whether the start tag is

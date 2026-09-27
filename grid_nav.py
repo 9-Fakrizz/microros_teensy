@@ -3222,218 +3222,14 @@ HTML_PAGE = """<!doctype html>
 <meta charset="utf-8">
 <title>grid_nav.py</title>
 <style>
-  /* ---------------- Theme tokens ----------------
-     Dark-first (this console's native look -- an instrument panel, read
-     in the field). Full four-block pattern so the CSS resolves correctly
-     on its own even before the toggle script runs: bare :root carries
-     the dark palette; an unstamped root additionally honors a LIGHT OS
-     preference; explicit data-theme (the toggle button, persisted in
-     localStorage) always wins in either direction. */
-  :root {
-    --bg: #14161a;
-    --bg-elevated: #1a1d22;
-    --panel-bg: #1e2126;
-    --panel-bg-2: #23272e;
-    --border: #30353d;
-    --border-soft: #262a31;
-    --text: #e8eaed;
-    --text-dim: #9aa0a8;
-    --text-faint: #6b7178;
-    --accent: #4da3ff;
-    --accent-strong: #2f8fff;
-    --accent-text: #ffffff;
-    --success: #34c77b;
-    --success-bg: #15301f;
-    --success-border: #1f5c37;
-    --danger: #ff6b6b;
-    --danger-bg: #391616;
-    --danger-border: #6b2323;
-    --warning: #f2b93d;
-    --warning-bg: #362a08;
-    --warning-border: #614c12;
-    --focus-ring: 0 0 0 3px rgba(77,163,255,0.35);
-    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 4px 12px rgba(0,0,0,0.25);
-    --shadow-sm: 0 1px 2px rgba(0,0,0,0.3);
-    --radius: 9px;
-    --radius-sm: 5px;
-    color-scheme: dark;
-  }
-  @media (prefers-color-scheme: light) {
-    :root:not([data-theme="dark"]) {
-      --bg: #f3f4f6;
-      --bg-elevated: #ffffff;
-      --panel-bg: #ffffff;
-      --panel-bg-2: #f7f8fa;
-      --border: #dde1e6;
-      --border-soft: #e7eaee;
-      --text: #1b1e24;
-      --text-dim: #565d68;
-      --text-faint: #868d97;
-      --accent: #1d6fd6;
-      --accent-strong: #1558ac;
-      --accent-text: #ffffff;
-      --success: #1f9d55;
-      --success-bg: #e8f7ee;
-      --success-border: #bfe8cf;
-      --danger: #d63c3c;
-      --danger-bg: #fdecec;
-      --danger-border: #f4c2c2;
-      --warning: #a8720a;
-      --warning-bg: #fff4dc;
-      --warning-border: #f0d798;
-      --focus-ring: 0 0 0 3px rgba(29,111,214,0.25);
-      --shadow: 0 1px 2px rgba(20,22,26,0.06), 0 6px 16px rgba(20,22,26,0.08);
-      --shadow-sm: 0 1px 2px rgba(20,22,26,0.06);
-      color-scheme: light;
-    }
-  }
-  :root[data-theme="light"] {
-    --bg: #f3f4f6;
-    --bg-elevated: #ffffff;
-    --panel-bg: #ffffff;
-    --panel-bg-2: #f7f8fa;
-    --border: #dde1e6;
-    --border-soft: #e7eaee;
-    --text: #1b1e24;
-    --text-dim: #565d68;
-    --text-faint: #868d97;
-    --accent: #1d6fd6;
-    --accent-strong: #1558ac;
-    --accent-text: #ffffff;
-    --success: #1f9d55;
-    --success-bg: #e8f7ee;
-    --success-border: #bfe8cf;
-    --danger: #d63c3c;
-    --danger-bg: #fdecec;
-    --danger-border: #f4c2c2;
-    --warning: #a8720a;
-    --warning-bg: #fff4dc;
-    --warning-border: #f0d798;
-    --focus-ring: 0 0 0 3px rgba(29,111,214,0.25);
-    --shadow: 0 1px 2px rgba(20,22,26,0.06), 0 6px 16px rgba(20,22,26,0.08);
-    --shadow-sm: 0 1px 2px rgba(20,22,26,0.06);
-    color-scheme: light;
-  }
-  :root[data-theme="dark"] {
-    --bg: #14161a;
-    --bg-elevated: #1a1d22;
-    --panel-bg: #1e2126;
-    --panel-bg-2: #23272e;
-    --border: #30353d;
-    --border-soft: #262a31;
-    --text: #e8eaed;
-    --text-dim: #9aa0a8;
-    --text-faint: #6b7178;
-    --accent: #4da3ff;
-    --accent-strong: #2f8fff;
-    --accent-text: #ffffff;
-    --success: #34c77b;
-    --success-bg: #15301f;
-    --success-border: #1f5c37;
-    --danger: #ff6b6b;
-    --danger-bg: #391616;
-    --danger-border: #6b2323;
-    --warning: #f2b93d;
-    --warning-bg: #362a08;
-    --warning-border: #614c12;
-    --focus-ring: 0 0 0 3px rgba(77,163,255,0.35);
-    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 4px 12px rgba(0,0,0,0.25);
-    --shadow-sm: 0 1px 2px rgba(0,0,0,0.3);
-    color-scheme: dark;
-  }
-
-  * { box-sizing: border-box; }
-  html { -webkit-text-size-adjust: 100%; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    background: var(--bg); color: var(--text); margin: 0; padding: 0;
-    font-size: 14px; line-height: 1.4;
-  }
-
-  /* ---------------- Top bar ---------------- */
-  .topbar {
-    position: sticky; top: 0; z-index: 20;
-    display: flex; align-items: center; justify-content: space-between; gap: 8px;
-    padding: 10px 14px; background: var(--bg-elevated); border-bottom: 1px solid var(--border);
-    box-shadow: var(--shadow-sm);
-  }
-  .topbar h1 { font-size: 15px; font-weight: 600; color: var(--text); margin: 0; letter-spacing: -0.01em; }
-  .topbar .poll-hint { font-size: 11px; color: var(--text-faint); font-family: ui-monospace, monospace; }
-  .topbar-actions { display: flex; align-items: center; gap: 10px; }
-  .icon-btn {
-    width: 34px; height: 34px; padding: 0; margin: 0; border-radius: 999px;
-    background: var(--panel-bg-2); border: 1px solid var(--border); color: var(--text);
-    font-size: 16px; display: flex; align-items: center; justify-content: center; cursor: pointer;
-    flex-shrink: 0;
-  }
-  .icon-btn:hover { border-color: var(--accent); }
-
-  /* ---------------- App shell ----------------
-     Mobile (default): everything stacks and the page scrolls normally,
-     in visual order Status -> Map -> Camera -> Controls (an operator on
-     a phone wants the live picture before the settings).
-     Wide screens (>= 900px): a fixed two-pane console instead -- settings
-     pinned on the LEFT in their own scrolling rail, live status + map +
-     camera together on the RIGHT, sized to the viewport so there's
-     nothing to scroll past to see the map. */
-  .app-shell { display: flex; flex-direction: column; }
-  .col-controls { display: flex; flex-direction: column; gap: 8px; padding: 10px; order: 4; }
-  .col-main { display: flex; flex-direction: column; gap: 8px; padding: 10px; order: 1; min-width: 0; }
-  .main-row { display: flex; flex-direction: column; gap: 8px; }
-  .col-map { order: 2; min-width: 0; }
-  .col-camera { display: flex; flex-direction: column; gap: 8px; order: 3; min-width: 0; }
-  .statusbar-compact .quick-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
-  .statusbar-compact .quick-actions .btn { flex: 1 1 140px; }
-
-  @media (min-width: 900px) {
-    html, body { height: 100%; }
-    body { display: flex; flex-direction: column; overflow: hidden; }
-    .topbar { flex-shrink: 0; }
-    .app-shell { flex: 1 1 auto; flex-direction: row; min-height: 0; overflow: hidden; }
-    .col-controls {
-      order: initial; width: 340px; flex-shrink: 0; height: 100%; overflow-y: auto;
-      background: var(--bg-elevated); border-right: 1px solid var(--border);
-    }
-    .col-main { order: initial; flex: 1 1 auto; height: 100%; overflow-y: auto; min-width: 0; }
-    .main-row { flex-direction: row; align-items: flex-start; }
-    .col-map { order: initial; flex: 1.5 1 0; min-width: 0; }
-    .col-camera { order: initial; flex: 1 1 340px; max-width: 380px; }
-  }
-  @media (min-width: 1400px) {
-    .col-controls { width: 380px; }
-  }
-
-  /* ---------------- Cards / collapsible sections ---------------- */
-  .card {
-    background: var(--panel-bg); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 10px; box-shadow: var(--shadow-sm);
-  }
-  .card-title { font-size: 12.5px; font-weight: 600; color: var(--text); margin: 0 0 6px 0; }
-  details.card { padding: 0; overflow: hidden; }
-  details.card > summary {
-    list-style: none; cursor: pointer; padding: 9px 12px; font-weight: 600; font-size: 12.5px;
-    display: flex; align-items: center; justify-content: space-between; color: var(--text);
-    user-select: none; -webkit-tap-highlight-color: transparent;
-  }
-  details.card > summary::-webkit-details-marker { display: none; }
-  details.card > summary::after {
-    content: '\2304'; font-size: 15px; color: var(--text-faint); transition: transform 0.15s ease;
-    margin-left: 8px;
-  }
-  details.card[open] > summary::after { transform: rotate(180deg); }
-  details.card > summary:hover { background: var(--panel-bg-2); }
-  details.card > .card-body { padding: 3px 12px 12px 12px; display: flex; flex-direction: column; gap: 8px; }
-  details.card > .card-body > .hint:first-child { margin-top: -2px; }
-
-  .hint { font-size: 11.5px; color: var(--text-faint); line-height: 1.45; }
-
-  /* ---------------- Camera ---------------- */
-  .camera-wrap { position: relative; border-radius: var(--radius-sm); overflow: hidden; background: #000; }
-  .camera-wrap img { width: 100%; display: block; }
-  .camera-unavailable {
-    color: var(--text-faint); padding: 32px 12px; text-align: center; font-size: 12px;
-    background: var(--panel-bg-2); border-radius: var(--radius-sm);
-  }
+  body { font-family: sans-serif; background: #1e1e1e; color: #eee; margin: 0; padding: 8px; font-size: 13px; }
+  h1 { font-size: 13px; font-weight: normal; color: #aaa; margin: 0 0 6px 0; }
+  .layout { display: flex; gap: 8px; align-items: flex-start; flex-wrap: wrap; }
+  .left { display: flex; flex-direction: column; gap: 6px; min-width: 220px; max-width: 260px; }
+  .camera { display: flex; flex-direction: column; gap: 4px; min-width: 220px; max-width: 300px; }
+  .camera-wrap { position: relative; }
+  .camera img { width: 100%; background: #111; border: 1px solid #444; border-radius: 4px; display: block; }
+  .camera .k { font-size: 10px; color: #999; text-transform: uppercase; }
   /* Small "+" fixed at the optical-axis center -- what you physically aim
      at a known-distance floor mark to calibrate. */
   .crosshair { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
@@ -3454,310 +3250,157 @@ HTML_PAGE = """<!doctype html>
   .detection-box-label { position: absolute; top: 0; left: 0; transform: translateY(-100%);
                           font-size: 11px; font-family: monospace; white-space: nowrap;
                           text-shadow: 0 0 3px #000, 0 0 3px #000; }
-
-  /* ---------------- Map ---------------- */
-  .canvas-wrap { border-radius: var(--radius-sm); overflow: hidden; border: 1px solid var(--border); background: #0c0d10; line-height: 0; }
-  #canvas { background: #0c0d10; display: block; width: 100%; height: auto; cursor: crosshair; touch-action: manipulation; }
-
-  /* ---------------- Forms / inputs ---------------- */
-  form .row { margin-bottom: 6px; }
-  form .row:last-of-type { margin-bottom: 0; }
-  .checkbox-row { display: flex; align-items: center; gap: 8px; }
-  .checkbox-row label { margin: 0; font-size: 12.5px; color: var(--text); }
-  input[type="number"], input[type="text"] {
-    width: 100%; font-size: 14px; padding: 7px 9px; border-radius: var(--radius-sm);
-    border: 1px solid var(--border); background: var(--panel-bg-2); color: var(--text);
-  }
-  input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent); flex-shrink: 0; }
-  input:focus-visible, button:focus-visible, summary:focus-visible {
-    outline: none; box-shadow: var(--focus-ring);
-  }
-  label { display: block; font-size: 11px; font-weight: 600; color: var(--text-dim);
-          text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 3px; }
-
-  button, .btn {
-    font-size: 13px; font-weight: 600; padding: 9px 12px; margin-top: 4px; width: 100%;
-    border-radius: var(--radius-sm); border: 1px solid var(--border); cursor: pointer;
-    background: var(--panel-bg-2); color: var(--text); transition: filter 0.1s ease, opacity 0.1s ease;
-    min-height: 38px;
-  }
-  form button[type="submit"] { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
-  button:hover { filter: brightness(1.08); }
-  button:active { filter: brightness(0.95); }
-  button:disabled { opacity: 0.45; cursor: not-allowed; filter: none; }
-  .btn-mode { background: var(--panel-bg-2); border-color: var(--border); color: var(--text); flex: 1; }
-  .btn-danger { background: var(--danger-bg); border-color: var(--danger-border); color: var(--danger); }
-  .btn-success { background: var(--success-bg); border-color: var(--success-border); color: var(--success); }
-  .btn-warning { background: var(--warning-bg); border-color: var(--warning-border); color: var(--warning); }
-  .btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
-  .btn-row { display: flex; gap: 8px; }
-  .btn-row .btn-mode { margin-top: 0; }
-
-  /* ---------------- Stats ---------------- */
-  .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
-  @media (min-width: 520px) and (max-width: 899px) { .stats { grid-template-columns: repeat(3, 1fr); } }
-  @media (min-width: 900px) { .stats { grid-template-columns: repeat(4, 1fr); } }
-  @media (min-width: 1150px) { .stats { grid-template-columns: repeat(5, 1fr); } }
-  @media (min-width: 1500px) { .stats { grid-template-columns: repeat(6, 1fr); } }
-  .stat-box { background: var(--panel-bg-2); border: 1px solid var(--border-soft); border-radius: var(--radius-sm); padding: 7px 9px; }
-  .stat-box .k { font-size: 10px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.03em; }
-  .stat-box .v { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px; color: var(--text); margin-top: 2px; word-break: break-word; }
+  .right { flex: 1; }
+  #canvas { background: #111; border: 1px solid #444; display: block; max-width: 100%; height: auto; cursor: crosshair; }
+  form { background: #262626; border: 1px solid #444; padding: 6px 8px; border-radius: 5px; }
+  form .row { margin-bottom: 4px; }
+  input { width: 80px; font-size: 12px; padding: 2px 3px; }
+  button { font-size: 12px; padding: 4px 10px; margin-top: 2px; width: 100%; }
+  label { display: block; font-size: 10px; color: #aaa; margin-bottom: 1px; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+  .stat-box { background: #262626; border: 1px solid #444; border-radius: 5px; padding: 4px 6px; }
+  .stat-box .k { font-size: 9px; color: #999; text-transform: uppercase; }
+  .stat-box .v { font-family: monospace; font-size: 12px; color: #eee; margin-top: 1px; }
   .stat-box.wide { grid-column: 1 / -1; }
-
-  /* Comfortable tap targets on touch devices */
-  @media (pointer: coarse) {
-    button, .btn { min-height: 42px; }
-    input[type="checkbox"] { width: 20px; height: 20px; }
-  }
 </style>
 </head>
 <body>
-<header class="topbar">
-  <h1>grid_nav.py <span class="poll-hint">&middot; live &middot; poll __POLL_MS__ms</span></h1>
-  <div class="topbar-actions">
-    <button id="themeToggle" class="icon-btn" type="button" title="Toggle light/dark theme">&#9788;</button>
+<h1>grid_nav.py -- live position (poll __POLL_MS__ms)</h1>
+<div class="layout">
+  <div class="left">
+    <div style="font-size:11px; color:#999;">Start-position setup (point camera at the home AprilTag, ~2m away, roughly centered):</div>
+    <div class="stats" style="margin-bottom:6px;">
+      <div class="stat-box wide"><div class="k">Setup Status</div><div class="v" id="s-setup">--</div></div>
+    </div>
+    <button id="confirmStartBtn" style="background:#444;" disabled>Confirm Start Position</button>
+    <form id="startTagForm">
+      <div style="font-size:11px; color:#999;">Start Point AprilTag Config (independent of the pin-position tag above):</div>
+      <div class="row"><label>Tag ID</label><input id="stTagId" type="number" value="__START_TAG_ID__" step="1" min="0"></div>
+      <div class="row"><label>Tag Size (cm)</label><input id="stTagSize" type="number" value="__START_TAG_SIZE__" step="0.1" min="0.1"></div>
+      <button type="submit">Set Start Point AprilTag Config</button>
+    </form>
+    <form id="setupSettingsForm">
+      <div class="row"><label>Max Distance (cm)</label><input id="setupMaxDist" type="number" value="__SETUP_MAX_DIST__" step="1" min="1"></div>
+      <div class="row"><label>Center Tolerance (0-1)</label><input id="setupCenterTol" type="number" value="__SETUP_CENTER_TOL__" step="0.01" min="0.01" max="1"></div>
+      <button type="submit">Set Setup Tolerance</button>
+    </form>
+    <form id="homingDistanceForm">
+      <div style="font-size:11px; color:#999;">Return-home target: reproduces the distance/offset from your Confirm reading. These are the fallback (used only if no reference was ever captured) and tolerances:</div>
+      <div class="row"><label>Fallback Target Distance (cm)</label><input id="homingTargetDist" type="number" value="__HOMING_TARGET_DIST__" step="1" min="0"></div>
+      <div class="row"><label>Distance Tolerance (cm)</label><input id="homingDistTol" type="number" value="__HOMING_DIST_TOL__" step="1" min="1"></div>
+      <div class="row"><label>Center Tolerance (0-1)</label><input id="homingCenterTol" type="number" value="__HOMING_CENTER_TOL__" step="0.01" min="0.01" max="1"></div>
+      <button type="submit">Set Homing Distance</button>
+    </form>
+    <form id="goalForm">
+      <div class="row"><label>Goal X (cm)</label><input id="goalX" type="number" value="0" step="1"></div>
+      <div class="row"><label>Goal Y (cm)</label><input id="goalY" type="number" value="0" step="1"></div>
+      <div class="row"><label>End Direction (deg, 0=+X)</label><input id="goalDir" type="number" value="0" step="1"></div>
+      <div class="row"><label style="display:inline"><input id="goalStep" type="checkbox" style="width:auto"> Step mode (pause every __STEP_SIZE__m box)</label></div>
+      <button type="submit">Go</button>
+    </form>
+    <div style="font-size:11px; color:#999;">Preset coverage paths (court -- see map):</div>
+    <div style="display:flex; gap:4px;">
+      <button id="modeABtn" style="background:#1a3a5a; flex:1;">Mode A</button>
+      <button id="modeBBtn" style="background:#1a3a5a; flex:1;">Mode B</button>
+      <button id="modeCBtn" style="background:#1a3a5a; flex:1;">Mode C</button>
+    </div>
+    <form id="modeSettingsForm">
+      <div style="font-size:11px; color:#999;">Mode A/B U-pattern sweep (same start corner, adjustable extent):</div>
+      <div class="row"><label>X Length (cm)</label><input id="modeXLength" type="number" value="__MODE_X_LENGTH__" step="1" min="1"></div>
+      <div class="row"><label>Y Length (cm)</label><input id="modeYLength" type="number" value="__MODE_Y_LENGTH__" step="1" min="1"></div>
+      <div class="row"><label>Row Step (cm)</label><input id="modeRowStep" type="number" value="__MODE_ROW_STEP__" step="1" min="1"></div>
+      <div class="row"><label>Row X Drift Offset (cm/row)</label><input id="modeRowXOffset" type="number" value="__MODE_ROW_X_OFFSET__" step="0.5"></div>
+      <button type="submit">Set Mode Path Settings</button>
+    </form>
+    <button id="resetBtn" style="background:#5a2a2a;">Reset Position to (0,0)</button>
+    <button id="continueBtn" style="background:#2a5a2a; display:none;">Continue to Next Box</button>
+    <button id="clearObstaclesBtn" style="background:#5a4a1a;">Clear Obstacles</button>
+    <div style="font-size:11px; color:#999;">Click a grid cell to toggle it as an obstacle (A* routes around it, diagonals allowed).</div>
+    <form id="speedForm">
+      <div class="row"><label>Drive Speed (0-1)</label><input id="speedFwd" type="number" value="__FORWARD_SPEED__" step="0.01" min="0.01" max="1"></div>
+      <div class="row"><label>Rotate Speed (0-1)</label><input id="speedRot" type="number" value="__ROTATE_SPEED__" step="0.01" min="0.01" max="1"></div>
+      <button type="submit">Set Speed</button>
+    </form>
+    <form id="pulsesForm">
+      <div class="row"><label>Pulses Per CM</label><input id="pulsesPerCm" type="number" value="__PULSES_PER_CM__" step="0.1" min="0.1"></div>
+      <button type="submit">Set Pulses Per CM</button>
+    </form>
+    <div class="stats" id="stats">
+      <div class="stat-box wide"><div class="k">Position</div><div class="v" id="s-pos">--</div></div>
+      <div class="stat-box"><div class="k">State</div><div class="v" id="s-state">--</div></div>
+      <div class="stat-box"><div class="k">Phase</div><div class="v" id="s-phase">--</div></div>
+      <div class="stat-box"><div class="k">Leg</div><div class="v" id="s-leg">--</div></div>
+      <div class="stat-box wide"><div class="k">Leg Progress</div><div class="v" id="s-progress">--</div></div>
+      <div class="stat-box wide"><div class="k">Preset Path Waypoints Left</div><div class="v" id="s-waypoints">--</div></div>
+      <div class="stat-box"><div class="k">End Dir</div><div class="v" id="s-enddir">--</div></div>
+      <div class="stat-box wide"><div class="k">Speed (drive / rotate)</div><div class="v" id="s-speed">--</div></div>
+      <div class="stat-box wide"><div class="k">IMU Yaw (raw)</div><div class="v" id="s-yaw">--</div></div>
+      <div class="stat-box wide"><div class="k">Heading (ref=0)</div><div class="v" id="s-heading">--</div></div>
+      <div class="stat-box wide"><div class="k">Target Heading</div><div class="v" id="s-target">--</div></div>
+      <div class="stat-box wide"><div class="k">Obstacle Watch</div><div class="v" id="s-obwatch">--</div></div>
+      <div class="stat-box wide"><div class="k">AprilTag</div><div class="v" id="s-apriltag">--</div></div>
+      <div class="stat-box wide"><div class="k">Homing (return-to-start)</div><div class="v" id="s-homing">--</div></div>
+    </div>
+    <form id="homingSpeedForm">
+      <div style="font-size:11px; color:#999;">Return-home speed caps (slower than normal drive speed, for a precise final approach):</div>
+      <div class="row"><label>Max Forward Speed (0-1)</label><input id="homingMaxFwd" type="number" value="__HOMING_MAX_FWD__" step="0.01" min="0.01" max="1"></div>
+      <div class="row"><label>Max Rotate Speed (0-1)</label><input id="homingMaxRot" type="number" value="__HOMING_MAX_ROT__" step="0.01" min="0.01" max="1"></div>
+      <button type="submit">Set Homing Speed</button>
+    </form>
+    <form id="obWatchForm">
+      <div class="row"><label style="display:inline"><input id="obEnabled" type="checkbox" style="width:auto"> Obstacle Detection Enabled</label></div>
+      <div class="row"><label style="display:inline"><input id="obAvoidEnabled" type="checkbox" style="width:auto"> Auto-Avoid (replan + continue -- unchecked = stop only)</label></div>
+      <div class="row"><label>Sensitivity (consecutive frames to pin, 1=instant)</label><input id="obSensitivity" type="number" value="3" step="1" min="1"></div>
+      <div style="font-size:11px; color:#999;">Configure before starting a task -- applies to whatever obstacle is confirmed next.</div>
+      <button type="submit">Set Obstacle Watch</button>
+    </form>
+    <form id="aprilTagForm">
+      <div class="row"><label>Tag ID</label><input id="atTagId" type="number" value="__APRILTAG_ID__" step="1" min="0"></div>
+      <div class="row"><label>World X (cm)</label><input id="atWorldX" type="number" value="__APRILTAG_WORLD_X__" step="1"></div>
+      <div class="row"><label>World Y (cm)</label><input id="atWorldY" type="number" value="__APRILTAG_WORLD_Y__" step="1"></div>
+      <div class="row"><label>Tag Size (cm)</label><input id="atTagSize" type="number" value="__APRILTAG_SIZE__" step="0.1" min="0.1"></div>
+      <div class="row"><label>Trigger Distance (cm)</label><input id="atTrigger" type="number" value="__APRILTAG_TRIGGER__" step="1" min="1"></div>
+      <button type="submit">Set AprilTag Config</button>
+    </form>
   </div>
-</header>
-<div class="app-shell">
-
-  <aside class="col-controls">
-
-      <details class="card" open>
-        <summary>Start-Position Setup</summary>
-        <div class="card-body">
-          <div class="hint">Point camera at the home AprilTag, ~2m away, roughly centered.</div>
-          <div class="stats">
-            <div class="stat-box wide"><div class="k">Setup Status</div><div class="v" id="s-setup">--</div></div>
-          </div>
-          <button id="confirmStartBtn" class="btn-primary" disabled>Confirm Start Position</button>
-          <form id="startTagForm">
-            <div class="hint">Start Point AprilTag config (independent of the pin-position tag below):</div>
-            <div class="row"><label>Tag ID</label><input id="stTagId" type="number" value="__START_TAG_ID__" step="1" min="0"></div>
-            <div class="row"><label>Tag Size (cm)</label><input id="stTagSize" type="number" value="__START_TAG_SIZE__" step="0.1" min="0.1"></div>
-            <button type="submit">Set Start Point AprilTag Config</button>
-          </form>
-          <form id="setupSettingsForm">
-            <div class="row"><label>Max Distance (cm)</label><input id="setupMaxDist" type="number" value="__SETUP_MAX_DIST__" step="1" min="1"></div>
-            <div class="row"><label>Center Tolerance (0-1)</label><input id="setupCenterTol" type="number" value="__SETUP_CENTER_TOL__" step="0.01" min="0.01" max="1"></div>
-            <button type="submit">Set Setup Tolerance</button>
-          </form>
-        </div>
-      </details>
-
-      <details class="card" open>
-        <summary>Manual Goal</summary>
-        <div class="card-body">
-          <form id="goalForm">
-            <div class="row"><label>Goal X (cm)</label><input id="goalX" type="number" value="0" step="1"></div>
-            <div class="row"><label>Goal Y (cm)</label><input id="goalY" type="number" value="0" step="1"></div>
-            <div class="row"><label>End Direction (deg, 0=+X)</label><input id="goalDir" type="number" value="0" step="1"></div>
-            <div class="row checkbox-row"><input id="goalStep" type="checkbox"><label style="margin:0;">Step mode (pause every __STEP_SIZE__m box)</label></div>
-            <button type="submit">Go</button>
-          </form>
-        </div>
-      </details>
-
-      <details class="card" open>
-        <summary>Preset Coverage Paths</summary>
-        <div class="card-body">
-          <div class="hint">Court -- see map</div>
-          <div class="btn-row">
-            <button id="modeABtn" class="btn-mode">Mode A</button>
-            <button id="modeBBtn" class="btn-mode">Mode B</button>
-            <button id="modeCBtn" class="btn-mode">Mode C</button>
-          </div>
-          <form id="modeSettingsForm">
-            <div class="hint">Mode A/B U-pattern sweep (same start corner, adjustable extent):</div>
-            <div class="row"><label>X Length (cm)</label><input id="modeXLength" type="number" value="__MODE_X_LENGTH__" step="1" min="1"></div>
-            <div class="row"><label>Y Length (cm)</label><input id="modeYLength" type="number" value="__MODE_Y_LENGTH__" step="1" min="1"></div>
-            <div class="row"><label>Row Step (cm)</label><input id="modeRowStep" type="number" value="__MODE_ROW_STEP__" step="1" min="1"></div>
-            <div class="row"><label>Row X Drift Offset (cm/row)</label><input id="modeRowXOffset" type="number" value="__MODE_ROW_X_OFFSET__" step="0.5"></div>
-            <button type="submit">Set Mode Path Settings</button>
-          </form>
-        </div>
-      </details>
-
-      <details class="card">
-        <summary>Return-to-Home</summary>
-        <div class="card-body">
-          <form id="homingDistanceForm">
-            <div class="hint">Reproduces the distance/offset from your Confirm reading. These are the fallback (used only if no reference was ever captured) and tolerances:</div>
-            <div class="row"><label>Fallback Target Distance (cm)</label><input id="homingTargetDist" type="number" value="__HOMING_TARGET_DIST__" step="1" min="0"></div>
-            <div class="row"><label>Distance Tolerance (cm)</label><input id="homingDistTol" type="number" value="__HOMING_DIST_TOL__" step="1" min="1"></div>
-            <div class="row"><label>Center Tolerance (0-1)</label><input id="homingCenterTol" type="number" value="__HOMING_CENTER_TOL__" step="0.01" min="0.01" max="1"></div>
-            <button type="submit">Set Homing Distance</button>
-          </form>
-          <form id="homingSpeedForm">
-            <div class="hint">Return-home speed caps (slower than normal drive speed, for a precise final approach):</div>
-            <div class="row"><label>Max Forward Speed (0-1)</label><input id="homingMaxFwd" type="number" value="__HOMING_MAX_FWD__" step="0.01" min="0.01" max="1"></div>
-            <div class="row"><label>Max Rotate Speed (0-1)</label><input id="homingMaxRot" type="number" value="__HOMING_MAX_ROT__" step="0.01" min="0.01" max="1"></div>
-            <button type="submit">Set Homing Speed</button>
-          </form>
-        </div>
-      </details>
-
-      <details class="card">
-        <summary>Drive Speed &amp; Calibration</summary>
-        <div class="card-body">
-          <form id="speedForm">
-            <div class="row"><label>Drive Speed (0-1)</label><input id="speedFwd" type="number" value="__FORWARD_SPEED__" step="0.01" min="0.01" max="1"></div>
-            <div class="row"><label>Rotate Speed (0-1)</label><input id="speedRot" type="number" value="__ROTATE_SPEED__" step="0.01" min="0.01" max="1"></div>
-            <button type="submit">Set Speed</button>
-          </form>
-          <form id="pulsesForm">
-            <div class="row"><label>Pulses Per CM</label><input id="pulsesPerCm" type="number" value="__PULSES_PER_CM__" step="0.1" min="0.1"></div>
-            <button type="submit">Set Pulses Per CM</button>
-          </form>
-        </div>
-      </details>
-
-      <details class="card">
-        <summary>Obstacle Avoidance</summary>
-        <div class="card-body">
-          <form id="obWatchForm">
-            <div class="row checkbox-row"><input id="obEnabled" type="checkbox"><label style="margin:0;">Obstacle Detection Enabled</label></div>
-            <div class="row checkbox-row"><input id="obAvoidEnabled" type="checkbox"><label style="margin:0;">Auto-Avoid (replan + continue -- unchecked = stop only)</label></div>
-            <div class="row"><label>Sensitivity (consecutive frames to pin, 1=instant)</label><input id="obSensitivity" type="number" value="3" step="1" min="1"></div>
-            <div class="hint">Configure before starting a task -- applies to whatever obstacle is confirmed next.</div>
-            <button type="submit">Set Obstacle Watch</button>
-          </form>
-        </div>
-      </details>
-
-      <details class="card">
-        <summary>AprilTag (Pin Position)</summary>
-        <div class="card-body">
-          <form id="aprilTagForm">
-            <div class="row"><label>Tag ID</label><input id="atTagId" type="number" value="__APRILTAG_ID__" step="1" min="0"></div>
-            <div class="row"><label>World X (cm)</label><input id="atWorldX" type="number" value="__APRILTAG_WORLD_X__" step="1"></div>
-            <div class="row"><label>World Y (cm)</label><input id="atWorldY" type="number" value="__APRILTAG_WORLD_Y__" step="1"></div>
-            <div class="row"><label>Tag Size (cm)</label><input id="atTagSize" type="number" value="__APRILTAG_SIZE__" step="0.1" min="0.1"></div>
-            <div class="row"><label>Trigger Distance (cm)</label><input id="atTrigger" type="number" value="__APRILTAG_TRIGGER__" step="1" min="1"></div>
-            <button type="submit">Set AprilTag Config</button>
-          </form>
-        </div>
-      </details>
-
-  </aside>
-
-  <main class="col-main">
-
-    <div class="card statusbar-compact">
-      <div class="stats" id="stats">
-        <div class="stat-box wide"><div class="k">Position</div><div class="v" id="s-pos">--</div></div>
-        <div class="stat-box"><div class="k">State</div><div class="v" id="s-state">--</div></div>
-        <div class="stat-box"><div class="k">Phase</div><div class="v" id="s-phase">--</div></div>
-        <div class="stat-box"><div class="k">Leg</div><div class="v" id="s-leg">--</div></div>
-        <div class="stat-box wide"><div class="k">Leg Progress</div><div class="v" id="s-progress">--</div></div>
-        <div class="stat-box wide"><div class="k">Preset Path Waypoints Left</div><div class="v" id="s-waypoints">--</div></div>
-        <div class="stat-box"><div class="k">End Dir</div><div class="v" id="s-enddir">--</div></div>
-        <div class="stat-box wide"><div class="k">Speed (drive / rotate)</div><div class="v" id="s-speed">--</div></div>
-        <div class="stat-box wide"><div class="k">IMU Yaw (raw)</div><div class="v" id="s-yaw">--</div></div>
-        <div class="stat-box wide"><div class="k">Heading (ref=0)</div><div class="v" id="s-heading">--</div></div>
-        <div class="stat-box wide"><div class="k">Target Heading</div><div class="v" id="s-target">--</div></div>
-        <div class="stat-box wide"><div class="k">Obstacle Watch</div><div class="v" id="s-obwatch">--</div></div>
-        <div class="stat-box wide"><div class="k">AprilTag</div><div class="v" id="s-apriltag">--</div></div>
-        <div class="stat-box wide"><div class="k">Homing (return-to-start)</div><div class="v" id="s-homing">--</div></div>
-      </div>
-      <div class="quick-actions">
-        <button id="resetBtn" class="btn btn-danger">Reset Position to (0,0)</button>
-        <button id="continueBtn" class="btn btn-success" style="display:none;">Continue to Next Box</button>
-        <button id="clearObstaclesBtn" class="btn btn-warning">Clear Obstacles</button>
-      </div>
+  <div class="camera">
+    <div class="k">Camera</div>
+    <div class="camera-wrap">
+      <img id="cameraFeed" src="/video_feed" alt="camera feed"
+           onerror="this.replaceWith(Object.assign(document.createElement('div'), {textContent: 'Camera unavailable', style: 'color:#999; padding:12px; border:1px solid #444; border-radius:4px;'}))">
+      <div class="center-line"></div>
+      <div class="guide-lines" id="guideLines"></div>
+      <div class="detection-boxes" id="detectionBoxes"></div>
+      <div class="detection-boxes" id="aprilTagBoxes"></div>
+      <div class="detection-boxes" id="startTagBoxes"></div>
+      <div class="crosshair"></div>
     </div>
-
-    <div class="main-row">
-
-      <div class="col-map">
-        <div class="card">
-          <div class="card-title">Map <span class="hint">(click a cell to toggle it as an obstacle)</span></div>
-          <div class="canvas-wrap">
-            <canvas id="canvas" width="__CANVAS_PX__" height="__CANVAS_PX__"></canvas>
-          </div>
-        </div>
-      </div>
-
-      <div class="col-camera">
-        <div class="card">
-          <div class="card-title">Camera</div>
-          <div class="camera-wrap">
-            <img id="cameraFeed" src="/video_feed" alt="camera feed"
-                 onerror="this.replaceWith(Object.assign(document.createElement('div'), {textContent: 'Camera unavailable', className: 'camera-unavailable'}))">
-            <div class="center-line"></div>
-            <div class="guide-lines" id="guideLines"></div>
-            <div class="detection-boxes" id="detectionBoxes"></div>
-            <div class="detection-boxes" id="aprilTagBoxes"></div>
-            <div class="detection-boxes" id="startTagBoxes"></div>
-            <div class="crosshair"></div>
-          </div>
-        </div>
-        <details class="card">
-          <summary>Camera Calibration</summary>
-          <div class="card-body">
-            <form id="camCalibForm">
-              <div class="row"><label>Camera Height Above Floor (cm)</label><input id="camHeight" type="number" value="26" step="0.5"></div>
-              <div class="row"><label>Known Distance at Crosshair (cm)</label><input id="camDist" type="number" value="100" step="1"></div>
-              <div class="row"><label>Vertical FOV (deg, tune for accuracy)</label><input id="camVfov" type="number" value="60" step="1"></div>
-              <button type="submit">Calibrate (crosshair on floor mark)</button>
-            </form>
-            <div class="stat-box wide"><div class="k">Tilt / Crosshair Distance</div><div class="v" id="s-cam">not calibrated</div></div>
-          </div>
-        </details>
-        <details class="card">
-          <summary>Obstacle Detection Params</summary>
-          <div class="card-body">
-            <form id="detectSizeForm">
-              <div class="row"><label>Black V Max (0-255)</label><input id="detectBlackVMax" type="number" value="90" step="1" min="0" max="255"></div>
-              <div class="row"><label>White S Max (0-255)</label><input id="detectWhiteSMax" type="number" value="40" step="1" min="0" max="255"></div>
-              <div class="row"><label>White V Min (0-255)</label><input id="detectWhiteVMin" type="number" value="200" step="1" min="0" max="255"></div>
-              <div class="row"><label>Blur Kernel Size (odd, e.g. 3/5/7)</label><input id="detectBlurKsize" type="number" value="3" step="2" min="1" max="21"></div>
-              <button type="submit">Set Detection Params</button>
-            </form>
-            <div class="stat-box wide"><div class="k">Line / Object Coverage (%)</div><div class="v" id="s-detect-size">--</div></div>
-            <div class="stat-box wide"><div class="k">Front Cell Status</div><div class="v" id="s-front-cell">--</div></div>
-          </div>
-        </details>
-        <details class="card">
-          <summary>Detection Debug Feed</summary>
-          <div class="card-body">
-            <div class="hint">Edge map, line edges erased</div>
-            <div class="camera-wrap">
-              <img id="debugFeed" src="/debug_feed" alt="detection debug feed"
-                   onerror="this.replaceWith(Object.assign(document.createElement('div'), {textContent: 'Debug feed unavailable', className: 'camera-unavailable'}))">
-            </div>
-          </div>
-        </details>
-      </div>
-
-    </div>
-  </main>
+    <form id="camCalibForm">
+      <div class="row"><label>Camera Height Above Floor (cm)</label><input id="camHeight" type="number" value="26" step="0.5"></div>
+      <div class="row"><label>Known Distance at Crosshair (cm)</label><input id="camDist" type="number" value="100" step="1"></div>
+      <div class="row"><label>Vertical FOV (deg, tune for accuracy)</label><input id="camVfov" type="number" value="60" step="1"></div>
+      <button type="submit">Calibrate (crosshair on floor mark)</button>
+    </form>
+    <div class="stat-box wide"><div class="k">Tilt / Crosshair Distance</div><div class="v" id="s-cam">not calibrated</div></div>
+    <form id="detectSizeForm">
+      <div class="row"><label>Black V Max (0-255)</label><input id="detectBlackVMax" type="number" value="90" step="1" min="0" max="255"></div>
+      <div class="row"><label>White S Max (0-255)</label><input id="detectWhiteSMax" type="number" value="40" step="1" min="0" max="255"></div>
+      <div class="row"><label>White V Min (0-255)</label><input id="detectWhiteVMin" type="number" value="200" step="1" min="0" max="255"></div>
+      <div class="row"><label>Blur Kernel Size (odd, e.g. 3/5/7)</label><input id="detectBlurKsize" type="number" value="3" step="2" min="1" max="21"></div>
+      <button type="submit">Set Detection Params</button>
+    </form>
+    <div class="stat-box wide"><div class="k">Line / Object Coverage (%)</div><div class="v" id="s-detect-size">--</div></div>
+    <div class="stat-box wide"><div class="k">Front Cell Status</div><div class="v" id="s-front-cell">--</div></div>
+    <div class="k">Detection Debug (edge map, line edges erased)</div>
+    <img id="debugFeed" src="/debug_feed" alt="detection debug feed"
+         onerror="this.replaceWith(Object.assign(document.createElement('div'), {textContent: 'Debug feed unavailable', style: 'color:#999; padding:12px; border:1px solid #444; border-radius:4px;'}))">
+  </div>
+  <div class="right">
+    <canvas id="canvas" width="__CANVAS_PX__" height="__CANVAS_PX__"></canvas>
+  </div>
 </div>
 
 <script>
-// ---------------- Theme (light/dark) ----------------
-// Explicit choice persisted in localStorage; falls back to the OS/browser
-// preference (prefers-color-scheme) the very first time, matching how
-// the rest of this session's Artifacts handle theme.
-(function () {
-  const stored = localStorage.getItem('gridNavTheme');
-  const initial = stored || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
-  document.documentElement.setAttribute('data-theme', initial);
-})();
-
-function updateThemeToggleIcon() {
-  const theme = document.documentElement.getAttribute('data-theme');
-  document.getElementById('themeToggle').textContent = theme === 'light' ? '☾' : '☀';
-  document.getElementById('themeToggle').title = theme === 'light' ? 'Switch to dark theme' : 'Switch to light theme';
-}
-updateThemeToggleIcon();
-document.getElementById('themeToggle').addEventListener('click', () => {
-  const current = document.documentElement.getAttribute('data-theme');
-  const next = current === 'light' ? 'dark' : 'light';
-  document.documentElement.setAttribute('data-theme', next);
-  localStorage.setItem('gridNavTheme', next);
-  updateThemeToggleIcon();
-});
-
 const VIEW_EXTENT = __VIEW_EXTENT__;
 const VIEW_NEGATIVE = __VIEW_NEGATIVE__;
 const SPACING = __SPACING__;
