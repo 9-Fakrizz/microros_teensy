@@ -1,0 +1,44 @@
+# Starts BOTH the micro-ROS agent (bridges the Teensy's USB-serial link
+# into ROS2 topics) and grid_nav.py (the ROS2 node + Flask GUI) with one
+# command:
+#
+#   docker compose up -d --build
+#
+# View logs:      docker compose logs -f grid-nav
+#                 docker compose logs -f microros-agent
+# Stop:           docker compose down
+# Web GUI:        http://<this-pi's-ip>:8080
+#
+# BEFORE FIRST RUN, check these two device paths actually match this Pi
+# (they are NOT guaranteed to match your old Pi5 -- USB enumeration order
+# can differ):
+#   ls /dev/ttyACM*   # the Teensy -- update microros-agent's device/command below
+#   ls /dev/video*    # the USB webcam -- update grid-nav's device below
+#
+# network_mode: host on both services is the simplest way to get ROS2 DDS
+# discovery working between two containers on the same machine (no
+# cross-container DDS/multicast config needed), and it's also what makes
+# the Flask GUI directly reachable on port 8080 without an explicit
+# ports: mapping.
+services:
+  microros-agent:
+    image: microros/micro-ros-agent:jazzy
+    container_name: microros-agent
+    # -b 115200 is a common default for micro_ros_arduino's USB-serial
+    # transport -- adjust if your firmware/agent setup uses a different
+    # baud rate (see src/main.cpp's set_microros_transports() call).
+    command: serial --dev /dev/ttyACM0 -b 115200
+    devices:
+      - /dev/ttyACM0:/dev/ttyACM0
+    network_mode: host
+    restart: unless-stopped
+
+  grid-nav:
+    build: .
+    container_name: grid-nav
+    devices:
+      - /dev/video0:/dev/video0
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - microros-agent

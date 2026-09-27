@@ -1,0 +1,395 @@
+================================================================
+ grid_nav.py -- User & Developer Guide
+================================================================
+
+This file explains how to run the robot's web control panel, what
+every button and field on it does, and (in the second half) how the
+system is put together for anyone who needs to modify or extend it.
+
+There are two ways to run this software:
+
+  1. REAL ROBOT  - Raspberry Pi 5 + Teensy 4.1 (micro-ROS) + USB webcam,
+                    deployed with Docker. See DEPLOY.md for that setup.
+
+  2. MOCK ROBOT  - runs entirely on your own Windows/Mac/Linux machine,
+                    no Teensy, no camera, no ROS2 install needed. This
+                    is what mock_robot.py is for, and is the fastest
+                    way to learn the web GUI or test a change safely.
+
+Both run the EXACT SAME web GUI (grid_nav.py's Flask app) -- the mock
+just fakes the sensors underneath it. Everything in Part 1 below
+applies identically to the real robot and the mock.
+
+
+================================================================
+ PART 1 -- NORMAL USE (the web control panel)
+================================================================
+
+----------------------------------------------------------------
+1.1  Running the mock robot on your own computer
+----------------------------------------------------------------
+
+Requirements: Python 3 with flask, opencv-python (cv2), and numpy
+installed (these are the only real dependencies used).
+
+    cd path\to\this\project
+    python mock_robot.py
+
+You'll see it print a startup log, then:
+
+    open http://localhost:8080 in any web browser
+
+The same terminal window also becomes an interactive console (see
+Part 2.2) -- you can leave it running and just use the browser, or
+type commands into it while the browser is open. Both control the
+same simulated robot at the same time.
+
+To stop it: press Ctrl+C in the terminal, or type "quit".
+
+----------------------------------------------------------------
+1.2  Running on the real robot
+----------------------------------------------------------------
+
+See DEPLOY.md. Short version: on the Raspberry Pi 5,
+
+    docker compose up -d --build
+
+then open http://<pi's IP address>:8080 from any device on the same
+network. Everything below is identical to the mock.
+
+----------------------------------------------------------------
+1.3  First-time startup sequence
+----------------------------------------------------------------
+
+  1. Power on / start the program. The robot will not move yet --
+     it's waiting to establish which way it's facing.
+  2. Point the robot (or, in mock mode, aim the simulated camera by
+     leaving the fake tag in view) at the "start" AprilTag, about
+     2 meters away, roughly centered in frame.
+  3. Watch the "Setup Status" box (top of the "Start-Position Setup"
+     panel) turn ready, then press "Confirm Start Position". This
+     locks the robot's internal (0, 0) coordinate and 0-degree
+     heading to wherever it's currently sitting, and remembers how
+     far away the start tag was -- this becomes the target distance
+     used later when the robot returns home.
+  4. Once confirmed, all movement controls unlock.
+
+----------------------------------------------------------------
+1.4  The control panel, section by section
+----------------------------------------------------------------
+
+Every section below is a collapsible card in the left-hand panel
+(tap/click its title bar to expand or collapse it).
+
+--- Start-Position Setup ---
+  Setup Status            Read-only. Shows whether the start tag is
+                           currently visible, centered, and at a
+                           sensible distance -- becomes ready when
+                           you can safely press Confirm.
+  Confirm Start Position   Locks (0,0)/heading-0 to the robot's
+                           current spot. Do this once at the start
+                           of every session. Disabled until the tag
+                           is properly in view.
+  Tag ID                   Which AprilTag number is the "start" tag.
+                           Only change this if you print a different
+                           tag than the default.
+  Tag Size (cm)            The physical printed size of that tag's
+                           black square, in centimeters. Must match
+                           reality or distance readings will be off.
+  Max Distance (cm)        How far away the start tag is still
+                           allowed to be for "Setup Status" to say
+                           ready. Increase if your room is small and
+                           you must stand closer.
+  Center Tolerance (0-1)   How close to dead-center the tag must be
+                           (0 = must be perfectly centered, 1 = any
+                           position counts). Lower = stricter.
+
+--- Manual Goal ---
+  Goal X / Goal Y (cm)     Drive the robot to this single point,
+                           measured in centimeters from the (0,0)
+                           you set during Confirm Start.
+  End Direction (deg)      Which way the robot should be FACING once
+                           it arrives (0 = facing +X). Purely a final
+                           spin at the destination.
+  Step mode                If checked, the robot pauses after every
+                           grid box along the way and waits for you
+                           to press "Continue to Next Box" (see the
+                           quick actions below) instead of driving
+                           the whole path automatically. Useful for
+                           watching it carefully box-by-box.
+  Go                       Starts driving to the goal you entered.
+
+--- Preset Coverage Paths ---
+  Mode A / Mode B / Mode C One-click preset "sweep the court" paths
+                           (a U-shaped back-and-forth pattern) --
+                           see the Map for the actual court outline.
+                           Each mode is a different starting corner.
+  X Length / Y Length (cm) The overall footprint of the sweep.
+  Row Step (cm)            How far apart each pass of the sweep is
+                           (smaller = more thorough coverage, more
+                           passes, slower).
+  Row X Drift Offset       Optional sideways drift added to each
+  (cm/row)                 successive row (0 = perfectly straight
+                           rows stacked on top of each other).
+
+--- Return-to-Home ---
+  Fallback Target Distance This is used only if you never actually
+  (cm)                     confirmed a start position with the tag in
+                           view (so there's no real reading to use).
+                           Normally you can leave this alone --
+                           Confirm Start Position overrides it with
+                           the real measured distance automatically.
+  Distance Tolerance (cm)  How close the final distance reading must
+                           be to the target before homing is
+                           considered "close enough."
+  Center Tolerance (0-1)   Same idea as above, but for how centered
+                           the tag must be in frame at the end.
+  Max Forward Speed (0-1)  Speed cap during the final return-home
+  Max Rotate Speed (0-1)   approach -- kept slower than normal driving
+                           on purpose, for precision. 1 = full speed.
+
+--- Drive Speed & Calibration ---
+  Drive Speed (0-1)        Normal forward driving speed, as a
+                           fraction of full motor power.
+  Rotate Speed (0-1)       Normal in-place turning speed.
+  Pulses Per CM             How many wheel-encoder pulses correspond
+                           to 1 cm of real travel. This is a physical
+                           calibration number for YOUR robot's wheels
+                           -- get it wrong and every distance the
+                           robot thinks it has traveled will be
+                           wrong. Only change this after actually
+                           measuring your robot's wheels/encoder.
+
+--- Obstacle Avoidance ---
+  Obstacle Detection        Turns the camera-based obstacle spotting
+  Enabled                   on/off entirely.
+  Auto-Avoid                If checked: when an obstacle is confirmed,
+                            the robot re-plans a path around it and
+                            keeps going by itself. If unchecked: it
+                            just stops and waits for you.
+  Sensitivity (frames)      How many consecutive camera frames must
+                            agree something is blocking a cell before
+                            it's treated as a real obstacle (1 = react
+                            instantly, higher = fewer false alarms but
+                            slower to react).
+  Set Obstacle Watch        Apply the two settings above. Do this
+                            BEFORE starting a run -- it only affects
+                            obstacles confirmed after you press it.
+
+--- AprilTag (Pin Position) ---
+  This is a SECOND, separate AprilTag from the "start" tag above --
+  used mid-run to correct the robot's tracked position if it drifts
+  (e.g. taped to a wall at a known spot).
+  Tag ID                   Which tag number to watch for.
+  World X / World Y (cm)   Where that tag physically sits in your
+                           (0,0)-based coordinate system.
+  Tag Size (cm)            Its physical printed size.
+  Trigger Distance (cm)    How close the robot must get before it
+                           uses this tag to snap-correct its position.
+
+--- Top status bar (always visible) ---
+  Position                 Current (x, y) in cm, live.
+  State / Phase            What the robot is doing right now
+                           (IDLE, RUNNING, HOMING, etc. / ROTATE,
+                           DRIVE, etc.).
+  Leg / Leg Progress       Which segment of the current path it's on,
+                           and how far along that segment.
+  Preset Path Waypoints    How many stops are left in the current
+  Left                     Mode A/B/C run.
+  End Dir                  The final facing direction requested for
+                           the current goal.
+  Speed (drive / rotate)   The currently-applied speed settings.
+  IMU Yaw (raw) /          Raw sensor heading vs. the robot's
+  Heading (ref=0)          zeroed/calibrated heading.
+  Target Heading           What heading the robot is currently
+                           steering toward.
+  Obstacle Watch /         One-line live summaries of those
+  AprilTag / Homing        subsystems' current status.
+
+  Reset Position to (0,0) Manually forces the tracked position back
+                           to the origin. Use only if you know the
+                           robot is actually sitting there --
+                           otherwise every future move will be
+                           wrong. Prefer Confirm Start Position
+                           instead when possible.
+  Continue to Next Box    Only appears in Step mode -- advances one
+                          grid box.
+  Clear Obstacles         Wipes all obstacles the robot has learned
+                          about this session (map goes back to
+                          empty), letting it re-plan a straight path.
+
+--- Map ---
+  Shows the court outline, the robot's live position/heading, its
+  current path, and any pinned obstacles. Click any cell directly on
+  the map to manually mark/unmark it as an obstacle yourself, without
+  needing the camera to see it.
+
+--- Camera panel ---
+  Live video feed with a crosshair (optical center) and dashed
+  center-line (straight-ahead reference), plus colored boxes drawn
+  over anything currently detected (obstacles, the pin-position tag,
+  the start tag).
+
+--- Camera Calibration ---
+  Camera Height Above       Physical mounting height of the camera.
+  Floor (cm)
+  Known Distance at         Aim the crosshair at a floor mark you've
+  Crosshair (cm)             measured, enter that real-world distance,
+                             then press Calibrate.
+  Vertical FOV (deg)        Fine-tune if distance estimates still
+                            look wrong after calibrating -- most
+                            cameras are close to 60 degrees but not
+                            exact.
+
+--- Obstacle Detection Params ---
+  These tune the color/brightness thresholds used to tell "floor"
+  apart from "obstacle" in the camera image. Only touch these if
+  obstacle detection is clearly too sensitive or not sensitive enough
+  for your lighting/floor color:
+  Black V Max / White S Max / White V Min   HSV brightness/saturation
+                                             cutoffs.
+  Blur Kernel Size                          Smooths the image before
+                                             analyzing it; must be an
+                                             odd number.
+
+--- Detection Debug Feed ---
+  A second video feed showing exactly what the obstacle detector sees
+  after processing (edges, etc.) -- useful for understanding WHY it
+  did or didn't flag something, not needed for normal driving.
+
+
+================================================================
+ PART 2 -- DEVELOPER NOTES
+================================================================
+
+----------------------------------------------------------------
+2.1  How the pieces fit together
+----------------------------------------------------------------
+
+  grid_nav.py       The entire robot brain + web GUI. A single
+                     rclpy Node (GridNavNode) runs the control loop,
+                     A* planning, obstacle/AprilTag logic, and hosts
+                     a Flask app (HTML_PAGE + /api/* routes) for the
+                     browser UI. This file is IDENTICAL whether it's
+                     talking to real hardware or the mock.
+
+  mock_robot.py      A drop-in stand-in for the ROS2 + hardware layer.
+                     It stubs out rclpy/sensor_msgs/geometry_msgs/
+                     std_msgs via sys.modules BEFORE importing
+                     grid_nav, so grid_nav's own GridNavNode class
+                     runs completely unmodified against a simulated
+                     IMU/encoder/AprilTag instead of real ones.
+                     Key pieces:
+                       - RobotSimulator: reads node.state/phase/
+                         homing_stage each tick and synthesizes fake
+                         IMU + encoder feedback matching the CURRENT
+                         phase's intent (pure rotation during ROTATE,
+                         pure translation during DRIVE/HOMING-STRAIGHT).
+                       - FakeAprilTagLocalizer: runs its own
+                         background thread (10 Hz) computing whether
+                         a simulated tag is visible/centered/near
+                         enough, using the SAME live-position helper
+                         (node._live_position_locked(), under
+                         node._lock) that grid_nav.py itself uses
+                         internally -- reading node.x/node.y directly
+                         is WRONG mid-leg, since those only update
+                         when a leg fully completes.
+                       - run_console(): the interactive terminal
+                         command loop (see 2.2).
+
+  Dockerfile /        Real-hardware deployment. See DEPLOY.md.
+  docker-compose.yml  These need no changes when grid_nav.py's logic
+                       changes (COPY grid_nav.py . always picks up
+                       the current file); only touch them if you add
+                       a new Python dependency (edit Dockerfile's pip/
+                       apt install lines) or change the device paths.
+
+----------------------------------------------------------------
+2.2  mock_robot.py console commands
+----------------------------------------------------------------
+
+Typed into the terminal that's running "python mock_robot.py",
+alongside the browser GUI (both act on the same simulated robot):
+
+  help                        List available commands.
+  pos                         Print current x, y, heading, state,
+                              phase in one line.
+  teleport <x> <y> [heading]  Instantly move the simulated robot to
+                              (x, y) cm, optionally setting heading
+                              (degrees). Internally calls
+                              node.abort_to_idle() FIRST -- setting
+                              x/y directly while a leg is mid-drive
+                              gets silently overwritten by the node's
+                              own leg-tracking math on the very next
+                              control_loop() tick, so any in-progress
+                              motion must be cancelled first.
+  tag on                      Force the simulated AprilTag to be
+                              reported as visible.
+  tag off                     Force it to be reported as NOT visible
+                              (tests "lost the tag" behavior).
+  tag show                    Clear the on/off override, back to
+                              normal physics-based visibility.
+  quit / exit                 Stop the console loop (Ctrl+C also
+                              works; both are caught cleanly).
+
+----------------------------------------------------------------
+2.3  Web API routes (used internally by the GUI's JS; useful for
+     scripting your own tests, e.g. via Flask's test_client())
+----------------------------------------------------------------
+
+  GET  /api/state                    Full live status snapshot.
+  GET  /api/setup_status             Start-tag visibility/readiness.
+  POST /api/confirm_start             Lock (0,0)/heading from the
+                                       currently-visible start tag.
+  POST /api/goal                     {x, y, dir_deg, step_mode}
+  POST /api/run_mode                 {mode: "A"|"B"|"C"}
+  POST /api/reset_position           Force position back to (0,0).
+  POST /api/continue_step            Advance one box in Step mode.
+  POST /api/toggle_obstacle          {i, j} -- manual map click.
+  POST /api/clear_obstacles          Wipe all pinned obstacles.
+  GET  /api/obstacle_watch           Live obstacle-watch status.
+  POST /api/obstacle_watch_settings  {enabled, avoid_enabled,
+                                       sensitivity}
+  GET  /api/apriltag_state           Live pin-tag status.
+  POST /api/apriltag_settings        {tag_id, world_x, world_y,
+                                       tag_size, trigger_distance}
+  GET  /api/start_apriltag_state     Live start-tag status.
+  POST /api/start_apriltag_settings  {tag_id, tag_size}
+  POST /api/setup_settings           {max_distance, center_tolerance}
+  POST /api/homing_distance_settings {target_distance, dist_tol,
+                                       center_tol}
+  POST /api/homing_speed_settings    {max_fwd, max_rot}
+  GET  /api/mode_settings            Current Mode A/B/C sweep params.
+  POST /api/mode_settings            {x_length, y_length, row_step,
+                                       row_x_offset}
+  POST /api/set_speed                {forward, rotate}
+  POST /api/set_pulses_per_cm        {value}
+  POST /api/camera_calibrate         {height_cm, known_distance_cm,
+                                       vfov_deg}
+  GET  /api/camera_state             Calibration status.
+  GET  /api/detections               Live obstacle-detection boxes.
+  POST /api/detection_settings       {black_v_max, white_s_max,
+                                       white_v_min, blur_ksize}
+  GET  /video_feed  /debug_feed       MJPEG streams (browser <img>
+                                       tags point at these directly).
+
+----------------------------------------------------------------
+2.4  Testing changes without hardware
+----------------------------------------------------------------
+
+  - Quick manual check: run mock_robot.py, drive it around in the
+    browser, watch the console's "pos" output and the Map update.
+  - Scripted/automated check: import mock_robot, call mock_robot.build()
+    to get (node, sim, apriltag, app) without starting the Flask
+    server or console loop, then drive it with app.test_client()
+    (see the diagnostic test pattern used while fixing the homing
+    bug: post to /api/confirm_start, call node.run_path(...) directly,
+    then poll GET /api/state in a loop until state == 'IDLE').
+  - If you change anything about HOW position is tracked live during
+    a leg/homing stage in grid_nav.py (leg_progress_cm, homing_*
+    fields, _live_position_locked()), double-check
+    FakeAprilTagLocalizer._tick() in mock_robot.py still reads
+    position the same way -- it deliberately mirrors grid_nav.py's
+    own internal pattern rather than reading node.x/node.y raw, and
+    a future change to one side without the other will silently
+    reintroduce a frozen-position bug like the one this session fixed.
